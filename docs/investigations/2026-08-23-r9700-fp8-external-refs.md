@@ -1,7 +1,7 @@
 # R9700 FP8 branch: external references (2026-08-23)
 
 - **Date:** 2026-08-23
-- **Branch:** `r9700-fp8-adaptive` @ `7e345c4c` + uncommitted GEMM
+- **Branch:** `r9700-fp8-adaptive` @ GEMM ALL PASS (2026-08-23)
 - **Status:** investigation / briefing. Not a product default, floor, or admission.
 - **Hardware:** Radeon AI PRO R9700 (`gfx1201`), 32 GB GDDR6
 
@@ -26,7 +26,23 @@ Do not vendor the AMD ISA PDF (license forbids redistribution).
 | Base | `master` @ `80a572c8` (2026-08-18 integration / Saddle) |
 | `3b9c6b70` | Phase 0–2 groundwork + `QuantType` 40/41 slot |
 | `7e345c4c` | Native E4M3 G256 **GEMV** (`v_dot4_f32_fp8_fp8`), GPU-validated |
-| Working tree | **GEMM** kernel + `Gfx1201Device::fp8_gemm_e4m3_g256` + lab example, uncommitted |
+| `8191effe` | WMMA GEMM kernel + dispatch + lab harness |
+| GEMM lab 2026-08-23 | **ALL PASS** on R9700 (`HIP_VISIBLE_DEVICES=0`, HIP 7.2). NRMSE 2.50–2.91e-2 on 8 shapes. 76 VGPR / 20 SGPR / 0 spill. |
+
+Measured `test_gemm_fp8e4m3_g256 --release` (not a product claim; F32→E4M3 activation band):
+
+| Shape | NRMSE | GPU time | MFLOPS |
+|---|---:|---:|---:|
+| oracle 16×16×256 | 2.906e-2 | 10.27 µs | 12,769 |
+| tile 32×64×256 | 2.787e-2 | 8.15 µs | 128,641 |
+| small 128×128×512 | 2.749e-2 | 11.63 µs | 1,443,046 |
+| gate_up 2048×4096×2048 | 2.673e-2 | 1586.54 µs | 21,657,060 |
+| w_down 4096×2048×11008 | 2.504e-2 | 10507.96 µs | 17,575,594 |
+| qkv 512×2048×2048 | 2.663e-2 | 217.45 µs | 19,751,240 |
+| ffn1 128×11008×2048 | 2.641e-2 | 237.25 µs | 24,325,767 |
+| attn 2048×2048×2048 | 2.664e-2 | 726.97 µs | 23,632,285 |
+
+Radiowave inspect: 533 inst, 50 global loads, 130 waits, no LDS. Next lever is tiling, not occupancy.
 
 GEMV result recorded in the commit: NRMSE 2.5–2.7% vs CPU FP32 (F32→E4M3
 activation rounding; 5% relative tolerance), 46–58% peak BW on attention
@@ -43,10 +59,9 @@ writer for qt=40 yet.
 
 `crates/hipfire-quantize/src/hfq.rs` names the slot `FP8E4M3G256` and the
 kernel uses **256-element** leaves + fp16 per-group scale + 16 B header.
-The same comment also says “34 B/group (32 × 1B leaf + 2 B fp16 scale),
-8.5 bpw”. That 32-elem / 34 B layout is **llama.cpp / The-Rock8 F8E4M3**,
-not hipfire G256. Same WMMA opcode, **not drop-in**. Fix the comment when
-the encoder lands.
+That 32-elem / 34 B layout is **llama.cpp / The-Rock8 F8E4M3**, not
+hipfire G256. Same WMMA opcode, **not drop-in**. The `hfq.rs` comment was
+corrected to 8.0625 bpw (256 B leaf + 2 B scale) on 2026-08-23.
 
 ---
 
@@ -208,9 +223,9 @@ Skills in play: `.agents/skills/hipfire-arch-port/` (WMMA C-map, chip tag),
 
 | Phase | Goal | Success metric | Est. |
 |---|---|---|---|
-| **3b (now)** | GPU-validate uncommitted WMMA GEMM vs CPU FP32 | `test_gemm_fp8e4m3_g256` ALL PASS; NRMSE in the same ~5% F32→E4M3 band as GEMV; no page fault | hours |
-| **3c** | F8_Mode / C-map oracle (16×16×16 and 16×16×256) | `cvt_pk_fp8_f32` bytes match G256 encoder; rows 0–7 vs 8–15 C-map; max 448 not 240 | hours |
-| **3d** | Fix qt=40 comment (G256 vs 32-elem 34 B) | Comment matches kernel + encoder | minutes |
+| **3b** | GPU-validate WMMA GEMM vs CPU FP32 | **Done 2026-08-23.** ALL PASS, NRMSE 2.50–2.91e-2 | hours |
+| **3c** | F8_Mode / C-map oracle | **Empirically closed:** CPU ref is OCP E4M3fn bias 7; C-map oracle 16×16×256 passed | hours |
+| **3d** | Fix qt=40 comment (G256 vs 32-elem 34 B) | **Done** — 8.0625 bpw in `hfq.rs` | minutes |
 | **4** | One tiling lever after 3b is green (LDS X panel **or** 128-bit K-stage **or** geom sweep) | Occupancy/ISA dump first; then NRMSE still PASS; microbench GFLOPS up. No tok/s claim | 1–2 days |
 | **5** | Encoder + `fp8_wmma` dispatch into one prefill GEMM | Channel cosine on a tiny oracle; daemon still default-off | days |
 | **Parked** | FreeToken \(q^\star\) / semantic anchors | Only if a MoE pool does not fit 32 GB | later |

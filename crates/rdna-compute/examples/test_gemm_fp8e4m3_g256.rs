@@ -11,7 +11,8 @@
 //! Skips silently on non-gfx1201 archs.
 //!
 //! Run:
-//!   cargo run -p rdna-compute --example test_gemm_fp8e4m3_g256 --features lab
+//!   cargo run --release -p rdna-compute --example test_gemm_fp8e4m3_g256 --features lab
+//!   HIPFIRE_FP8_GEMM_QUICK=1 cargo run --release -p rdna-compute --example test_gemm_fp8e4m3_g256 --features lab
 
 use rdna_compute::{DType, Gpu};
 use std::time::Instant;
@@ -30,7 +31,9 @@ fn main() {
 
     // Small tiles first so a C-map / launch fault fails in seconds, then
     // Qwen prefill shapes. CPU ref is O(N*M*K) and the large cells take minutes.
+    // HIPFIRE_FP8_GEMM_QUICK=1 keeps only the three small tiles.
     // Shapes: [N batch, M out, K in], K padded to 256.
+    let quick = std::env::var("HIPFIRE_FP8_GEMM_QUICK").ok().as_deref() == Some("1");
     let shapes: Vec<(usize, usize, usize, &str)> = vec![
         (16, 16, 256, "oracle    N=16   M=16   K=256"),
         (32, 64, 256, "tile      N=32   M=64   K=256"),
@@ -41,6 +44,11 @@ fn main() {
         (128, 11008, 2048, "ffn1      N=128  M=11008 K=2048"),
         (2048, 2048, 2048, "attn      N=2048 M=2048 K=2048"),
     ];
+    let shapes: Vec<(usize, usize, usize, &str)> = if quick {
+        shapes.into_iter().take(3).collect()
+    } else {
+        shapes
+    };
 
     let trials = 20;
     let warmup = 3;
