@@ -9,6 +9,10 @@ description = "Compute kernel dispatch for RDNA GPUs"
 # Archived research probes; see the note by the [[example]] blocks.
 lab = []
 deltanet = []
+# Native OCP FP8 (E4M3/E5M2) WMMA recipe catalog for gfx1201 (RDNA4).
+# Forwards to radiowave's Wave-2 recipe types; off by default until the
+# FP8 quant format + GEMM/GEMV kernels land end-to-end.
+experimental-fp8 = ["radiowave/experimental-fp8"]
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }

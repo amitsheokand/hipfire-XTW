@@ -73,6 +73,8 @@ impl QuantType {
             37 => Some(Self::MFP2G32E8),
             38 => Some(Self::MQ2G256GL),
             39 => Some(Self::MQ3G256GL),
+            40 => Some(Self::FP8E4M3G256),
+            41 => Some(Self::FP8E5M2G256),
             _ => None,
         }
     }
@@ -158,6 +160,14 @@ pub(crate) enum QuantType {
     // (MQ2) — and the group base becomes naturally aligned (64 B vs 72 B stride).
     MQ2G256GL = 38, // 2-bit + global codebook: 64 B idx/group + 2 B scale = 2.0625 bpw
     MQ3G256GL = 39, // 3-bit + global codebook: 96 B idx/group + 2 B scale = 3.0625 bpw
+    // FP8 family — OCP E4M3/E5M2 leaf + fp16 per-block scale, group-256.
+    // Native gfx1201 WMMA path: __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12
+    // (see crates/radiowave/src/recipes_fp8.rs, gated behind experimental-fp8).
+    // 34 B/group (32 × 1B leaf + 2 B fp16 scale), 8.5 bpw.
+    // Higher quality-per-byte than MQ4 at the cost of 2× the VRAM; the
+    // prefill win on gfx1201 is the value, not decode (decode is BW-bound).
+    FP8E4M3G256 = 40, // OCP E4M3 (4 exp / 3 mantissa) + fp16 g256 scale — quality leaf
+    FP8E5M2G256 = 41, // OCP E5M2 (bf8, 5 exp / 2 mantissa) + fp16 g256 scale — range leaf
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.

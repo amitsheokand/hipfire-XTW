@@ -2754,6 +2754,54 @@ pub static FIELDS: &[ConfigField] = &[
         None,
         "Certified fusion policy; individual kernel selection remains compiled."
     ),
+    field!(
+        "experimental.fp8_wmma",
+        "fp8_wmma",
+        Experimental,
+        ModelLoad,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        false,
+        true,
+        Some("HIPFIRE_FP8_WMMA"),
+        "Enable native OCP FP8 (E4M3) WMMA dispatch on gfx1201; off falls back to MQ4."
+    ),
+    field!(
+        "experimental.fp8_format",
+        "fp8_format",
+        Experimental,
+        ModelLoad,
+        DefaultValue::String("e4m3"),
+        ValueRule::Enum(&["e4m3", "e5m2"]),
+        false,
+        true,
+        Some("HIPFIRE_FP8_FORMAT"),
+        "OCP FP8 leaf encoding for the fp8_wmma path; E4M3 (quality) or E5M2 (range)."
+    ),
+    field!(
+        "experimental.ubatch_size",
+        "ubatch_size",
+        Experimental,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::NullableInteger { min: 0, max: 32768 },
+        false,
+        true,
+        Some("HIPFIRE_UBATCH_SIZE"),
+        "Override micro-batch (ubatch) size; zero keeps the model/arch default. >=2048 avoids wave-boundary stalls on hybrid GatedDeltaNet."
+    ),
+    field!(
+        "experimental.moe_expert_cache_mb",
+        "moe_expert_cache_mb",
+        Experimental,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::NullableInteger { min: 0, max: 32768 },
+        false,
+        true,
+        Some("HIPFIRE_MOE_EXPERT_CACHE_MB"),
+        "Cap for hot MoE expert residency in VRAM (MB); zero disables paging and pins all experts."
+    ),
 ];
 
 pub fn fields() -> &'static [ConfigField] {
