@@ -45,6 +45,10 @@ const FP8_E4M3_GEMM_SRC: &str =
     include_str!("../../../../kernels/src/gemm_fp8e4m3_g256_wmma.gfx1201.hip");
 const FP8_E4M3_GEMM_KERNEL: &str = "gemm_fp8e4m3_g256_wmma_gfx1201";
 
+const FP8_E4M3_GATE_UP_SRC: &str =
+    include_str!("../../../../kernels/src/gemm_gate_up_fp8e4m3_g256_wmma.gfx1201.hip");
+const FP8_E4M3_GATE_UP_KERNEL: &str = "gemm_gate_up_fp8e4m3_g256_wmma_gfx1201";
+
 /// A mutable GPU borrow proven to target exact gfx1201.
 ///
 /// The constructor is intentionally available only through
@@ -89,6 +93,25 @@ impl Gpu {
         self.try_gfx1201()
             .ok_or_else(|| HipError::new(0, "FP8E4M3G256 GEMM requires gfx1201"))?
             .fp8_gemm_e4m3_g256(a, x, y, m, k, n)
+    }
+
+    /// Native qt=40 fused gate+up WMMA GEMM. gfx1201 only; other archs error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_gemm_gate_up_e4m3_g256(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.try_gfx1201()
+            .ok_or_else(|| HipError::new(0, "FP8E4M3G256 fused gate+up requires gfx1201"))?
+            .fp8_gemm_gate_up_e4m3_g256(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n)
     }
 }
 
@@ -573,6 +596,88 @@ impl Gfx1201Device<'_> {
             self.gpu.hip.launch_kernel(
                 func,
                 [((m + 15) / 16) as u32, ((n + 15) / 16) as u32, 1],
+                [32, 1, 1],
+                0,
+                self.gpu.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// Fused gate+up sister of [`Self::fp8_gemm_e4m3_g256`]. One launch,
+    /// packed X is still `ensure_fp8_x` (cache hits the second matrix).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_gemm_gate_up_e4m3_g256(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "gfx1201 FP8 E4M3 fused gate+up requires K%256=0");
+        assert!(
+            x.numel() >= n * k
+                && y_gate.numel() >= n * gate_m
+                && y_up.numel() >= n * up_m,
+            "fp8_gemm_gate_up_e4m3_g256 needs X>=N*K Yg>=N*gate_m Yu>=N*up_m \
+             (x={:?} yg={:?} yu={:?} n={n} gate_m={gate_m} up_m={up_m} k={k})",
+            x.shape,
+            y_gate.shape,
+            y_up.shape
+        );
+
+        self.gpu.bind_thread()?;
+        let x_fp8_ptr = self.gpu.ensure_fp8_x(x, n * k)?;
+        self.gpu.ensure_kernel(
+            FP8_E4M3_GATE_UP_KERNEL,
+            FP8_E4M3_GATE_UP_SRC,
+            FP8_E4M3_GATE_UP_KERNEL,
+        )?;
+
+        let func = &self.gpu.functions[FP8_E4M3_GATE_UP_KERNEL];
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut x_ptr = x_fp8_ptr;
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut gate_m_i = gate_m as i32;
+        let mut up_m_i = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut gate_m_i as *mut _ as *mut c_void,
+            &mut up_m_i as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = gate_m + up_m;
+        let bytes = (gate_m + up_m) * (16 + (k / 256).next_multiple_of(16) * 2 + k) + n * k;
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "gemm",
+            FP8_E4M3_GATE_UP_KERNEL,
+            bytes,
+        );
+
+        let result = unsafe {
+            self.gpu.hip.launch_kernel(
+                func,
+                [((total_m + 15) / 16) as u32, ((n + 15) / 16) as u32, 1],
                 [32, 1, 1],
                 0,
                 self.gpu.stream_ref(),

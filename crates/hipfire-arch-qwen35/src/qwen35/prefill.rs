@@ -908,7 +908,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
 // docs/plans/mq-lloyd-batched-prefill-followup.md for the full
 // checklist + rationale.
 //
-// FP8E4M3G256 is gfx1201-only overwrite GEMM (no fused QKV/QKVZA/gate_up).
+// FP8E4M3G256 is gfx1201-only batched GEMM (fused gate+up; QKV/QKVZA still overwrite).
 // Dedicated `is_fp8` / `*_is_fp8` arms sit in front of every HFQ4 `else`.
 // Do not admit it in `moe_ffn_batched_admissible` (no MoE-3D encoder).
 //
@@ -1074,7 +1074,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
             .as_deref()
             == Some("1");
 
-    // Native qt=40 overwrite GEMM (no fused QKV/QKVZA/gate_up). Kernel
+    // Native qt=40 GEMM (fused gate+up; QKV/QKVZA still overwrite). Kernel
     // sources are gfx1201-tagged; gfx1200 would JIT-fail if admitted.
     // Dedicated arms live in the LA/FA matchers; the HFQ4 `else` must
     // not see this dtype. MoE FFN stays on per-token (no 3D encoder).
@@ -2126,6 +2126,32 @@ fn run_fp8_gemm(
     n: usize,
 ) -> HipResult<()> {
     gpu.fp8_gemm_e4m3_g256(&w.buf, x, y, w.m, w.k, n)
+}
+
+/// Fused gate+up overwrite GEMM. One launch; same packed-X cache as
+/// [`run_fp8_gemm`].
+#[inline]
+fn run_fp8_gate_up(
+    gpu: &mut Gpu,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    x: &GpuTensor,
+    y_gate: &GpuTensor,
+    y_up: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(w_gate.k, w_up.k);
+    gpu.fp8_gemm_gate_up_e4m3_g256(
+        &w_gate.buf,
+        &w_up.buf,
+        x,
+        y_gate,
+        y_up,
+        w_gate.m,
+        w_up.m,
+        w_gate.k,
+        n,
+    )
 }
 
 /// Residual `y += W·x` via overwrite GEMM into `scratch` then add.
@@ -4405,8 +4431,15 @@ fn batch_chunk_delta_net_ffn(
                         matches!(layer.w_up.gpu_dtype, DType::FP8E4M3G256),
                         "LA FFN FP8 dispatch requires both w_gate and w_up to be FP8E4M3G256",
                     );
-                    run_fp8_gemm(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n)?;
+                    run_fp8_gate_up(
+                        gpu,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        n,
+                    )?;
                 } else {
                     run_fused_gate_up_key(
                         gpu,
@@ -5309,8 +5342,15 @@ fn batch_chunk_full_attn_ffn(
                         matches!(layer.w_up.gpu_dtype, DType::FP8E4M3G256),
                         "FA FFN FP8 dispatch requires both w_gate and w_up to be FP8E4M3G256",
                     );
-                    run_fp8_gemm(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n)?;
+                    run_fp8_gate_up(
+                        gpu,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        n,
+                    )?;
                 } else {
                     run_fused_gate_up_key(
                         gpu,
@@ -7768,7 +7808,7 @@ mod tests {
     fn qwen35_is_batchable_la_fp8_gfx1201_only() {
         assert!(
             is_batchable_la(DType::FP8E4M3G256, "gfx1201"),
-            "FP8E4M3G256 batches on gfx1201 via overwrite GEMM"
+            "FP8E4M3G256 batches on gfx1201 (fused gate+up, overwrite QKV)"
         );
         for &arch in WMMA_ARCHS {
             if arch == "gfx1201" {

@@ -150,11 +150,78 @@ fn main() {
         }
     }
 
+    if !fused_gate_up_matches_dual(&mut gpu) {
+        all_pass = false;
+    }
+
     if !all_pass {
         eprintln!("\n=== FAIL ===");
         std::process::exit(1);
     }
     eprintln!("\n=== ALL PASS ===");
+}
+
+/// Fused gate+up must match two overwrite GEMMs on the same packed X.
+fn fused_gate_up_matches_dual(gpu: &mut Gpu) -> bool {
+    let n = 32;
+    let gate_m = 64;
+    let up_m = 64;
+    let k = 256;
+    let n_blocks = k / GROUP;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let row_bytes = 16 + scale_padded * 2 + n_blocks * GROUP;
+
+    let (w_gate_host, x_host, _) = synth_reference(gate_m, k, n, 0xC0FFEE);
+    let (w_up_host, _, _) = synth_reference(up_m, k, n, 0x0BADF00D);
+
+    let w_gate = gpu
+        .upload_raw(&w_gate_host, &[gate_m * row_bytes])
+        .unwrap();
+    let w_up = gpu.upload_raw(&w_up_host, &[up_m * row_bytes]).unwrap();
+    let x = gpu.alloc_tensor(&[n, k], DType::F32).unwrap();
+    gpu.hip
+        .memcpy_htod(&x.buf, unsafe {
+            std::slice::from_raw_parts(x_host.as_ptr() as *const u8, n * k * 4)
+        })
+        .unwrap();
+
+    let y_gate_ref = gpu.alloc_tensor(&[n, gate_m], DType::F32).unwrap();
+    let y_up_ref = gpu.alloc_tensor(&[n, up_m], DType::F32).unwrap();
+    let y_gate = gpu.alloc_tensor(&[n, gate_m], DType::F32).unwrap();
+    let y_up = gpu.alloc_tensor(&[n, up_m], DType::F32).unwrap();
+
+    gpu.fp8_gemm_e4m3_g256(&w_gate, &x, &y_gate_ref, gate_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_e4m3_g256(&w_up, &x, &y_up_ref, up_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_gate_up_e4m3_g256(
+        &w_gate, &w_up, &x, &y_gate, &y_up, gate_m, up_m, k, n,
+    )
+    .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+
+    let g_ref = gpu.download_f32(&y_gate_ref).unwrap();
+    let u_ref = gpu.download_f32(&y_up_ref).unwrap();
+    let g = gpu.download_f32(&y_gate).unwrap();
+    let u = gpu.download_f32(&y_up).unwrap();
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+    let dg = max_abs(&g_ref, &g);
+    let du = max_abs(&u_ref, &u);
+    // Same kernel math as overwrite GEMM; only routing differs. Bit-exact
+    // on this tile in practice; keep a tiny float slop for store order.
+    let ok = dg <= 1e-5 && du <= 1e-5;
+    if ok {
+        eprintln!("  fused_gate_up vs dual GEMM     OK  max|Δ| gate={dg:.3e} up={du:.3e}");
+    } else {
+        eprintln!("  fused_gate_up vs dual GEMM     FAIL  max|Δ| gate={dg:.3e} up={du:.3e}");
+    }
+    ok
 }
 
 fn e4m3_to_f32(b: u8) -> f32 {

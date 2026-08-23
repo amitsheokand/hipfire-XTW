@@ -8,11 +8,13 @@ tags: [gfx1201, r9700, fp8, prefill, gemm]
 (llama + qwen35 copies). Kernel sources are `.gfx1201.hip`; gfx1200
 stays false. Not gated on `fp8_wmma` (HFP4 activation flag).
 
-No fused QKV/QKVZA/gate_up/residual FP8 kernel. Prefill uses
-`gpu.fp8_gemm_e4m3_g256` overwrite (three/four times for QKV/QKVZA,
-two for gate+up). Residual is GEMM-into-scratch + `add_inplace_f32`
-(same pattern as non-WMMA Q8). Pack cache hits after the first GEMM
-on the same X pointer.
+No fused QKV/QKVZA/residual FP8 kernel. Prefill uses
+`gpu.fp8_gemm_e4m3_g256` overwrite for QKV/QKVZA/wo/down. **Gate+up is
+fused** (`gpu.fp8_gemm_gate_up_e4m3_g256`, one launch). Residual is
+GEMM-into-scratch + `add_inplace_f32` (same pattern as non-WMMA Q8).
+Pack cache hits after the first GEMM on the same X pointer.
+
+See [[fp8-fused-gate-up-gfx1201]].
 
 Every HFQ4 `else` that would have fired has an explicit FP8 arm:
 llama QKV/wo/gate_up/down; qwen35 dense LA/FA QKVZA/QKV/wo/gate_up/down;

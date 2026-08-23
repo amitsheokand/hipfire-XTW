@@ -1758,7 +1758,7 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 
 /// Is this dtype/arch combination eligible for batched prefill?
 /// Shares the always-ok / WMMA / gfx10-MQ3 rules with `qwen35::is_batchable_la`.
-/// `FP8E4M3G256` is gfx1201-only overwrite GEMM (no fused QKV/gate_up).
+/// `FP8E4M3G256` is gfx1201-only batched GEMM (fused gate+up; QKV still overwrite).
 pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(
         dt,
@@ -1787,7 +1787,7 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             arch,
             "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
         );
-    // Native qt=40 overwrite GEMM (no fused QKV/gate_up). Kernel sources
+    // Native qt=40 GEMM (fused gate+up; QKV still overwrite). Kernel sources
     // are gfx1201-tagged; gfx1200 would JIT-fail if admitted.
     let fp8_gfx1201 = matches!(dt, DType::FP8E4M3G256) && arch == "gfx1201";
     wmma_only || mq3_gfx10_scalar || fp8_gfx1201
@@ -3142,20 +3142,15 @@ fn forward_prefill_chunk(
                 matches!(layer.w_up.gpu_dtype, DType::FP8E4M3G256),
                 "llama FP8 gate/up batch requires both weights to be FP8E4M3G256"
             );
-            gpu.fp8_gemm_e4m3_g256(
+            gpu.fp8_gemm_gate_up_e4m3_g256(
                 &layer.w_gate.buf,
-                &pbs.x_rot_batch,
-                &pbs.gate_ffn_batch,
-                layer.w_gate.m,
-                layer.w_gate.k,
-                n,
-            )?;
-            gpu.fp8_gemm_e4m3_g256(
                 &layer.w_up.buf,
                 &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
                 &pbs.up_batch,
+                layer.w_gate.m,
                 layer.w_up.m,
-                layer.w_up.k,
+                layer.w_gate.k,
                 n,
             )?;
         } else {

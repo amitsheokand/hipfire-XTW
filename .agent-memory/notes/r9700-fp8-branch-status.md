@@ -25,6 +25,9 @@ Branch `r9700-fp8-adaptive` (fork hipfire-XTW) on `master` `80a572c8`.
   serve on gfx1201 produced readable Paris/Seine + merge_sort text.
   Attractor=0. Serve JIT must run inside `nix develop`. Not a tok/s
   or admission claim. See [[fp8-e2e-qwen35-4b]].
+- Fused gate+up FP8 GEMM on gfx1201 (same WMMA as overwrite GEMM). Lab
+  fused vs dual GEMM max|Δ|=0. QKV still overwrite. See
+  [[fp8-fused-gate-up-gfx1201]].
 
 Packed-X Radiowave: **68 VGPR / 20 SGPR / 0 spill**, 375 inst, 34 gld,
 94 waits. NRMSE unchanged vs in-kernel cvt. Large-N prefill GEMM-only
