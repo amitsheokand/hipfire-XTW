@@ -2244,7 +2244,7 @@ pub(crate) fn run() {
         let is_moe_expert_3d = (is_moe || is_gemma4)
             && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
             && meta.shape.len() == 3;
-        {
+        if is_moe_expert_3d {
             let __ctx = PerTensorCtx { name, file_idx: *file_idx, shape: &meta.shape, n_elements, arch_id, dtype: &meta.dtype, is_vision };
             if handle_moe_expert_3d(&__ctx, meta, raw_data, is_moe, is_gemma4, &kmap, &mq3_tier_layers, &imatrix_gguf, &moe_tier_map, use_moe_graded, moe_hot_frac, &hessian_dir, use_gptq_e8, use_gptq_mfp3e8, use_gptq_mfp2e8, use_mq6g256, use_mq4g256, use_mq4_mq6exp, use_mq4_mq2lloydexp, use_mq4_mq2glexp, use_mq4_mq2lloyd_native, use_mq4_mq2lloyd_kmap, use_mq4_mq2lloyd_imatrix, use_mq4_mq3lloyd_kmap, use_mq4_mqlloyd_tiered, use_mq4_mqlloyd_antirez, use_mq4_mqlloyd_antirez_gptq, use_mq4_mq2lloyd_gptq_all, use_mq5g256, use_hfq6, use_hfq4g256, use_hfq3g256, use_hfq3g128, use_hfq2g256, use_hfq2g128, use_hfq_mixed, use_mfp4, use_mfp4p, use_mfp4e8, use_mfp4e8soa, use_mfp3e8_gptq_fmt, use_mfp2e8_gptq_fmt, use_mq3g256, use_mq2g256, use_mq2g256_lloyd, use_mq3g256_lloyd, use_mq4g256_lloyd, use_hfp4, use_mfp4l, routed_gl, &imatrix_path, bake_keep_active, &reap_bake_plan, reap_arch, &st_files, &fp8_scale_for, &mut hfq_tensors, &mut quantized_params, &mut spill) {
                 continue;
@@ -3625,6 +3625,13 @@ fn handle_moe_expert_3d(
     let n_elements = ctx.n_elements;
     let arch_id = ctx.arch_id;
     let is_vision = ctx.is_vision;
+
+    if !((is_moe || is_gemma4)
+        && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+        && meta.shape.len() == 3)
+    {
+        return false;
+    }
 
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
@@ -5662,6 +5669,130 @@ fn handle_main_quant(
                     });
                 }
             } // end else (non-Q8HFQ path)
+        } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
+            // Quantize vision weights to HFQ4G256 (for speed-critical VL workloads)
+            let f32_data = to_f32(raw_data, &meta.dtype);
+            *state.quantized_params += n_elements as u64;
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let k_dim = if shape.len() == 2 {
+                shape[1] as usize
+            } else {
+                n_elements
+            };
+            let (quantized, gs) = if k_dim % 256 == 0 {
+                (quantize_hfq4g256(&f32_data), 256u32)
+            } else {
+                (quantize_hfq4g128(&f32_data), 128u32)
+            };
+            let qt = if gs == 256 {
+                QuantType::HFQ4G256
+            } else {
+                QuantType::HFQ4G128
+            };
+            let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
+            eprintln!(
+                "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                quantized.len() as f64 / 1024.0
+            );
+            state.hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: qt,
+                shape,
+                group_size: gs,
+                data: quantized,
+                spilled_len: 0,
+            });
+        } else if is_vision && vision_quant == "bf16" && meta.dtype == "BF16" {
+            // Store vision weights as original BF16 (zero precision loss)
+            *state.quantized_params += n_elements as u64;
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!(
+                "  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0
+            );
+            state.hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::BF16,
+                shape,
+                group_size: 0,
+                data: raw_data.to_vec(),
+                spilled_len: 0,
+            });
+        } else if is_vision && vision_quant == "bf16" {
+            // Non-BF16 source (F16/F32) — store as F16
+            let data = if meta.dtype == "F16" {
+                raw_data.to_vec()
+            } else {
+                let f32_vals = to_f32(raw_data, &meta.dtype);
+                f32_vals
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect()
+            };
+            *state.quantized_params += n_elements as u64;
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!(
+                "  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
+                name,
+                meta.shape,
+                data.len() as f64 / 1024.0
+            );
+            state.hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data,
+                spilled_len: 0,
+            });
+        } else {
+            // Keep as F16 (norms, biases, A_log, dt_bias, tiny tensors).
+            // Restored after d1d172e9 dropped this else when extracting
+            // handle_main_quant — without it, dense Qwen3.5 encodes omit
+            // `norm.weight` and the loader panics.
+            let f16_data = match meta.dtype.as_str() {
+                "F16" => raw_data.to_vec(),
+                "BF16" => {
+                    let f32_vals = to_f32(raw_data, "BF16");
+                    f32_vals
+                        .iter()
+                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                        .collect()
+                }
+                "F32" => {
+                    let f32_vals = to_f32(raw_data, "F32");
+                    f32_vals
+                        .iter()
+                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                        .collect()
+                }
+                other => panic!("unsupported dtype for norm/embd: {other}"),
+            };
+
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!(
+                "  F16:        {} {:?} ({} elements, {:.1} KB)",
+                name,
+                meta.shape,
+                n_elements,
+                f16_data.len() as f64 / 1024.0
+            );
+
+            state.hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data: f16_data,
+                spilled_len: 0,
+            });
         }
 }
 

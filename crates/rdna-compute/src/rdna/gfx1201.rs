@@ -469,8 +469,10 @@ impl Gfx1201Device<'_> {
     ) -> HipResult<()> {
         assert!(k % 256 == 0, "gfx1201 FP8 E4M3 GEMV requires K%256=0");
         assert!(
-            x.shape.len() == 1 && y.shape.len() == 1,
-            "fp8_gemv_e4m3_g256 expects x[K], y[M]"
+            x.numel() >= k && y.numel() >= m,
+            "fp8_gemv_e4m3_g256 needs x>=K y>=M (x={:?} y={:?} m={m} k={k})",
+            x.shape,
+            y.shape
         );
 
         self.gpu.bind_thread()?;
@@ -533,8 +535,10 @@ impl Gfx1201Device<'_> {
     ) -> HipResult<()> {
         assert!(k % 256 == 0, "gfx1201 FP8 E4M3 GEMM requires K%256=0");
         assert!(
-            x.shape.len() == 2 && y.shape.len() == 2,
-            "fp8_gemm_e4m3_g256 expects X[N,K], Y[N,M]"
+            x.numel() >= n * k && y.numel() >= n * m,
+            "fp8_gemm_e4m3_g256 needs X>=N*K Y>=N*M (x={:?} y={:?} n={n} m={m} k={k})",
+            x.shape,
+            y.shape
         );
 
         self.gpu.bind_thread()?;

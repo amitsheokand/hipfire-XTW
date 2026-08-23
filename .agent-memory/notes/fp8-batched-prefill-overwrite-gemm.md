@@ -28,7 +28,10 @@ FP8 errors out rather than taking HFQ4 keys.
 
 Unit tests: `is_batchable_la_fp8_gfx1201_only` (runtime),
 `qwen35_is_batchable_la_fp8_gfx1201_only`, dispatch-tests llama.
-Not a tok/s or admission claim; no E2E `.hfq` serve yet.
+
+E2E: Qwen3.5-0.8B qt=40 loaded and generated on gfx1201 via overwrite
+GEMM (flattened-X numel assert). See [[fp8-e2e-qwen35-08b]]. Not a
+tok/s or admission claim; 0.8B output is known-incoherent.
 
 Related: [[fp8-runtime-dtype-dispatch]], [[r9700-fp8-branch-status]],
 [[fp8-encoder-cpu]].

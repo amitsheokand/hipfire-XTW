@@ -16,5 +16,9 @@ CPU tests (`cargo test -p hipfire-quantize --lib -- fp8e4m3`): max code
 gfx1201 overwrite GEMM; see [[fp8-batched-prefill-overwrite-gemm]].
 `fp8_wmma` stays default-off.
 
+`d1d172e9` extract dropped the 3D-expert gate and the F16
+norm/bias else; both restored so dense Qwen3.5 `--format fp8e4m3`
+actually writes a loadable `.hfq`. E2E: [[fp8-e2e-qwen35-08b]].
+
 Related: [[fp8-gemm-pack-prepass]], [[r9700-fp8-branch-status]],
 [[fp8-g256-not-llamacpp-34b]].

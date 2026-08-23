@@ -17,6 +17,10 @@ Branch `r9700-fp8-adaptive` (fork hipfire-XTW) on `master` `80a572c8`.
 - batched prefill: gfx1201-only `is_batchable_la` + overwrite GEMM arms
   (llama + qwen35 dense/MoE-attn). See [[fp8-batched-prefill-overwrite-gemm]].
   `fp8_wmma` stays default-off. No MoE-3D encoder.
+- E2E: Qwen3.5-0.8B `--format fp8e4m3` → load → short serve on gfx1201.
+  Encoder gates restored (3D expert + F16 fallback). Flattened-X GEMM
+  numel assert. 0.8B output attractor is known-incoherent, not FP8.
+  See [[fp8-e2e-qwen35-08b]].
 
 Packed-X Radiowave: **68 VGPR / 20 SGPR / 0 spill**, 375 inst, 34 gld,
 94 waits. NRMSE unchanged vs in-kernel cvt. Large-N prefill GEMM-only
