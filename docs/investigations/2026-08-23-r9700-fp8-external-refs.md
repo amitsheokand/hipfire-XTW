@@ -27,7 +27,7 @@ Do not vendor the AMD ISA PDF (license forbids redistribution).
 | `3b9c6b70` | Phase 0–2 groundwork + `QuantType` 40/41 slot |
 | `7e345c4c` | Native E4M3 G256 **GEMV** (`v_dot4_f32_fp8_fp8`), GPU-validated |
 | `8191effe` | WMMA GEMM kernel + dispatch + lab harness |
-| GEMM lab 2026-08-23 | **ALL PASS** on R9700 (`HIP_VISIBLE_DEVICES=0`, HIP 7.2). NRMSE 2.50–2.91e-2 on 8 shapes. 76 VGPR / 20 SGPR / 0 spill. |
+| GEMM lab 2026-08-23 | **ALL PASS** on R9700 (`HIP_VISIBLE_DEVICES=0`, HIP 7.2). NRMSE 2.50–2.91e-2 on 8 shapes. In-kernel cvt: 76 VGPR. Packed-X: 68 VGPR / 375 inst. |
 
 Measured `test_gemm_fp8e4m3_g256 --release` (not a product claim; F32→E4M3 activation band):
 
@@ -42,7 +42,10 @@ Measured `test_gemm_fp8e4m3_g256 --release` (not a product claim; F32→E4M3 act
 | ffn1 128×11008×2048 | 2.641e-2 | 237.25 µs | 24,325,767 |
 | attn 2048×2048×2048 | 2.664e-2 | 726.97 µs | 23,632,285 |
 
-Radiowave inspect: 533 inst, 50 global loads, 130 waits, no LDS. Next lever is tiling, not occupancy.
+Radiowave inspect (in-kernel cvt): 533 inst, 50 global loads, 130 waits, no LDS.
+Pack pre-pass (2026-08-23): 375 inst, 34 gld, 94 waits, 68 VGPR; occupancy
+unchanged (granule-16). GEMM-only −42–51% on large-N prefill; ffn1 N=128 +8.3%.
+See `.agent-memory/notes/fp8-gemm-pack-prepass.md`.
 
 GEMV result recorded in the commit: NRMSE 2.5–2.7% vs CPU FP32 (F32→E4M3
 activation rounding; 5% relative tolerance), 46–58% peak BW on attention
@@ -226,7 +229,7 @@ Skills in play: `.agents/skills/hipfire-arch-port/` (WMMA C-map, chip tag),
 | **3b** | GPU-validate WMMA GEMM vs CPU FP32 | **Done 2026-08-23.** ALL PASS, NRMSE 2.50–2.91e-2 | hours |
 | **3c** | F8_Mode / C-map oracle | **Empirically closed:** CPU ref is OCP E4M3fn bias 7; C-map oracle 16×16×256 passed | hours |
 | **3d** | Fix qt=40 comment (G256 vs 32-elem 34 B) | **Done** — 8.0625 bpw in `hfq.rs` | minutes |
-| **4** | One tiling lever after 3b is green | **LDS X-panel rejected 2026-08-23** (76→155 VGPR). Next: separate `pack_f32_to_fp8` pre-pass, not in-kernel LDS convert. See `.agent-memory/notes/fp8-gemm-lds-xpanel-vgpr-cliff.md` | 1–2 days |
+| **4** | One tiling lever after 3b is green | **LDS X-panel rejected.** Pack pre-pass **landed**: GEMM-only −42–51% large-N; ffn1 +8.3%. Occupancy unchanged. See `.agent-memory/notes/fp8-gemm-pack-prepass.md` | done |
 | **5** | Encoder + `fp8_wmma` dispatch into one prefill GEMM | Channel cosine on a tiny oracle; daemon still default-off | days |
 | **Parked** | FreeToken \(q^\star\) / semantic anchors | Only if a MoE pool does not fit 32 GB | later |
 | **Never** | Hyperloom, Lemonade, GGUF F8 layout, `HSA_OVERRIDE` as product | — | — |

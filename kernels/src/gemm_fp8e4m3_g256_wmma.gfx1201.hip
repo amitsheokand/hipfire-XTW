@@ -9,8 +9,9 @@
 //
 // Computes Y[N x M] = X[N x K] @ A[M x K]^T where A is FP8E4M3G256
 // (block-scaled E4M3: [16 B hdr][n_blocks x 2 B fp16 scale, 16-aligned]
-// [n_blocks x 256 B E4M3 leaves]) and X is F32 activations converted to
-// E4M3 inline.
+// [n_blocks x 256 B E4M3 leaves]) and X is E4M3 packed by
+// pack_f32_to_fp8_gfx12 (in-kernel cvt was the ALU tax; LDS staging
+// doubled VGPRs — see fp8-gemm-lds-xpanel-vgpr-cliff).
 //
 // Fragment layout mirrors gemm_qkv_hfp4g32_wmma_fp8.gfx12.hip (proven on
 // this card): m_lane = tid & 15, k_grp = tid >> 4, 16x16x16 WMMA tiles,
@@ -19,7 +20,6 @@
 // Grid: [ceil(M/16), ceil(N/16)]. Block: [32] (one wave32).
 
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp8.h>
 
 typedef float __attribute__((ext_vector_type(8))) v8f_t;
 typedef int   __attribute__((ext_vector_type(2))) v2i_t;
@@ -28,9 +28,9 @@ typedef int   __attribute__((ext_vector_type(2))) v2i_t;
 
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_fp8e4m3_g256_wmma_gfx1201(
-    const char* __restrict__ A,        // [M] rows of FP8E4M3G256
-    const float* __restrict__ X,       // [N x K] F32 activations
-    float* __restrict__ Y,             // [N x M] output
+    const char* __restrict__ A,                 // [M] rows of FP8E4M3G256
+    const unsigned char* __restrict__ X_fp8,    // [N x K] E4M3
+    float* __restrict__ Y,                      // [N x M] output
     int M,
     int K,
     int N
@@ -92,7 +92,8 @@ extern "C" __global__ void gemm_fp8e4m3_g256_wmma_gfx1201(
         }
 
         const char* group_leaf = leaf_base + (long long)g * FP8_GEMM_GROUP;
-        const float* x_group = X + (long long)safe_batch * K + g * FP8_GEMM_GROUP;
+        const unsigned char* x_group =
+            X_fp8 + (long long)safe_batch * K + g * FP8_GEMM_GROUP;
 
 #pragma unroll
         for (int kt = 0; kt < 16; kt += 4) {
@@ -102,44 +103,15 @@ extern "C" __global__ void gemm_fp8e4m3_g256_wmma_gfx1201(
             const int k_off_c = (kt + 2) * 16 + k_grp * 8;
             const int k_off_d = (kt + 3) * 16 + k_grp * 8;
 
-            // 8 weight E4M3 bytes per tile per lane.
             v2i_t w_a = *(const v2i_t*)(group_leaf + k_off_a);
             v2i_t w_b = *(const v2i_t*)(group_leaf + k_off_b);
             v2i_t w_c = *(const v2i_t*)(group_leaf + k_off_c);
             v2i_t w_d = *(const v2i_t*)(group_leaf + k_off_d);
 
-            // F32 activations -> E4M3 bytes inline, mirroring
-            // mq_rotate_x_dual.gfx12.hip exactly: 4 cvt_pk_fp8_f32 calls
-            // pack 8 floats into v2i_t {lo (v0..v3), hi (v4..v7)}.
-            // Each lane covers 8 K-elements per tile.
-            const float* xa = x_group + k_off_a;
-            const float* xb = x_group + k_off_b;
-            const float* xc = x_group + k_off_c;
-            const float* xd = x_group + k_off_d;
-            unsigned int xa_lo = 0u, xa_hi = 0u;
-            xa_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xa[0], xa[1], xa_lo, false);
-            xa_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xa[2], xa[3], xa_lo, true);
-            xa_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xa[4], xa[5], xa_hi, false);
-            xa_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xa[6], xa[7], xa_hi, true);
-            const v2i_t x_a = { (int)xa_lo, (int)xa_hi };
-            unsigned int xb_lo = 0u, xb_hi = 0u;
-            xb_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xb[0], xb[1], xb_lo, false);
-            xb_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xb[2], xb[3], xb_lo, true);
-            xb_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xb[4], xb[5], xb_hi, false);
-            xb_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xb[6], xb[7], xb_hi, true);
-            const v2i_t x_b = { (int)xb_lo, (int)xb_hi };
-            unsigned int xc_lo = 0u, xc_hi = 0u;
-            xc_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xc[0], xc[1], xc_lo, false);
-            xc_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xc[2], xc[3], xc_lo, true);
-            xc_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xc[4], xc[5], xc_hi, false);
-            xc_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xc[6], xc[7], xc_hi, true);
-            const v2i_t x_c = { (int)xc_lo, (int)xc_hi };
-            unsigned int xd_lo = 0u, xd_hi = 0u;
-            xd_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xd[0], xd[1], xd_lo, false);
-            xd_lo = __builtin_amdgcn_cvt_pk_fp8_f32(xd[2], xd[3], xd_lo, true);
-            xd_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xd[4], xd[5], xd_hi, false);
-            xd_hi = __builtin_amdgcn_cvt_pk_fp8_f32(xd[6], xd[7], xd_hi, true);
-            const v2i_t x_d = { (int)xd_lo, (int)xd_hi };
+            v2i_t x_a = *(const v2i_t*)(x_group + k_off_a);
+            v2i_t x_b = *(const v2i_t*)(x_group + k_off_b);
+            v2i_t x_c = *(const v2i_t*)(x_group + k_off_c);
+            v2i_t x_d = *(const v2i_t*)(x_group + k_off_d);
 
             // Scale must apply to THIS group's contribution only — never
             // chain through acc, or group g+1 inherits scale_g (compounding

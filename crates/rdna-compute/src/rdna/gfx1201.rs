@@ -488,8 +488,9 @@ impl Gfx1201Device<'_> {
     /// Block-scaled FP8 E4M3 (group-256) WMMA GEMM (prefill).
     ///
     /// Computes `Y[N x M] = X[N x K] @ A[M x K]^T` where `A` is
-    /// `QuantType::FP8E4M3G256` and `X` is F32. Uses the native gfx1201
-    /// `v_wmma_f32_16x16x16_fp8_fp8` instruction (16x16x16 tiles, wave32).
+    /// `QuantType::FP8E4M3G256` and `X` is F32, packed to E4M3 via
+    /// [`Gpu::ensure_fp8_x`] (`pack_f32_to_fp8_gfx12`) before the MMA.
+    /// Same X is cached so back-to-back GEMMs skip the pack.
     ///
     /// Kernel: `kernels/src/gemm_fp8e4m3_g256_wmma.gfx1201.hip`.
     pub fn fp8_gemm_e4m3_g256(
@@ -508,11 +509,12 @@ impl Gfx1201Device<'_> {
         );
 
         self.gpu.bind_thread()?;
+        let x_fp8_ptr = self.gpu.ensure_fp8_x(x, n * k)?;
         self.gpu.ensure_kernel(FP8_E4M3_GEMM_KERNEL, FP8_E4M3_GEMM_SRC, FP8_E4M3_GEMM_KERNEL)?;
 
         let func = &self.gpu.functions[FP8_E4M3_GEMM_KERNEL];
         let mut a_ptr = a.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
+        let mut x_ptr = x_fp8_ptr;
         let mut y_ptr = y.buf.as_ptr();
         let mut m_val = m as i32;
         let mut k_val = k as i32;
@@ -526,7 +528,7 @@ impl Gfx1201Device<'_> {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        let bytes = m * (16 + (k / 256).next_multiple_of(16) * 2 + k) + n * k * 4;
+        let bytes = m * (16 + (k / 256).next_multiple_of(16) * 2 + k) + n * k;
         let timer = crate::profile::begin_timer(
             &self.gpu.hip,
             "gemm",

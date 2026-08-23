@@ -11,7 +11,7 @@ tried one tiling lever: cooperative pack of the 16×256 F32 X panel into
 155 with `#pragma unroll 1`; global loads 50→20; waits 130→81; inst
 533→398. Occupancy halves (granule-16: ~19 waves → ~9). Small-tile µs
 moved ~5–11% (launch-dominated; not a claim). Do not keep LDS convert
-in the kernel. Next lever is a **separate** `pack_f32_to_fp8` pre-pass
-(HFP4G32 FP8 sister already measured in-kernel cvt as the tax; pre-pass
-recovered ~10pp) — not another in-kernel shared staging of F32→E4M3.
+in the kernel. Pack pre-pass **landed** (GEMM-only −42–51% on large-N
+prefill; ffn1 N=128 +8.3%). See [[fp8-gemm-pack-prepass]]. Do not retry
+in-kernel LDS convert. Next is encoder + `fp8_wmma` dispatch, default-off.
 Related: [[r9700-fp8-branch-status]].
