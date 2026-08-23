@@ -12,16 +12,18 @@ Branch `r9700-fp8-adaptive` (fork hipfire-XTW) on `master` `80a572c8`.
 - `258e29d2` GEMM ALL PASS recorded; qt=40 comment; `HIPFIRE_FP8_GEMM_QUICK=1`
 - `fff94abd` LDS X-panel **rejected** (76→155 VGPR)
 - pack pre-pass: GEMM consumes `pack_f32_to_fp8_gfx12` via `ensure_fp8_x`
-- CPU encoder `--format fp8e4m3` (qt=40). Runtime **loads and dispatches**
-  via `DType::FP8E4M3G256` (not `is_batchable_la`). See
-  [[fp8-runtime-dtype-dispatch]], [[fp8-encoder-cpu]].
+- CPU encoder `--format fp8e4m3` (qt=40)
+- `6ff97bce` runtime DType + GEMV/GEMM dispatch + encoder→GPU cosine oracle
+- batched prefill: gfx1201-only `is_batchable_la` + overwrite GEMM arms
+  (llama + qwen35 dense/MoE-attn). See [[fp8-batched-prefill-overwrite-gemm]].
+  `fp8_wmma` stays default-off. No MoE-3D encoder.
 
 Packed-X Radiowave: **68 VGPR / 20 SGPR / 0 spill**, 375 inst, 34 gld,
 94 waits. NRMSE unchanged vs in-kernel cvt. Large-N prefill GEMM-only
 −42% to −51% (gate_up / qkv / attn); ffn1 N=128 **+8.3%**. Occupancy
 unchanged (granule-16 both round to 80 VGPR). See
-[[fp8-gemm-pack-prepass]]. Encoder: [[fp8-encoder-cpu]]. `fp8_wmma` stays
-default-off.
+[[fp8-gemm-pack-prepass]]. Encoder: [[fp8-encoder-cpu]]. Runtime:
+[[fp8-runtime-dtype-dispatch]].
 
 HIP launch must pass `&mut` addresses. Related:
 [[fp8-g256-not-llamacpp-34b]], [[rdna4-isa-fp8-wmma-confirmed]],

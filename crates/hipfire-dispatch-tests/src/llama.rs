@@ -237,7 +237,9 @@ fn llama_prefill_unsupported_dtypes() {
     assert!(!is_batchable_la(DType::Q4K, "gfx1100"));
     assert!(!is_batchable_la(DType::Q6K, "gfx1100"));
     assert!(!is_batchable_la(DType::F32, "gfx1100"));
-    assert!(!is_batchable_la(DType::FP8E4M3G256, "gfx1201"));
+    assert!(!is_batchable_la(DType::FP8E4M3G256, "gfx1100"));
+    assert!(!is_batchable_la(DType::FP8E4M3G256, "gfx1200"));
+    assert!(is_batchable_la(DType::FP8E4M3G256, "gfx1201"));
 }
 
 // ─── LLaMA dispatch constants ─────────────────────────────────

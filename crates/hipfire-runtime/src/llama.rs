@@ -1756,14 +1756,10 @@ pub fn prefill_forward(
 /// largest physical_cap any consumer sets up.
 pub const PREFILL_MAX_BATCH: usize = 256;
 
-/// Is this dtype/arch combination eligible for the batched WMMA prefill
-/// kernels? Matches `qwen35::is_batchable_la` exactly so plain Qwen3 and
-/// hybrid Qwen3.5 share one rule and stay in lockstep when new dtypes or
-/// arches gain WMMA support.
+/// Is this dtype/arch combination eligible for batched prefill?
+/// Shares the always-ok / WMMA / gfx10-MQ3 rules with `qwen35::is_batchable_la`.
+/// `FP8E4M3G256` is gfx1201-only overwrite GEMM (no fused QKV/gate_up).
 pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
-    // FP8E4M3G256 is intentionally absent: the QKV `else` is
-    // `gemm_qkv_hfq4g256` and would treat E4M3 bytes as HFQ4. Prefill
-    // stays on per-token `weight_gemv` until dedicated batched arms land.
     let always_ok = matches!(
         dt,
         DType::MQ4G256
@@ -1791,7 +1787,10 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             arch,
             "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
         );
-    wmma_only || mq3_gfx10_scalar
+    // Native qt=40 overwrite GEMM (no fused QKV/gate_up). Kernel sources
+    // are gfx1201-tagged; gfx1200 would JIT-fail if admitted.
+    let fp8_gfx1201 = matches!(dt, DType::FP8E4M3G256) && arch == "gfx1201";
+    wmma_only || mq3_gfx10_scalar || fp8_gfx1201
 }
 
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
@@ -2435,6 +2434,7 @@ fn forward_prefill_chunk(
         let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
         let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let qkv_is_fp8 = matches!(layer.wq.gpu_dtype, DType::FP8E4M3G256);
 
         // attn_norm (+ FWHT for MQ — includes MFP4G32 since rotation is the
         // same FWHT pattern as MQ4).
@@ -2580,6 +2580,36 @@ fn forward_prefill_chunk(
                 layer.wk.m,
                 layer.wv.m,
                 layer.wq.k,
+                n,
+            )?;
+        } else if qkv_is_fp8 {
+            debug_assert!(
+                matches!(layer.wk.gpu_dtype, DType::FP8E4M3G256)
+                    && matches!(layer.wv.gpu_dtype, DType::FP8E4M3G256),
+                "llama FP8 QKV batch requires wq/wk/wv to share FP8E4M3G256"
+            );
+            gpu.fp8_gemm_e4m3_g256(
+                &layer.wq.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_batch,
+                layer.wq.m,
+                layer.wq.k,
+                n,
+            )?;
+            gpu.fp8_gemm_e4m3_g256(
+                &layer.wk.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_k_batch,
+                layer.wk.m,
+                layer.wk.k,
+                n,
+            )?;
+            gpu.fp8_gemm_e4m3_g256(
+                &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_v_batch,
+                layer.wv.m,
+                layer.wv.k,
                 n,
             )?;
         } else {
@@ -2890,6 +2920,7 @@ fn forward_prefill_chunk(
         let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
         let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let wo_is_fp8 = matches!(layer.wo.gpu_dtype, DType::FP8E4M3G256);
         let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
         let wo_is_hfq4g128 = matches!(layer.wo.gpu_dtype, DType::HFQ4G128);
         let wo_input = if wo_is_mq {
@@ -2962,6 +2993,18 @@ fn forward_prefill_chunk(
                 layer.wo.k,
                 n,
             )?;
+        } else if wo_is_fp8 {
+            let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
+            gpu.fp8_gemm_e4m3_g256(
+                &layer.wo.buf,
+                wo_input,
+                &scratch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+            )?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
         } else {
             gpu.gemm_hfq4g256_residual(
                 &layer.wo.buf,
@@ -2982,6 +3025,7 @@ fn forward_prefill_chunk(
         let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
         let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let ffn_is_fp8 = matches!(layer.w_gate.gpu_dtype, DType::FP8E4M3G256);
         let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
         let ffn_is_hfq4g128 = matches!(layer.w_gate.gpu_dtype, DType::HFQ4G128);
         if ffn_is_mq {
@@ -3093,6 +3137,27 @@ fn forward_prefill_chunk(
                 layer.w_gate.k,
                 n,
             )?;
+        } else if ffn_is_fp8 {
+            debug_assert!(
+                matches!(layer.w_up.gpu_dtype, DType::FP8E4M3G256),
+                "llama FP8 gate/up batch requires both weights to be FP8E4M3G256"
+            );
+            gpu.fp8_gemm_e4m3_g256(
+                &layer.w_gate.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+            )?;
+            gpu.fp8_gemm_e4m3_g256(
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.up_batch,
+                layer.w_up.m,
+                layer.w_up.k,
+                n,
+            )?;
         } else {
             gpu.gemm_gate_up_hfq4g256(
                 &layer.w_gate.buf,
@@ -3113,6 +3178,7 @@ fn forward_prefill_chunk(
         let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
         let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let w_down_is_fp8 = matches!(layer.w_down.gpu_dtype, DType::FP8E4M3G256);
         let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
         let w_down_is_hfq4g128 = matches!(layer.w_down.gpu_dtype, DType::HFQ4G128);
         if w_down_is_mq {
@@ -3192,6 +3258,18 @@ fn forward_prefill_chunk(
                 layer.w_down.k,
                 n,
             )?;
+        } else if w_down_is_fp8 {
+            let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
+            gpu.fp8_gemm_e4m3_g256(
+                &layer.w_down.buf,
+                &pbs.ffn_hidden_batch,
+                &scratch,
+                layer.w_down.m,
+                layer.w_down.k,
+                n,
+            )?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
         } else {
             gpu.gemm_hfq4g256_residual(
                 &layer.w_down.buf,
@@ -8208,14 +8286,20 @@ mod tests {
     #[test]
     fn is_batchable_la_unsupported_dtypes() {
         // Q4K / Q6K / F32 stay on per-token forward_scratch.
-        // FP8E4M3G256 must too: the QKV `else` is gemm_qkv_hfq4g256.
         for arch in ["gfx1100", "gfx1200", "gfx1201"] {
             assert!(!is_batchable_la(DType::Q4K, arch));
             assert!(!is_batchable_la(DType::Q6K, arch));
             assert!(!is_batchable_la(DType::F32, arch));
+        }
+    }
+
+    #[test]
+    fn is_batchable_la_fp8_gfx1201_only() {
+        assert!(is_batchable_la(DType::FP8E4M3G256, "gfx1201"));
+        for arch in ["gfx1100", "gfx1200", "gfx1010", "gfx906"] {
             assert!(
                 !is_batchable_la(DType::FP8E4M3G256, arch),
-                "FP8E4M3G256 must not take the HFQ4 batched QKV else"
+                "FP8E4M3G256 must not batch on {arch}"
             );
         }
     }

@@ -9,9 +9,8 @@ to `KernelKey::GemvFp8E4m3G256` under `ArchPredicate::HasWmmaGfx12`.
 `weight_gemm` calls `Gpu::fp8_gemm_e4m3_g256`. Native opt-in; **not**
 gated on `fp8_wmma` (that flag is HFP4's optional FP8 activation path).
 
-**Not** in `is_batchable_la` (llama or qwen35). The QKV `else` is
-`gemm_qkv_hfq4g256` and would treat E4M3 bytes as HFQ4. Prefill falls
-back to per-token `weight_gemv` (slow, correct). No MoE-3D encoder path.
+Batched prefill is gfx1201-only overwrite GEMM — see
+[[fp8-batched-prefill-overwrite-gemm]]. No MoE-3D encoder path.
 
 Encoder→GPU cosine oracle (R9700, HIP 7.2, `HIP_VISIBLE_DEVICES=0`,
 N=M=16 K=256, 2026-08-23): encoder NRMSE vs F32 W@X **2.533e-3**; GEMV

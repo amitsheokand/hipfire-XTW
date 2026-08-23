@@ -908,6 +908,10 @@ pub fn forward_prefill_batch_with_pbs_opts(
 // docs/plans/mq-lloyd-batched-prefill-followup.md for the full
 // checklist + rationale.
 //
+// FP8E4M3G256 is gfx1201-only overwrite GEMM (no fused QKV/QKVZA/gate_up).
+// Dedicated `is_fp8` / `*_is_fp8` arms sit in front of every HFQ4 `else`.
+// Do not admit it in `moe_ffn_batched_admissible` (no MoE-3D encoder).
+//
 // As of this PR (issue #116 Phase 5): MQ3G256Lloyd is wired through
 // the gemm_*_mq3g256_lloyd_wmma family on gfx11 (always-on) and on
 // gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ4G256Lloyd is wired
@@ -1070,6 +1074,12 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
             .as_deref()
             == Some("1");
 
+    // Native qt=40 overwrite GEMM (no fused QKV/QKVZA/gate_up). Kernel
+    // sources are gfx1201-tagged; gfx1200 would JIT-fail if admitted.
+    // Dedicated arms live in the LA/FA matchers; the HFQ4 `else` must
+    // not see this dtype. MoE FFN stays on per-token (no 3D encoder).
+    let fp8_gfx1201 = matches!(dt, DType::FP8E4M3G256) && arch == "gfx1201";
+
     mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
         || lloyd_mq3_with_gfx11_wmma
@@ -1078,6 +1088,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
         || e8_with_wmma
+        || fp8_gfx1201
 }
 /// Single source of truth for per-layer batchability and checked geometry.
 /// Called by `validate_ep_batch_compatibility`, `prefill_batch_pbs_eligible`,
@@ -2102,6 +2113,36 @@ pub(crate) fn run_plain_gemm_key(
     hipfire_runtime::llama::gemm_family()
         .run_key(key, &ctx, gpu, &params)
         .map_err(HipError::from)
+}
+
+/// Overwrite GEMM for native qt=40 `FP8E4M3G256`. gfx1201-only at the
+/// `Gpu` method; callers must not admit this dtype on any other arch.
+#[inline]
+fn run_fp8_gemm(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    gpu.fp8_gemm_e4m3_g256(&w.buf, x, y, w.m, w.k, n)
+}
+
+/// Residual `y += W·x` via overwrite GEMM into `scratch` then add.
+/// `scratch` must be dead (not aliased with `x` or `y`).
+#[inline]
+fn run_fp8_gemm_add(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    scratch: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    let projected = scratch.sub_offset(0, n * w.m);
+    gpu.fp8_gemm_e4m3_g256(&w.buf, x, &projected, w.m, w.k, n)?;
+    let y_n = y.sub_offset(0, n * w.m);
+    gpu.add_inplace_f32(&y_n, &projected)
 }
 
 /// #397 Ship 5.2 FINAL: route a single BATCHED-prefill RESIDUAL-fused GEMM
@@ -3484,6 +3525,7 @@ fn batch_chunk_delta_net_attn(
                 let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
                 let is_mq3_lloyd = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256Lloyd);
                 let is_fp4 = matches!(layer.wqkv.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let is_fp8 = matches!(layer.wqkv.gpu_dtype, DType::FP8E4M3G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
 
                 // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
@@ -3683,6 +3725,17 @@ fn batch_chunk_delta_net_attn(
                         layer.wqkv.k,
                         n,
                     )?;
+                } else if is_fp8 {
+                    debug_assert!(
+                        matches!(layer.wz.gpu_dtype, DType::FP8E4M3G256)
+                            && matches!(layer.w_beta.gpu_dtype, DType::FP8E4M3G256)
+                            && matches!(layer.w_alpha.gpu_dtype, DType::FP8E4M3G256),
+                        "LA qkvza FP8 dispatch requires all of wqkv/wz/w_beta/w_alpha to be FP8E4M3G256",
+                    );
+                    run_fp8_gemm(gpu, &layer.wqkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.wz, &pbs.x_rot_batch, &pbs.dn_z_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
                 } else {
                     run_fused_qkvza_key(
                         gpu,
@@ -4056,6 +4109,7 @@ fn batch_chunk_delta_net_attn(
                 let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let wo_is_fp8 = matches!(layer.wo.gpu_dtype, DType::FP8E4M3G256);
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let wo_input = if wo_is_mq {
                     // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
@@ -4164,6 +4218,15 @@ fn batch_chunk_delta_net_attn(
                         layer.wo.k,
                         n,
                     )?;
+                } else if wo_is_fp8 {
+                    run_fp8_gemm_add(
+                        gpu,
+                        &layer.wo,
+                        wo_input,
+                        &pbs.x_batch,
+                        &pbs.x_rot_batch,
+                        n,
+                    )?;
                 } else {
                     run_residual_gemm_key(
                         gpu,
@@ -4208,6 +4271,7 @@ fn batch_chunk_delta_net_ffn(
                 let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
                 let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let ffn_is_fp8 = matches!(layer.w_gate.gpu_dtype, DType::FP8E4M3G256);
                 let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 if ffn_is_mq {
                     // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
@@ -4336,6 +4400,13 @@ fn batch_chunk_delta_net_ffn(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if ffn_is_fp8 {
+                    debug_assert!(
+                        matches!(layer.w_up.gpu_dtype, DType::FP8E4M3G256),
+                        "LA FFN FP8 dispatch requires both w_gate and w_up to be FP8E4M3G256",
+                    );
+                    run_fp8_gemm(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n)?;
                 } else {
                     run_fused_gate_up_key(
                         gpu,
@@ -4372,6 +4443,7 @@ fn batch_chunk_delta_net_ffn(
                 let w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let w_down_is_fp8 = matches!(layer.w_down.gpu_dtype, DType::FP8E4M3G256);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 if w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for w_down input.
@@ -4479,6 +4551,15 @@ fn batch_chunk_delta_net_ffn(
                         layer.w_down.k,
                         n,
                     )?;
+                } else if w_down_is_fp8 {
+                    run_fp8_gemm_add(
+                        gpu,
+                        &layer.w_down,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        &pbs.x_rot_batch,
+                        n,
+                    )?;
                 } else {
                     run_residual_gemm_key(
                         gpu,
@@ -4534,6 +4615,7 @@ fn batch_chunk_full_attn_attn(
                 let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
                 let qkv_is_mq3_lloyd = matches!(layer.wq.gpu_dtype, DType::MQ3G256Lloyd);
                 let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let qkv_is_fp8 = matches!(layer.wq.gpu_dtype, DType::FP8E4M3G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
                 // Fused QKV kernels require all three weights to share a
                 // dtype — they treat wq/wk/wv as same-stride byte arrays.
@@ -4704,6 +4786,15 @@ fn batch_chunk_full_attn_attn(
                         layer.wv.k,
                         n,
                     )?;
+                } else if qkv_is_fp8 && qkv_same_dtype {
+                    debug_assert!(
+                        matches!(layer.wk.gpu_dtype, DType::FP8E4M3G256)
+                            && matches!(layer.wv.gpu_dtype, DType::FP8E4M3G256),
+                        "FA qkv FP8 dispatch requires all of wq/wk/wv to be FP8E4M3G256",
+                    );
+                    run_fp8_gemm(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
                 } else if qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
@@ -4927,6 +5018,7 @@ fn batch_chunk_full_attn_attn(
                 let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let fa_wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let fa_wo_is_fp8 = matches!(layer.wo.gpu_dtype, DType::FP8E4M3G256);
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_input = if fa_wo_is_mq {
                     // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
@@ -5032,6 +5124,15 @@ fn batch_chunk_full_attn_attn(
                         layer.wo.k,
                         n,
                     )?;
+                } else if fa_wo_is_fp8 {
+                    run_fp8_gemm_add(
+                        gpu,
+                        &layer.wo,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        &pbs.x_rot_batch,
+                        n,
+                    )?;
                 } else {
                     run_residual_gemm_key(
                         gpu,
@@ -5078,6 +5179,7 @@ fn batch_chunk_full_attn_ffn(
                 let fa_ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_ffn_is_fp4 =
                     matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let fa_ffn_is_fp8 = matches!(layer.w_gate.gpu_dtype, DType::FP8E4M3G256);
                 let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 if fa_ffn_is_mq {
                     // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
@@ -5202,6 +5304,13 @@ fn batch_chunk_full_attn_ffn(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if fa_ffn_is_fp8 {
+                    debug_assert!(
+                        matches!(layer.w_up.gpu_dtype, DType::FP8E4M3G256),
+                        "FA FFN FP8 dispatch requires both w_gate and w_up to be FP8E4M3G256",
+                    );
+                    run_fp8_gemm(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n)?;
                 } else {
                     run_fused_gate_up_key(
                         gpu,
@@ -5231,6 +5340,7 @@ fn batch_chunk_full_attn_ffn(
                 let fa_w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let fa_w_down_is_fp8 = matches!(layer.w_down.gpu_dtype, DType::FP8E4M3G256);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 if fa_w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
@@ -5334,6 +5444,15 @@ fn batch_chunk_full_attn_ffn(
                         &pbs.x_batch,
                         layer.w_down.m,
                         layer.w_down.k,
+                        n,
+                    )?;
+                } else if fa_w_down_is_fp8 {
+                    run_fp8_gemm_add(
+                        gpu,
+                        &layer.w_down,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        &pbs.x_rot_batch,
                         n,
                     )?;
                 } else {
@@ -5442,13 +5561,14 @@ fn batch_chunk_delta_net_moe(
                 // with MQ3/Lloyd-MQ3 weights anywhere (attention OR FFN),
                 // mirroring the captured-path guard at line 3367+. So
                 // `layer.wqkv.gpu_dtype` is restricted here to MQ4G256 /
-                // HFQ4G256 / MQ6G256 / HFQ6G256 / Q8_0. Q8 admit landed
+                // HFQ4G256 / MQ6G256 / HFQ6G256 / Q8_0 / FP8E4M3G256. Q8 admit landed
                 // alongside the moe_ffn router/gate Q8 unlock (A3B's LA
                 // attention weights are Q8 — engine quantizer keeps q/k/v/o
                 // at Q8 alongside the Q8 router + shared_expert_gate).
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
+                let is_fp8 = matches!(layer.wqkv.gpu_dtype, DType::FP8E4M3G256);
                 // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
                 // ParoQ4G128 (each with its own Givens rotation tables);
                 // w_alpha/w_beta are F32 (no rotation, no quantization).
@@ -5672,6 +5792,17 @@ fn batch_chunk_delta_net_moe(
                         layer.w_alpha.k,
                         n,
                     )?;
+                } else if is_fp8 {
+                    debug_assert!(
+                        matches!(layer.wz.gpu_dtype, DType::FP8E4M3G256)
+                            && matches!(layer.w_beta.gpu_dtype, DType::FP8E4M3G256)
+                            && matches!(layer.w_alpha.gpu_dtype, DType::FP8E4M3G256),
+                        "DNMoe LA qkvza FP8 dispatch requires all of wqkv/wz/w_beta/w_alpha to be FP8E4M3G256",
+                    );
+                    run_fp8_gemm(gpu, &layer.wqkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.wz, &pbs.x_rot_batch, &pbs.dn_z_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
                 } else {
                     run_fused_qkvza_key(
                         gpu,
@@ -6033,9 +6164,10 @@ fn batch_chunk_delta_net_moe(
                 // stream when dispatched through the HFQ4 kernel against
                 // 200 B/group MQ6-layout bytes.
                 let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let dn_wo_is_fp8 = matches!(layer.wo.gpu_dtype, DType::FP8E4M3G256);
                 let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
-                let dn_wo_input = if dn_wo_is_q8 {
+                let dn_wo_input = if dn_wo_is_q8 || dn_wo_is_fp8 {
                     &pbs.dn_normed_batch
                 } else if dn_wo_is_paro {
                     // PARO wo: rotate dn_normed by wo's own Givens tables
@@ -6110,6 +6242,15 @@ fn batch_chunk_delta_net_moe(
                     )?;
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else if dn_wo_is_fp8 {
+                    run_fp8_gemm_add(
+                        gpu,
+                        &layer.wo,
+                        dn_wo_input,
+                        &pbs.x_batch,
+                        &pbs.dn_normed_rot_batch,
+                        n,
+                    )?;
                 } else if dn_wo_is_paro {
                     // PARO wo residual: HFQ4G128 batched GEMM into scratch,
                     // then add into x_batch. Reuse x_norm_batch (free at
@@ -6206,6 +6347,7 @@ fn batch_chunk_full_attn_moe(
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+                let qkv_is_fp8 = matches!(layer.wq.gpu_dtype, DType::FP8E4M3G256);
                 // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
                 // (each with its own Givens rotation tables). The fused-QKV
                 // kernels can't handle this — they assume one shared
@@ -6403,6 +6545,15 @@ fn batch_chunk_full_attn_moe(
                         layer.wv.k,
                         n,
                     )?;
+                } else if qkv_is_fp8 && qkv_same_dtype {
+                    debug_assert!(
+                        matches!(layer.wk.gpu_dtype, DType::FP8E4M3G256)
+                            && matches!(layer.wv.gpu_dtype, DType::FP8E4M3G256),
+                        "FAMoe qkv FP8 dispatch requires all of wq/wk/wv to be FP8E4M3G256",
+                    );
+                    run_fp8_gemm(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+                    run_fp8_gemm(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
                 } else if qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
@@ -6600,13 +6751,14 @@ fn batch_chunk_full_attn_moe(
                 // — catastrophic stride mismatch produces a single-token
                 // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let fa_wo_is_fp8 = matches!(layer.wo.gpu_dtype, DType::FP8E4M3G256);
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
                 // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
                 // paro into fa_attn_out_rot_batch, then HFQ4G128 GEMM into a
                 // scratch, then add into x_batch.
                 let fa_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
-                let fa_wo_input = if fa_wo_is_q8 {
+                let fa_wo_input = if fa_wo_is_q8 || fa_wo_is_fp8 {
                     &pbs.fa_attn_out_batch
                 } else if fa_wo_is_paro {
                     let paro_wo = layer.wo.paro.as_ref().unwrap_or_else(|| {
@@ -6678,6 +6830,15 @@ fn batch_chunk_full_attn_moe(
                     )?;
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else if fa_wo_is_fp8 {
+                    run_fp8_gemm_add(
+                        gpu,
+                        &layer.wo,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        &pbs.fa_attn_out_rot_batch,
+                        n,
+                    )?;
                 } else if fa_wo_is_paro {
                     // PARO wo residual: HFQ4G128 batched GEMM into scratch,
                     // then add into x_batch. Reuse x_norm_batch (free since
@@ -7395,12 +7556,13 @@ fn batched_gemm_single_weight(
                 n,
             )
         }
+        DType::FP8E4M3G256 => run_fp8_gemm(gpu, w, x, y, n),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "mixed-format batched prefill: weight dtype {other:?} has no \
              single-weight batched dispatch yet. Currently MQ3/HFQ3, \
-             MQ4/HFQ4, MQ6/HFQ6, and Q8_0 mixes are wired. Re-quantize with \
+             MQ4/HFQ4, MQ6/HFQ6, Q8_0, and FP8E4M3G256 mixes are wired. Re-quantize with \
              uniform format or extend `batched_gemm_single_weight` to cover this format."
             ),
         )),
@@ -7599,9 +7761,34 @@ mod tests {
                 !is_batchable_la(DType::BF16, arch),
                 "BF16 must fall back until the batched BF16 dispatch family is wired"
             );
+        }
+    }
+
+    #[test]
+    fn qwen35_is_batchable_la_fp8_gfx1201_only() {
+        assert!(
+            is_batchable_la(DType::FP8E4M3G256, "gfx1201"),
+            "FP8E4M3G256 batches on gfx1201 via overwrite GEMM"
+        );
+        for &arch in WMMA_ARCHS {
+            if arch == "gfx1201" {
+                continue;
+            }
             assert!(
                 !is_batchable_la(DType::FP8E4M3G256, arch),
-                "FP8E4M3G256 must fall back; no fused QKV/gate_up arm yet"
+                "FP8E4M3G256 must not batch on {arch}"
+            );
+        }
+        for &arch in NO_WMMA_ARCHS {
+            assert!(
+                !is_batchable_la(DType::FP8E4M3G256, arch),
+                "FP8E4M3G256 must not batch on {arch}"
+            );
+        }
+        for &arch in GFX10_SCALAR_ARCHS {
+            assert!(
+                !is_batchable_la(DType::FP8E4M3G256, arch),
+                "FP8E4M3G256 must not batch on {arch}"
             );
         }
     }

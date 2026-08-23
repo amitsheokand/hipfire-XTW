@@ -56,10 +56,11 @@ under `--genco`; shuffle-reduce is the live path.
 Config keys already exist and are **off**: `experimental.fp8_wmma`,
 `experimental.fp8_format` (default `e4m3`), `experimental.ubatch_size`,
 `experimental.moe_expert_cache_mb`. CPU encoder `--format fp8e4m3` writes
-qt=40. Runtime loads `DType::FP8E4M3G256` and dispatches gfx1201 GEMV/GEMM;
-prefill is per-token GEMV (`is_batchable_la` stays false). Encoder→GPU
-oracle 2026-08-23 (`HIP_VISIBLE_DEVICES=0`, HIP 7.2, 16×16×256): GEMV
-cosine 0.999998 / GEMM cosine 0.999995 vs F32 W@X. Not a product default.
+qt=40. Runtime loads `DType::FP8E4M3G256` and dispatches gfx1201 GEMV/GEMM.
+Prefill admits batched overwrite GEMM on **gfx1201 only** (`is_batchable_la`);
+gfx1200 stays false. No MoE-3D encoder. Encoder→GPU oracle 2026-08-23
+(`HIP_VISIBLE_DEVICES=0`, HIP 7.2, 16×16×256): GEMV cosine 0.999998 /
+GEMM cosine 0.999995 vs F32 W@X. Not a product default.
 
 ### Layout comment bug (do not copy llama.cpp)
 
