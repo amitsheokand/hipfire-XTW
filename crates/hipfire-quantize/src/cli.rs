@@ -41,7 +41,7 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, default_value = "q8f16")]
     pub format: String,
 
-    /// Rayon worker threads (defaults to 80% of available cores).
+    /// Rayon worker threads (defaults to available cores minus 2).
     #[arg(long, env = "HIPFIRE_QUANT_THREADS", value_name = "N")]
     pub threads: Option<usize>,
 

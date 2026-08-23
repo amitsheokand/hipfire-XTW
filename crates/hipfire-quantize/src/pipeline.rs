@@ -2575,13 +2575,15 @@ fn setup_thread_pool(args: &QuantizeArgs) {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    let default_threads = ((cores * 8) / 10).max(1);
+    // Leave two cores for the rest of the machine (12 → 10). Override with
+    // --threads / HIPFIRE_QUANT_THREADS.
+    let default_threads = cores.saturating_sub(2).max(1);
     let threads = args.threads.unwrap_or(default_threads);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global();
     eprintln!(
-        "Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})"
+        "Rayon: {threads} worker threads ({cores} cores available, default cores-2 = {default_threads})"
     );
 }
 
