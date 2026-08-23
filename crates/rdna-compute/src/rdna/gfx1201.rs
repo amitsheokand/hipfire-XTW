@@ -37,6 +37,10 @@ const MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_SRC: &str = include_str!(
 const MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_KERNEL: &str =
     "gemv_mq2g256_lloyd_moe_down_expanded_k4_lds_gfx1201_ep";
 
+const FP8_E4M3_GEMV_SRC: &str =
+    include_str!("../../../../kernels/src/gemv_fp8e4m3_g256.gfx1201.hip");
+const FP8_E4M3_GEMV_KERNEL: &str = "gemv_fp8e4m3_g256_gfx1201";
+
 /// A mutable GPU borrow proven to target exact gfx1201.
 ///
 /// The constructor is intentionally available only through
@@ -406,6 +410,71 @@ impl Gfx1201Device<'_> {
                 blob
             },
         );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// Block-scaled FP8 E4M3 (group-256) decode GEMV.
+    ///
+    /// Computes `y[row] = A[row,:] . x` for `M` rows of `K`-wide FP8 weights
+    /// on the native gfx1201 `v_dot4_f32_fp8_fp8` path (one wave32 per row).
+    /// Layout matches `QuantType::FP8E4M3G256`:
+    /// `[16 B hdr (fp16 row_scale, fp16 row_bias)] [n_blocks×2 B fp16 scale]
+    ///  [n_blocks×256 B E4M3 leaves]`, `n_blocks = K / 256`.
+    ///
+    /// Kernel: `kernels/src/gemv_fp8e4m3_g256.gfx1201.hip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_gemv_e4m3_g256(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "gfx1201 FP8 E4M3 GEMV requires K%256=0");
+        assert!(
+            x.shape.len() == 1 && y.shape.len() == 1,
+            "fp8_gemv_e4m3_g256 expects x[K], y[M]"
+        );
+
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(FP8_E4M3_GEMV_KERNEL, FP8_E4M3_GEMV_SRC, FP8_E4M3_GEMV_KERNEL)?;
+
+        let func = &self.gpu.functions[FP8_E4M3_GEMV_KERNEL];
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = m * (16 + (k / 256).next_multiple_of(16) * 2 + k);
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "gemv",
+            FP8_E4M3_GEMV_KERNEL,
+            bytes,
+        );
+
+        let result = unsafe {
+            self.gpu.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.gpu.stream_ref(),
+                &mut params,
+            )
+        };
         if let Some(timer) = timer {
             timer.finish(&self.gpu.hip);
         }
