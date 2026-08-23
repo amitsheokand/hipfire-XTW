@@ -1788,6 +1788,8 @@ mod hfq_block_diag {
             35 => "MFP4G32E8SOA",
             36 => "MFP3G32E8",
             37 => "MFP2G32E8",
+            40 => "FP8E4M3G256",
+            41 => "FP8E5M2G256",
             _ => "?",
         }
     }

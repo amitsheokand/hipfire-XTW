@@ -220,6 +220,7 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
         GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
         GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
+        GgufFormat::Fp8E4m3 => GgufFormat::Fp8E4m3,
     }
 }
 

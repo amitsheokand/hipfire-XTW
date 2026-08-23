@@ -230,7 +230,7 @@ Skills in play: `.agents/skills/hipfire-arch-port/` (WMMA C-map, chip tag),
 | **3c** | F8_Mode / C-map oracle | **Empirically closed:** CPU ref is OCP E4M3fn bias 7; C-map oracle 16×16×256 passed | hours |
 | **3d** | Fix qt=40 comment (G256 vs 32-elem 34 B) | **Done** — 8.0625 bpw in `hfq.rs` | minutes |
 | **4** | One tiling lever after 3b is green | **LDS X-panel rejected.** Pack pre-pass **landed**: GEMM-only −42–51% large-N; ffn1 +8.3%. Occupancy unchanged. See `.agent-memory/notes/fp8-gemm-pack-prepass.md` | done |
-| **5** | Encoder + `fp8_wmma` dispatch into one prefill GEMM | Channel cosine on a tiny oracle; daemon still default-off | days |
+| **5** | Encoder + `fp8_wmma` dispatch into one prefill GEMM | **Encoder CPU landed** (`--format fp8e4m3`, qt=40). Runtime `DType` + load/dispatch still open. Daemon default-off. | days |
 | **Parked** | FreeToken \(q^\star\) / semantic anchors | Only if a MoE pool does not fit 32 GB | later |
 | **Never** | Hyperloom, Lemonade, GGUF F8 layout, `HSA_OVERRIDE` as product | — | — |
 

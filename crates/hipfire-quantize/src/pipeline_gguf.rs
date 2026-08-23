@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Parser;
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::fp8e4m3_g256::quantize_fp8e4m3_g256_2d;
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use hipfire_quantize::hessian_io;
 use crate::e8;
@@ -70,6 +71,7 @@ pub(crate) enum GgufFormat {
     Mfp4E8Soa, // mfp4-E8 SoA — same E8 data in structure-of-arrays layout for coalesced GEMV
     Mfp3E8, // mfp3-E8 — mfp4-E8 frame with 3-bit lattice (13 B/blk, 3.25 bpw; drop-in for MQ3-Lloyd cold)
     Mfp2E8, // mfp2-E8 — mfp4-E8 frame with 2-bit lattice (9 B/blk, 2.25 bpw; drop-in for MQ2-Lloyd cold)
+    Fp8E4m3, // FP8E4M3G256 — OCP E4M3fn + fp16 g256 scale (gfx1201 WMMA). Experimental.
 }
 
 impl GgufFormat {
@@ -93,6 +95,7 @@ impl GgufFormat {
             "mfp4e8soa" | "mfp4-e8-soa" | "mfp4e8-soa" => Some(Self::Mfp4E8Soa),
             "mfp3e8" | "mfp3-e8" => Some(Self::Mfp3E8),
             "mfp2e8" | "mfp2-e8" => Some(Self::Mfp2E8),
+            "fp8e4m3" | "fp8e4m3g256" | "fp8-e4m3" => Some(Self::Fp8E4m3),
             _ => None,
         }
     }
@@ -117,6 +120,7 @@ impl GgufFormat {
             Self::Mfp4E8Soa => "MFP4G32E8SOA",
             Self::Mfp3E8 => "MFP3G32E8",
             Self::Mfp2E8 => "MFP2G32E8",
+            Self::Fp8E4m3 => "FP8E4M3G256",
         }
     }
 }
@@ -353,6 +357,12 @@ pub(crate) fn run_gguf_pipeline(
                     let q = quantize_hfp4g32_2d(&f32_data, m, k);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
+                GgufFormat::Fp8E4m3 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_fp8e4m3_g256_2d(&f32_data, m, k);
+                    (q, QuantType::FP8E4M3G256, 256u32, "FP8E4M3G256")
+                }
                 GgufFormat::Mfp4 => {
                     // No MFP6 variant. Promote6 for MFP4 stays at MFP4G32 (4.25 bpw).
                     let m = info.shape[0] as usize;
@@ -489,6 +499,11 @@ pub(crate) fn run_gguf_pipeline(
                     let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
+                GgufFormat::Fp8E4m3 => {
+                    let m = info.shape[0] as usize;
+                    let q = quantize_fp8e4m3_g256_2d(&f32_data, m, k_dim);
+                    (q, QuantType::FP8E4M3G256, 256u32, "FP8E4M3G256")
+                }
                 GgufFormat::Mfp4 => {
                     let m = info.shape[0] as usize;
                     let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
@@ -575,6 +590,12 @@ pub(crate) fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_hfp4g32_2d(&f32_data, m, k);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                }
+                GgufFormat::Fp8E4m3 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_fp8e4m3_g256_2d(&f32_data, m, k);
+                    (q, QuantType::FP8E4M3G256, 256u32, "FP8E4M3G256")
                 }
                 GgufFormat::Mfp4 => {
                     let m = info.shape[0] as usize;

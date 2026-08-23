@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Parser;
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::fp8e4m3_g256::quantize_fp8e4m3_g256_2d;
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use hipfire_quantize::hessian_io;
 use crate::e8;
@@ -50,6 +51,7 @@ struct MainQuantFlags {
     use_gptq_mfp2e8: bool,
     use_gptq_mfp3e8: bool,
     use_hfp4: bool,
+    use_fp8e4m3: bool,
     use_hfq2g128: bool,
     use_hfq2g256: bool,
     use_hfq3g128: bool,
@@ -631,6 +633,9 @@ pub(crate) fn run() {
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
+    // FP8E4M3G256 — OCP E4M3fn + fp16 g256 scale. gfx1201 WMMA/GEMV experimental.
+    let use_fp8e4m3 =
+        format == "fp8e4m3" || format == "fp8e4m3g256" || format == "fp8-e4m3";
     // MFP4G32 — HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same per-row layout
     // as HFP4G32 with format_flags bit 0 + bits 2-3 = 01 stamping the rotation kind.
     let use_mfp4 = format == "mfp4" || format == "mfp4g32" || format == "mf4p";
@@ -2352,6 +2357,7 @@ pub(crate) fn run() {
             use_gptq_mfp2e8: use_gptq_mfp2e8,
             use_gptq_mfp3e8: use_gptq_mfp3e8,
             use_hfp4: use_hfp4,
+            use_fp8e4m3: use_fp8e4m3,
             use_hfq2g128: use_hfq2g128,
             use_hfq2g256: use_hfq2g256,
             use_hfq3g128: use_hfq3g128,
@@ -4749,6 +4755,15 @@ fn handle_main_quant(
                                 let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
                                 (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                             }
+                            GgufFormat::Fp8E4m3 => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_fp8e4m3_g256_2d(&f32_data, m, k_dim);
+                                (q, QuantType::FP8E4M3G256, 256u32, "FP8E4M3G256")
+                            }
                         }
                     } else {
                         // Non-256-aligned override target: Q8 fallback.
@@ -4975,6 +4990,24 @@ fn handle_main_quant(
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                         } else {
                             // Fallback to standard HFQ4-G128 for non-256-aligned
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if flags.use_fp8e4m3 && is_embed {
+                        // FP8 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if flags.use_fp8e4m3 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let q = quantize_fp8e4m3_g256_2d(&f32_data, m, k_dim);
+                            (q, QuantType::FP8E4M3G256, 256u32, "FP8E4M3G256")
+                        } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
