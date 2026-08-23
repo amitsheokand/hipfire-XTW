@@ -462,6 +462,10 @@ name = "test_gemv_fp8e4m3_g256"
 required-features = ["lab"]
 
 [[example]]
+name = "test_gemm_fp8e4m3_g256"
+required-features = ["lab"]
+
+[[example]]
 name = "test_gemv_hfq4g256_xbatch"
 required-features = ["lab"]
 
