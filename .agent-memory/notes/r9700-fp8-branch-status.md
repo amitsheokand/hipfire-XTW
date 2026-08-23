@@ -32,8 +32,10 @@ Branch `r9700-fp8-adaptive` (fork hipfire-XTW) on `master` `80a572c8`.
 - Fused gate+up FP8 GEMM on gfx1201 (same WMMA as overwrite GEMM). Lab
   fused vs dual GEMM max|Δ|=0. See [[fp8-fused-gate-up-gfx1201]].
 - Fused QKVZA FP8 GEMM on gfx1201 (four LA banks, same WMMA). Lab fused
-  vs four overwrite GEMMs max|Δ|=0. FA QKV still overwrite. See
-  [[fp8-fused-qkvza-gfx1201]].
+  vs four overwrite GEMMs max|Δ|=0. See [[fp8-fused-qkvza-gfx1201]].
+- Fused FA QKV FP8 GEMM on gfx1201 (wq/wk/wv, same WMMA). Lab fused vs
+  three overwrite GEMMs max|Δ|=0. Residual wo/down stay overwrite. See
+  [[fp8-fused-qkv-gfx1201]].
 
 Packed-X Radiowave: **68 VGPR / 20 SGPR / 0 spill**, 375 inst, 34 gld,
 94 waits. NRMSE unchanged vs in-kernel cvt. Large-N prefill GEMM-only

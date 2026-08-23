@@ -156,6 +156,9 @@ fn main() {
     if !fused_qkvza_matches_quad(&mut gpu) {
         all_pass = false;
     }
+    if !fused_qkv_matches_triple(&mut gpu) {
+        all_pass = false;
+    }
 
     if !all_pass {
         eprintln!("\n=== FAIL ===");
@@ -314,6 +317,76 @@ fn fused_qkvza_matches_quad(gpu: &mut Gpu) -> bool {
         eprintln!(
             "  fused_qkvza vs quad GEMM     FAIL  max|Δ| qkv={dq:.3e} z={dz:.3e} beta={db:.3e} alpha={da:.3e}"
         );
+    }
+    ok
+}
+
+/// Fused FA QKV must match three overwrite GEMMs on the same packed X.
+/// Uneven M so a 16-row tile can straddle bank boundaries.
+fn fused_qkv_matches_triple(gpu: &mut Gpu) -> bool {
+    let n = 32;
+    let q_m = 48;
+    let k_m = 32;
+    let v_m = 16;
+    let k = 256;
+    let n_blocks = k / GROUP;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let row_bytes = 16 + scale_padded * 2 + n_blocks * GROUP;
+
+    let (w_q_host, x_host, _) = synth_reference(q_m, k, n, 0x111111);
+    let (w_k_host, _, _) = synth_reference(k_m, k, n, 0x222222);
+    let (w_v_host, _, _) = synth_reference(v_m, k, n, 0x333333);
+
+    let w_q = gpu.upload_raw(&w_q_host, &[q_m * row_bytes]).unwrap();
+    let w_k = gpu.upload_raw(&w_k_host, &[k_m * row_bytes]).unwrap();
+    let w_v = gpu.upload_raw(&w_v_host, &[v_m * row_bytes]).unwrap();
+    let x = gpu.alloc_tensor(&[n, k], DType::F32).unwrap();
+    gpu.hip
+        .memcpy_htod(&x.buf, unsafe {
+            std::slice::from_raw_parts(x_host.as_ptr() as *const u8, n * k * 4)
+        })
+        .unwrap();
+
+    let y_q_ref = gpu.alloc_tensor(&[n, q_m], DType::F32).unwrap();
+    let y_k_ref = gpu.alloc_tensor(&[n, k_m], DType::F32).unwrap();
+    let y_v_ref = gpu.alloc_tensor(&[n, v_m], DType::F32).unwrap();
+    let y_q = gpu.alloc_tensor(&[n, q_m], DType::F32).unwrap();
+    let y_k = gpu.alloc_tensor(&[n, k_m], DType::F32).unwrap();
+    let y_v = gpu.alloc_tensor(&[n, v_m], DType::F32).unwrap();
+
+    gpu.fp8_gemm_e4m3_g256(&w_q, &x, &y_q_ref, q_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_e4m3_g256(&w_k, &x, &y_k_ref, k_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_e4m3_g256(&w_v, &x, &y_v_ref, v_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_qkv_e4m3_g256(
+        &w_q, &w_k, &w_v, &x, &y_q, &y_k, &y_v, q_m, k_m, v_m, k, n,
+    )
+    .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+
+    let q_ref = gpu.download_f32(&y_q_ref).unwrap();
+    let k_ref = gpu.download_f32(&y_k_ref).unwrap();
+    let v_ref = gpu.download_f32(&y_v_ref).unwrap();
+    let q = gpu.download_f32(&y_q).unwrap();
+    let k = gpu.download_f32(&y_k).unwrap();
+    let v = gpu.download_f32(&y_v).unwrap();
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+    let dq = max_abs(&q_ref, &q);
+    let dk = max_abs(&k_ref, &k);
+    let dv = max_abs(&v_ref, &v);
+    let ok = dq <= 1e-5 && dk <= 1e-5 && dv <= 1e-5;
+    if ok {
+        eprintln!("  fused_qkv vs triple GEMM     OK  max|Δ| q={dq:.3e} k={dk:.3e} v={dv:.3e}");
+    } else {
+        eprintln!("  fused_qkv vs triple GEMM     FAIL  max|Δ| q={dq:.3e} k={dk:.3e} v={dv:.3e}");
     }
     ok
 }

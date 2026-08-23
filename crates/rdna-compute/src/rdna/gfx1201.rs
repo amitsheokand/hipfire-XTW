@@ -53,6 +53,10 @@ const FP8_E4M3_QKVZA_SRC: &str =
     include_str!("../../../../kernels/src/gemm_qkvza_fp8e4m3_g256_wmma.gfx1201.hip");
 const FP8_E4M3_QKVZA_KERNEL: &str = "gemm_qkvza_fp8e4m3_g256_wmma_gfx1201";
 
+const FP8_E4M3_QKV_SRC: &str =
+    include_str!("../../../../kernels/src/gemm_qkv_fp8e4m3_g256_wmma.gfx1201.hip");
+const FP8_E4M3_QKV_KERNEL: &str = "gemm_qkv_fp8e4m3_g256_wmma_gfx1201";
+
 /// A mutable GPU borrow proven to target exact gfx1201.
 ///
 /// The constructor is intentionally available only through
@@ -144,6 +148,28 @@ impl Gpu {
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
                 beta_m, alpha_m, k, n,
             )
+    }
+
+    /// Native qt=40 fused FA QKV WMMA GEMM. gfx1201 only; other archs error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_gemm_qkv_e4m3_g256(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.try_gfx1201()
+            .ok_or_else(|| HipError::new(0, "FP8E4M3G256 fused QKV requires gfx1201"))?
+            .fp8_gemm_qkv_e4m3_g256(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, n)
     }
 }
 
@@ -808,6 +834,99 @@ impl Gfx1201Device<'_> {
             &self.gpu.hip,
             "gemm",
             FP8_E4M3_QKVZA_KERNEL,
+            bytes,
+        );
+
+        let result = unsafe {
+            self.gpu.hip.launch_kernel(
+                func,
+                [((total_m + 15) / 16) as u32, ((n + 15) / 16) as u32, 1],
+                [32, 1, 1],
+                0,
+                self.gpu.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// Fused FA QKV sister of [`Self::fp8_gemm_qkvza_e4m3_g256`]. One launch,
+    /// packed X is still `ensure_fp8_x` (cache hits the other two matrices).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_gemm_qkv_e4m3_g256(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "gfx1201 FP8 E4M3 fused QKV requires K%256=0");
+        assert!(
+            x.numel() >= n * k
+                && y_q.numel() >= n * q_m
+                && y_k.numel() >= n * k_m
+                && y_v.numel() >= n * v_m,
+            "fp8_gemm_qkv_e4m3_g256 needs X>=N*K and Y*>=N*m \
+             (x={:?} yq={:?} yk={:?} yv={:?} n={n} q_m={q_m} k_m={k_m} v_m={v_m} k={k})",
+            x.shape,
+            y_q.shape,
+            y_k.shape,
+            y_v.shape
+        );
+
+        self.gpu.bind_thread()?;
+        let x_fp8_ptr = self.gpu.ensure_fp8_x(x, n * k)?;
+        self.gpu.ensure_kernel(
+            FP8_E4M3_QKV_KERNEL,
+            FP8_E4M3_QKV_SRC,
+            FP8_E4M3_QKV_KERNEL,
+        )?;
+
+        let func = &self.gpu.functions[FP8_E4M3_QKV_KERNEL];
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut x_ptr = x_fp8_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_i = q_m as i32;
+        let mut k_m_i = k_m as i32;
+        let mut v_m_i = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_i as *mut _ as *mut c_void,
+            &mut k_m_i as *mut _ as *mut c_void,
+            &mut v_m_i as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = q_m + k_m + v_m;
+        let bytes = total_m * (16 + (k / 256).next_multiple_of(16) * 2 + k) + n * k;
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "gemm",
+            FP8_E4M3_QKV_KERNEL,
             bytes,
         );
 

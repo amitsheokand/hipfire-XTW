@@ -2588,28 +2588,18 @@ fn forward_prefill_chunk(
                     && matches!(layer.wv.gpu_dtype, DType::FP8E4M3G256),
                 "llama FP8 QKV batch requires wq/wk/wv to share FP8E4M3G256"
             );
-            gpu.fp8_gemm_e4m3_g256(
+            gpu.fp8_gemm_qkv_e4m3_g256(
                 &layer.wq.buf,
-                &pbs.x_rot_batch,
-                &pbs.fa_q_batch,
-                layer.wq.m,
-                layer.wq.k,
-                n,
-            )?;
-            gpu.fp8_gemm_e4m3_g256(
                 &layer.wk.buf,
-                &pbs.x_rot_batch,
-                &pbs.fa_k_batch,
-                layer.wk.m,
-                layer.wk.k,
-                n,
-            )?;
-            gpu.fp8_gemm_e4m3_g256(
                 &layer.wv.buf,
                 &pbs.x_rot_batch,
+                &pbs.fa_q_batch,
+                &pbs.fa_k_batch,
                 &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
                 layer.wv.m,
-                layer.wv.k,
+                layer.wq.k,
                 n,
             )?;
         } else {

@@ -2192,6 +2192,38 @@ fn run_fp8_qkvza(
     )
 }
 
+/// Fused FA QKV overwrite GEMM. One launch; same packed-X cache as
+/// [`run_fp8_gemm`].
+#[inline]
+fn run_fp8_qkv(
+    gpu: &mut Gpu,
+    w_q: &WeightTensor,
+    w_k: &WeightTensor,
+    w_v: &WeightTensor,
+    x: &GpuTensor,
+    y_q: &GpuTensor,
+    y_k: &GpuTensor,
+    y_v: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(w_q.k, w_k.k);
+    debug_assert_eq!(w_q.k, w_v.k);
+    gpu.fp8_gemm_qkv_e4m3_g256(
+        &w_q.buf,
+        &w_k.buf,
+        &w_v.buf,
+        x,
+        y_q,
+        y_k,
+        y_v,
+        w_q.m,
+        w_k.m,
+        w_v.m,
+        w_q.k,
+        n,
+    )
+}
+
 /// Residual `y += W·x` via overwrite GEMM into `scratch` then add.
 /// `scratch` must be dead (not aliased with `x` or `y`).
 #[inline]
@@ -4872,9 +4904,17 @@ fn batch_chunk_full_attn_attn(
                             && matches!(layer.wv.gpu_dtype, DType::FP8E4M3G256),
                         "FA qkv FP8 dispatch requires all of wq/wk/wv to be FP8E4M3G256",
                     );
-                    run_fp8_gemm(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+                    run_fp8_qkv(
+                        gpu,
+                        &layer.wq,
+                        &layer.wk,
+                        &layer.wv,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        n,
+                    )?;
                 } else if qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
@@ -6647,9 +6687,17 @@ fn batch_chunk_full_attn_moe(
                             && matches!(layer.wv.gpu_dtype, DType::FP8E4M3G256),
                         "FAMoe qkv FP8 dispatch requires all of wq/wk/wv to be FP8E4M3G256",
                     );
-                    run_fp8_gemm(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+                    run_fp8_qkv(
+                        gpu,
+                        &layer.wq,
+                        &layer.wk,
+                        &layer.wv,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        n,
+                    )?;
                 } else if qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
