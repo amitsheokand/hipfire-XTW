@@ -226,7 +226,7 @@ Skills in play: `.agents/skills/hipfire-arch-port/` (WMMA C-map, chip tag),
 | **3b** | GPU-validate WMMA GEMM vs CPU FP32 | **Done 2026-08-23.** ALL PASS, NRMSE 2.50–2.91e-2 | hours |
 | **3c** | F8_Mode / C-map oracle | **Empirically closed:** CPU ref is OCP E4M3fn bias 7; C-map oracle 16×16×256 passed | hours |
 | **3d** | Fix qt=40 comment (G256 vs 32-elem 34 B) | **Done** — 8.0625 bpw in `hfq.rs` | minutes |
-| **4** | One tiling lever after 3b is green (LDS X panel **or** 128-bit K-stage **or** geom sweep) | Occupancy/ISA dump first; then NRMSE still PASS; microbench GFLOPS up. No tok/s claim | 1–2 days |
+| **4** | One tiling lever after 3b is green | **LDS X-panel rejected 2026-08-23** (76→155 VGPR). Next: separate `pack_f32_to_fp8` pre-pass, not in-kernel LDS convert. See `.agent-memory/notes/fp8-gemm-lds-xpanel-vgpr-cliff.md` | 1–2 days |
 | **5** | Encoder + `fp8_wmma` dispatch into one prefill GEMM | Channel cosine on a tiny oracle; daemon still default-off | days |
 | **Parked** | FreeToken \(q^\star\) / semantic anchors | Only if a MoE pool does not fit 32 GB | later |
 | **Never** | Hyperloom, Lemonade, GGUF F8 layout, `HSA_OVERRIDE` as product | — | — |

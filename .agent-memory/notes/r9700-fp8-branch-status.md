@@ -15,8 +15,9 @@ Branch `r9700-fp8-adaptive` (fork hipfire-XTW) on `master` `80a572c8`.
   F32→E4M3 activation band; CPU ref is OCP E4M3fn bias 7, so F8_Mode 0
   is empirically confirmed.
 - Radiowave inspect: 76 VGPR / 20 SGPR / 0 spill, 533 inst, 50 global
-  loads, 130 waits, no LDS. `__launch_bounds__(32, 2)`. Next lever is
-  tiling (LDS X panel or 128-bit K-stage), not occupancy.
+  loads, 130 waits, no LDS. `__launch_bounds__(32, 2)`. LDS X-panel
+  lever **rejected** (76→155 VGPR); next is a pack_f32_to_fp8 pre-pass.
+  See [[fp8-gemm-lds-xpanel-vgpr-cliff]].
 
 HIP launch must pass `&mut` addresses. Related:
 [[fp8-g256-not-llamacpp-34b]], [[rdna4-isa-fp8-wmma-confirmed]].
