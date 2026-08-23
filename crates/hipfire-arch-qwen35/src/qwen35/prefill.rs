@@ -2154,6 +2154,44 @@ fn run_fp8_gate_up(
     )
 }
 
+/// Fused QKVZA overwrite GEMM. One launch; same packed-X cache as
+/// [`run_fp8_gemm`].
+#[inline]
+fn run_fp8_qkvza(
+    gpu: &mut Gpu,
+    w_qkv: &WeightTensor,
+    w_z: &WeightTensor,
+    w_beta: &WeightTensor,
+    w_alpha: &WeightTensor,
+    x: &GpuTensor,
+    y_qkv: &GpuTensor,
+    y_z: &GpuTensor,
+    y_beta: &GpuTensor,
+    y_alpha: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(w_qkv.k, w_z.k);
+    debug_assert_eq!(w_qkv.k, w_beta.k);
+    debug_assert_eq!(w_qkv.k, w_alpha.k);
+    gpu.fp8_gemm_qkvza_e4m3_g256(
+        &w_qkv.buf,
+        &w_z.buf,
+        &w_beta.buf,
+        &w_alpha.buf,
+        x,
+        y_qkv,
+        y_z,
+        y_beta,
+        y_alpha,
+        w_qkv.m,
+        w_z.m,
+        w_beta.m,
+        w_alpha.m,
+        w_qkv.k,
+        n,
+    )
+}
+
 /// Residual `y += W·x` via overwrite GEMM into `scratch` then add.
 /// `scratch` must be dead (not aliased with `x` or `y`).
 #[inline]
@@ -3758,10 +3796,19 @@ fn batch_chunk_delta_net_attn(
                             && matches!(layer.w_alpha.gpu_dtype, DType::FP8E4M3G256),
                         "LA qkvza FP8 dispatch requires all of wqkv/wz/w_beta/w_alpha to be FP8E4M3G256",
                     );
-                    run_fp8_gemm(gpu, &layer.wqkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.wz, &pbs.x_rot_batch, &pbs.dn_z_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
+                    run_fp8_qkvza(
+                        gpu,
+                        &layer.wqkv,
+                        &layer.wz,
+                        &layer.w_beta,
+                        &layer.w_alpha,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        n,
+                    )?;
                 } else {
                     run_fused_qkvza_key(
                         gpu,
@@ -5839,10 +5886,19 @@ fn batch_chunk_delta_net_moe(
                             && matches!(layer.w_alpha.gpu_dtype, DType::FP8E4M3G256),
                         "DNMoe LA qkvza FP8 dispatch requires all of wqkv/wz/w_beta/w_alpha to be FP8E4M3G256",
                     );
-                    run_fp8_gemm(gpu, &layer.wqkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.wz, &pbs.x_rot_batch, &pbs.dn_z_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
-                    run_fp8_gemm(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
+                    run_fp8_qkvza(
+                        gpu,
+                        &layer.wqkv,
+                        &layer.wz,
+                        &layer.w_beta,
+                        &layer.w_alpha,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        n,
+                    )?;
                 } else {
                     run_fused_qkvza_key(
                         gpu,

@@ -153,6 +153,9 @@ fn main() {
     if !fused_gate_up_matches_dual(&mut gpu) {
         all_pass = false;
     }
+    if !fused_qkvza_matches_quad(&mut gpu) {
+        all_pass = false;
+    }
 
     if !all_pass {
         eprintln!("\n=== FAIL ===");
@@ -220,6 +223,97 @@ fn fused_gate_up_matches_dual(gpu: &mut Gpu) -> bool {
         eprintln!("  fused_gate_up vs dual GEMM     OK  max|Δ| gate={dg:.3e} up={du:.3e}");
     } else {
         eprintln!("  fused_gate_up vs dual GEMM     FAIL  max|Δ| gate={dg:.3e} up={du:.3e}");
+    }
+    ok
+}
+
+/// Fused QKVZA must match four overwrite GEMMs on the same packed X.
+/// Uneven M so a 16-row tile can straddle bank boundaries.
+fn fused_qkvza_matches_quad(gpu: &mut Gpu) -> bool {
+    let n = 32;
+    let qkv_m = 48;
+    let z_m = 32;
+    let beta_m = 16;
+    let alpha_m = 32;
+    let k = 256;
+    let n_blocks = k / GROUP;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let row_bytes = 16 + scale_padded * 2 + n_blocks * GROUP;
+
+    let (w_qkv_host, x_host, _) = synth_reference(qkv_m, k, n, 0xA11CE);
+    let (w_z_host, _, _) = synth_reference(z_m, k, n, 0xBEEF);
+    let (w_beta_host, _, _) = synth_reference(beta_m, k, n, 0xCAFE);
+    let (w_alpha_host, _, _) = synth_reference(alpha_m, k, n, 0xF00D);
+
+    let w_qkv = gpu
+        .upload_raw(&w_qkv_host, &[qkv_m * row_bytes])
+        .unwrap();
+    let w_z = gpu.upload_raw(&w_z_host, &[z_m * row_bytes]).unwrap();
+    let w_beta = gpu
+        .upload_raw(&w_beta_host, &[beta_m * row_bytes])
+        .unwrap();
+    let w_alpha = gpu
+        .upload_raw(&w_alpha_host, &[alpha_m * row_bytes])
+        .unwrap();
+    let x = gpu.alloc_tensor(&[n, k], DType::F32).unwrap();
+    gpu.hip
+        .memcpy_htod(&x.buf, unsafe {
+            std::slice::from_raw_parts(x_host.as_ptr() as *const u8, n * k * 4)
+        })
+        .unwrap();
+
+    let y_qkv_ref = gpu.alloc_tensor(&[n, qkv_m], DType::F32).unwrap();
+    let y_z_ref = gpu.alloc_tensor(&[n, z_m], DType::F32).unwrap();
+    let y_beta_ref = gpu.alloc_tensor(&[n, beta_m], DType::F32).unwrap();
+    let y_alpha_ref = gpu.alloc_tensor(&[n, alpha_m], DType::F32).unwrap();
+    let y_qkv = gpu.alloc_tensor(&[n, qkv_m], DType::F32).unwrap();
+    let y_z = gpu.alloc_tensor(&[n, z_m], DType::F32).unwrap();
+    let y_beta = gpu.alloc_tensor(&[n, beta_m], DType::F32).unwrap();
+    let y_alpha = gpu.alloc_tensor(&[n, alpha_m], DType::F32).unwrap();
+
+    gpu.fp8_gemm_e4m3_g256(&w_qkv, &x, &y_qkv_ref, qkv_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_e4m3_g256(&w_z, &x, &y_z_ref, z_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_e4m3_g256(&w_beta, &x, &y_beta_ref, beta_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_e4m3_g256(&w_alpha, &x, &y_alpha_ref, alpha_m, k, n)
+        .unwrap();
+    gpu.fp8_gemm_qkvza_e4m3_g256(
+        &w_qkv, &w_z, &w_beta, &w_alpha, &x, &y_qkv, &y_z, &y_beta, &y_alpha,
+        qkv_m, z_m, beta_m, alpha_m, k, n,
+    )
+    .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+
+    let q_ref = gpu.download_f32(&y_qkv_ref).unwrap();
+    let z_ref = gpu.download_f32(&y_z_ref).unwrap();
+    let b_ref = gpu.download_f32(&y_beta_ref).unwrap();
+    let a_ref = gpu.download_f32(&y_alpha_ref).unwrap();
+    let q = gpu.download_f32(&y_qkv).unwrap();
+    let z = gpu.download_f32(&y_z).unwrap();
+    let b = gpu.download_f32(&y_beta).unwrap();
+    let a = gpu.download_f32(&y_alpha).unwrap();
+
+    fn max_abs(p: &[f32], q: &[f32]) -> f32 {
+        p.iter()
+            .zip(q)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+    let dq = max_abs(&q_ref, &q);
+    let dz = max_abs(&z_ref, &z);
+    let db = max_abs(&b_ref, &b);
+    let da = max_abs(&a_ref, &a);
+    let ok = dq <= 1e-5 && dz <= 1e-5 && db <= 1e-5 && da <= 1e-5;
+    if ok {
+        eprintln!(
+            "  fused_qkvza vs quad GEMM     OK  max|Δ| qkv={dq:.3e} z={dz:.3e} beta={db:.3e} alpha={da:.3e}"
+        );
+    } else {
+        eprintln!(
+            "  fused_qkvza vs quad GEMM     FAIL  max|Δ| qkv={dq:.3e} z={dz:.3e} beta={db:.3e} alpha={da:.3e}"
+        );
     }
     ok
 }
