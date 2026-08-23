@@ -534,6 +534,7 @@ fn for_gemv_plain_maps_all_scalar_dtypes() {
         (DType::MQ4G256, KernelKey::GemvMq4G256),
         (DType::MQ3G256, KernelKey::GemvMq3G256),
         (DType::MFP4G32, KernelKey::GemvMfp4G32),
+        (DType::FP8E4M3G256, KernelKey::GemvFp8E4m3G256),
     ];
     for (dtype, expected) in cases {
         assert_eq!(
@@ -656,6 +657,7 @@ fn dtype_needs_rotation_false_for_hfq_and_scalar() {
         DType::HFQ4G256,
         DType::Q8_0,
         DType::HFP4G32,
+        DType::FP8E4M3G256,
     ] {
         assert!(
             !dtype_needs_rotation(dtype),
@@ -761,6 +763,38 @@ fn gemv_family_resolves_hfq4_on_all_archs() {
             None
         )
         .is_ok());
+}
+
+#[test]
+fn gemv_family_resolves_fp8_on_gfx12_only() {
+    let fam = GemvFamily::new();
+    assert!(fam
+        .resolve(
+            DType::FP8E4M3G256,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test("gfx1201"),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::FP8E4M3G256,
+            GemvVariant::Plain,
+            false,
+            &ctx_rdna4(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::FP8E4M3G256,
+            GemvVariant::Plain,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_err());
 }
 
 #[test]

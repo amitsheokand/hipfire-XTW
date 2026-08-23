@@ -1451,6 +1451,7 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::FP8E4M3G256 => gpu.fp8_gemm_e4m3_g256(&w.buf, x, y, w.m, w.k, batch_size),
         // MQ4G256 = HFQ4G256 weight layout + an offline FWHT rotation, so the
         // batched GEMM is: FWHT-rotate all `batch_size` activation columns once
         // (`mq_rotate_x`, AWQ-aware), then feed the same INT4-G256 WMMA kernel
@@ -1760,6 +1761,9 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 /// hybrid Qwen3.5 share one rule and stay in lockstep when new dtypes or
 /// arches gain WMMA support.
 pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
+    // FP8E4M3G256 is intentionally absent: the QKV `else` is
+    // `gemm_qkv_hfq4g256` and would treat E4M3 bytes as HFQ4. Prefill
+    // stays on per-token `weight_gemv` until dedicated batched arms land.
     let always_ok = matches!(
         dt,
         DType::MQ4G256
@@ -8204,10 +8208,15 @@ mod tests {
     #[test]
     fn is_batchable_la_unsupported_dtypes() {
         // Q4K / Q6K / F32 stay on per-token forward_scratch.
-        for arch in ["gfx1100", "gfx1200"] {
+        // FP8E4M3G256 must too: the QKV `else` is gemm_qkv_hfq4g256.
+        for arch in ["gfx1100", "gfx1200", "gfx1201"] {
             assert!(!is_batchable_la(DType::Q4K, arch));
             assert!(!is_batchable_la(DType::Q6K, arch));
             assert!(!is_batchable_la(DType::F32, arch));
+            assert!(
+                !is_batchable_la(DType::FP8E4M3G256, arch),
+                "FP8E4M3G256 must not take the HFQ4 batched QKV else"
+            );
         }
     }
 

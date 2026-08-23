@@ -227,6 +227,7 @@ pub enum KernelKey {
     GemvMfp4G32E8Soa,
     GemvMfp4G32Fused,
     GemvHfp4G32,
+    GemvFp8E4m3G256,
     GemvParoQ4G128,
     GemvQ4F16G64,
     GemvQ4F16G32,
@@ -619,6 +620,7 @@ impl KernelKey {
             (MFP4G32E8, Plain) => Ok(Self::GemvMfp4G32E8),
             (MFP4G32E8SOA, Plain) => Ok(Self::GemvMfp4G32E8Soa),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
+            (FP8E4M3G256, Plain) => Ok(Self::GemvFp8E4m3G256),
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
@@ -742,6 +744,9 @@ impl KernelKey {
             | MFP4G32E8 | MFP4G32E8SOA
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
             | ParoQ4G128 => ArchPredicate::Always,
+            // Native E4M3 G256 GEMV/GEMM: gfx12 WMMA + v_dot4_f32_fp8_fp8.
+            // Kernel sources are gfx1201-tagged; gfx1200 will JIT-fail if selected.
+            FP8E4M3G256 => ArchPredicate::HasWmmaGfx12,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline

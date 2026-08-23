@@ -10,7 +10,7 @@
 
 use std::ffi::c_void;
 
-use hip_bridge::{HipResult, KernargBlob};
+use hip_bridge::{HipError, HipResult, KernargBlob};
 
 use crate::{Gpu, GpuTensor};
 
@@ -60,6 +60,35 @@ impl Gpu {
         self.arch_caps
             .is_gfx1201()
             .then_some(Gfx1201Device { gpu: self })
+    }
+
+    /// Native qt=40 decode GEMV. gfx1201 only; other archs error.
+    pub fn fp8_gemv_e4m3_g256(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.try_gfx1201()
+            .ok_or_else(|| HipError::new(0, "FP8E4M3G256 GEMV requires gfx1201"))?
+            .fp8_gemv_e4m3_g256(a, x, y, m, k)
+    }
+
+    /// Native qt=40 WMMA GEMM (packed-X). gfx1201 only; other archs error.
+    pub fn fp8_gemm_e4m3_g256(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.try_gfx1201()
+            .ok_or_else(|| HipError::new(0, "FP8E4M3G256 GEMM requires gfx1201"))?
+            .fp8_gemm_e4m3_g256(a, x, y, m, k, n)
     }
 }
 

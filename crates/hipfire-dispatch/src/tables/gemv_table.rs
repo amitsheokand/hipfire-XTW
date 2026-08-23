@@ -48,6 +48,7 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::MFP4G32E8,
         DType::MFP4G32E8SOA,
         DType::HFP4G32,
+        DType::FP8E4M3G256,
         DType::ParoQ4G128,
         DType::Q4F16G64,
         DType::Q4F16G32,

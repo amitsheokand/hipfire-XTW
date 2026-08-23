@@ -413,6 +413,10 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 39,
         dtype: DType::MQ3G256GL,
     },
+    RawCodec {
+        quant_type: 40,
+        dtype: DType::FP8E4M3G256,
+    },
 ];
 
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
@@ -1324,6 +1328,7 @@ mod tests {
             // 96 B/group (or vice versa) → token soup, not a crash.
             (38, DType::MQ2G256GL),
             (39, DType::MQ3G256GL),
+            (40, DType::FP8E4M3G256),
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));

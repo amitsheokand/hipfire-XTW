@@ -9,6 +9,12 @@
 //! against a CPU FP32 reference. Times are GEMM-only after the pack
 //! cache warms (`ensure_fp8_x` skips reconvert for the same X pointer).
 //!
+//! First step is an encoder→GPU cosine oracle: F32 W is packed with the
+//! same G256 E4M3fn recipe as `hipfire-quantize` (`fp8e4m3_g256.rs`;
+//! copied here — rdna-compute cannot depend on that crate) and compared
+//! to `W_f32 @ X` (cosine) and `dequant(enc) @ X` (NRMSE). GEMV uses F32
+//! X; GEMM still packs X to E4M3.
+//!
 //! Skips silently on non-gfx1201 archs.
 //!
 //! Run:
@@ -30,6 +36,11 @@ fn main() {
     }
     eprintln!("=== gemm_fp8e4m3_g256_wmma_gfx1201 vs CPU FP32 reference ===");
     eprintln!("  arch={arch}");
+
+    if !encoder_gpu_oracle(&mut gpu) {
+        eprintln!("\n=== FAIL === encoder→GPU cosine oracle");
+        std::process::exit(1);
+    }
 
     // Small tiles first so a C-map / launch fault fails in seconds, then
     // Qwen prefill shapes. CPU ref is O(N*M*K) and w_down takes many minutes.
@@ -80,20 +91,14 @@ fn main() {
 
         // Warmup (JIT-compiles the kernel on first call).
         for _ in 0..warmup {
-            gpu.try_gfx1201()
-                .unwrap()
-                .fp8_gemm_e4m3_g256(&w, &x, &y, m, k, n)
-                .unwrap();
+            gpu.fp8_gemm_e4m3_g256(&w, &x, &y, m, k, n).unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
 
         // Time.
         let t = Instant::now();
         for _ in 0..trials {
-            gpu.try_gfx1201()
-                .unwrap()
-                .fp8_gemm_e4m3_g256(&w, &x, &y, m, k, n)
-                .unwrap();
+            gpu.fp8_gemm_e4m3_g256(&w, &x, &y, m, k, n).unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let us = t.elapsed().as_secs_f64() * 1e6 / trials as f64;
@@ -281,4 +286,267 @@ fn synth_reference(m: usize, k: usize, n: usize, seed: u64) -> (Vec<u8>, Vec<f32
         }
     }
     (w, x, y)
+}
+
+/// Encoder→GPU oracle. Keep the pack/dequant helpers in sync with
+/// `hipfire-quantize/src/fp8e4m3_g256.rs` (rdna-compute cannot depend on it).
+fn encoder_gpu_oracle(gpu: &mut Gpu) -> bool {
+    const N: usize = 16;
+    const M: usize = 16;
+    const K: usize = 256;
+    eprintln!("=== encoder→GPU cosine oracle  N={N} M={M} K={K} ===");
+
+    let mut w_f32 = vec![0.0f32; M * K];
+    let mut x_host = vec![0.0f32; N * K];
+    let mut s = 0xC0FFEE_u64;
+    let mut next = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as u32) as f32 / (u32::MAX as f32)
+    };
+    for v in &mut w_f32 {
+        *v = next() * 0.1 - 0.05;
+    }
+    for v in &mut x_host {
+        *v = next() * 0.2 - 0.1;
+    }
+
+    let w_enc = encode_fp8e4m3_g256_2d(&w_f32, M, K);
+    let w_dq = dequant_fp8e4m3_g256_2d(&w_enc, M, K);
+
+    let y_true = matmul_f32(&w_f32, &x_host, M, K, N);
+    let y_dq = matmul_f32(&w_dq, &x_host, M, K, N);
+    let enc_nrmse = nrmse(&y_true, &y_dq);
+
+    let w = gpu.upload_raw(&w_enc, &[w_enc.len()]).unwrap();
+    let x_gemv = gpu.alloc_tensor(&[K], DType::F32).unwrap();
+    let y_gemv = gpu.alloc_tensor(&[M], DType::F32).unwrap();
+    gpu.hip
+        .memcpy_htod(&x_gemv.buf, unsafe {
+            std::slice::from_raw_parts(x_host.as_ptr() as *const u8, K * 4)
+        })
+        .unwrap();
+    gpu.fp8_gemv_e4m3_g256(&w, &x_gemv, &y_gemv, M, K)
+        .unwrap();
+    let y_gemv_gpu = gpu.download_f32(&y_gemv).unwrap();
+    let y_true0 = &y_true[..M];
+    let y_dq0 = &y_dq[..M];
+    let gemv_vs_dq = nrmse(y_dq0, &y_gemv_gpu);
+    let gemv_cos = cosine(y_true0, &y_gemv_gpu);
+
+    let x_gemm = gpu.alloc_tensor(&[N, K], DType::F32).unwrap();
+    let y_gemm = gpu.alloc_tensor(&[N, M], DType::F32).unwrap();
+    gpu.hip
+        .memcpy_htod(&x_gemm.buf, unsafe {
+            std::slice::from_raw_parts(x_host.as_ptr() as *const u8, N * K * 4)
+        })
+        .unwrap();
+    gpu.fp8_gemm_e4m3_g256(&w, &x_gemm, &y_gemm, M, K, N)
+        .unwrap();
+    let y_gemm_gpu = gpu.download_f32(&y_gemm).unwrap();
+    let gemm_vs_dq = nrmse(&y_dq, &y_gemm_gpu);
+    let gemm_cos = cosine(&y_true, &y_gemm_gpu);
+
+    eprintln!("  encoder  NRMSE(dequant@X vs W_f32@X)={enc_nrmse:.3e}");
+    eprintln!(
+        "  GEMV     NRMSE vs dequant={gemv_vs_dq:.3e}  cosine vs W_f32={gemv_cos:.6}"
+    );
+    eprintln!(
+        "  GEMM     NRMSE vs dequant={gemm_vs_dq:.3e}  cosine vs W_f32={gemm_cos:.6}"
+    );
+
+    let ok = enc_nrmse < 0.05
+        && gemv_vs_dq < 0.05
+        && gemm_vs_dq < 0.05
+        && gemv_cos > 0.99
+        && gemm_cos > 0.99;
+    if ok {
+        eprintln!("  encoder oracle OK");
+    } else {
+        eprintln!("  encoder oracle FAIL");
+    }
+    ok
+}
+
+fn nrmse(a: &[f32], b: &[f32]) -> f64 {
+    let mut se = 0.0;
+    let mut sr = 0.0;
+    for (x, y) in a.iter().zip(b) {
+        let d = *x as f64 - *y as f64;
+        se += d * d;
+        sr += (*x as f64) * (*x as f64);
+    }
+    (se / sr.max(1e-30)).sqrt()
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
+    for (x, y) in a.iter().zip(b) {
+        let xf = *x as f64;
+        let yf = *y as f64;
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    dot / (na.sqrt() * nb.sqrt()).max(1e-30)
+}
+
+fn matmul_f32(w: &[f32], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; n * m];
+    for nn in 0..n {
+        for mm in 0..m {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                acc += w[mm * k + kk] * x[nn * k + kk];
+            }
+            y[nn * m + mm] = acc;
+        }
+    }
+    y
+}
+
+const E4M3_MAX: f32 = 448.0;
+
+fn enc_e4m3fn_mag(u: u8) -> f32 {
+    let exp = ((u >> 3) & 0xF) as i32;
+    let mant = (u & 0x7) as f32;
+    if exp == 0 {
+        return (2.0f32).powi(-6) * mant / 8.0;
+    }
+    if exp == 0xF && (u & 0x7) == 7 {
+        return E4M3_MAX;
+    }
+    (2.0f32).powi(exp - 7) * (1.0 + mant / 8.0)
+}
+
+fn enc_e4m3fn_to_f32(byte: u8) -> f32 {
+    let sign = if byte & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    sign * enc_e4m3fn_mag(byte & 0x7F)
+}
+
+fn enc_f32_to_e4m3fn(v: f32) -> u8 {
+    if !v.is_finite() {
+        return 0;
+    }
+    let neg = v.is_sign_negative();
+    let a = v.abs();
+    if a == 0.0 {
+        return if neg { 0x80 } else { 0 };
+    }
+    if a >= E4M3_MAX {
+        return if neg { 0xFE } else { 0x7E };
+    }
+    let mut best = 0u8;
+    let mut best_err = f32::INFINITY;
+    for code in 0u8..=0x7E {
+        let err = (enc_e4m3fn_mag(code) - a).abs();
+        if err < best_err {
+            best_err = err;
+            best = code;
+        }
+    }
+    if neg {
+        best | 0x80
+    } else {
+        best
+    }
+}
+
+/// Truncating F32→F16, same as `hipfire-quantize::float16::f32_to_f16`.
+fn enc_f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7FFFFF;
+    if exp == 0xFF {
+        let f16_frac = if frac == 0 { 0 } else { (frac >> 13) | 1 };
+        return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return ((sign << 15) | (0x1F << 10)) as u16;
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return (sign << 15) as u16;
+        }
+        let f = frac | 0x800000;
+        let shift = (1 - new_exp + 13) as u32;
+        return ((sign << 15) | (f >> shift)) as u16;
+    }
+    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+fn enc_f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((bits >> 10) & 0x1F) as i32;
+    let man = (bits & 0x3FF) as f32;
+    if exp == 0 {
+        return sign * man / 1024.0 * 2.0f32.powi(-14);
+    }
+    if exp == 31 {
+        return if man == 0.0 {
+            sign * f32::INFINITY
+        } else {
+            f32::NAN
+        };
+    }
+    sign * (1.0 + man / 1024.0) * 2.0f32.powi(exp - 15)
+}
+
+fn encode_fp8e4m3_g256_row(row: &[f32]) -> Vec<u8> {
+    let k = row.len();
+    let n_blocks = k / GROUP;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let nbytes = 16 + scale_padded * 2 + n_blocks * GROUP;
+    let mut out = vec![0u8; nbytes];
+    out[0..2].copy_from_slice(&enc_f32_to_f16(1.0).to_le_bytes());
+    out[2..4].copy_from_slice(&enc_f32_to_f16(0.0).to_le_bytes());
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes());
+    for g in 0..n_blocks {
+        let block = &row[g * GROUP..(g + 1) * GROUP];
+        let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let gscale = if amax > 0.0 { amax / E4M3_MAX } else { 1.0 };
+        let inv = if amax > 0.0 { 1.0 / gscale } else { 0.0 };
+        out[16 + g * 2..18 + g * 2].copy_from_slice(&enc_f32_to_f16(gscale).to_le_bytes());
+        let leaf_off = 16 + scale_padded * 2 + g * GROUP;
+        for j in 0..GROUP {
+            out[leaf_off + j] = enc_f32_to_e4m3fn(block[j] * inv);
+        }
+    }
+    out
+}
+
+fn encode_fp8e4m3_g256_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in 0..m {
+        out.extend_from_slice(&encode_fp8e4m3_g256_row(&f32_data[r * k..(r + 1) * k]));
+    }
+    out
+}
+
+fn dequant_fp8e4m3_g256_2d(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let n_blocks = k / GROUP;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let row_bytes = 16 + scale_padded * 2 + n_blocks * GROUP;
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let packed_row = &packed[r * row_bytes..(r + 1) * row_bytes];
+        let row_scale = enc_f16_to_f32(u16::from_le_bytes([packed_row[0], packed_row[1]]));
+        for g in 0..n_blocks {
+            let gscale = enc_f16_to_f32(u16::from_le_bytes([
+                packed_row[16 + g * 2],
+                packed_row[16 + g * 2 + 1],
+            ]));
+            let leaf_off = 16 + scale_padded * 2 + g * GROUP;
+            for j in 0..GROUP {
+                out[r * k + g * GROUP + j] =
+                    row_scale * gscale * enc_e4m3fn_to_f32(packed_row[leaf_off + j]);
+            }
+        }
+    }
+    out
 }

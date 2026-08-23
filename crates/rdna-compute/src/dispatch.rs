@@ -284,6 +284,10 @@ pub enum DType {
     // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
     MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 4), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 2),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
+    /// Block-scaled OCP E4M3fn (bias 7), group-256. gfx1201 GEMV/GEMM only.
+    /// Layout: [16 B hdr][n_blocks × 2 B fp16 scale, 16-aligned][n_blocks × 256 B E4M3].
+    /// qt=40. Not batchable in llama/qwen35 prefill yet (would hit the HFQ4 GEMM else).
+    FP8E4M3G256,
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -332,6 +336,7 @@ impl DType {
             | DType::MFP4G32E8SOA
             | DType::MFP3G32E8
             | DType::MFP2G32E8
+            | DType::FP8E4M3G256
             | DType::ParoQ4G128
             | DType::Raw => 1, // byte-level
         }
@@ -429,7 +434,11 @@ impl DType {
     pub fn requires_k_mod_256(self) -> bool {
         matches!(
             self,
-            DType::HFP4G32 | DType::MFP4G32 | DType::MQ2G256GL | DType::MQ3G256GL
+            DType::HFP4G32
+                | DType::MFP4G32
+                | DType::MQ2G256GL
+                | DType::MQ3G256GL
+                | DType::FP8E4M3G256
         )
     }
 }
@@ -3990,6 +3999,7 @@ mod tests {
     fn only_hfp4_family_requires_k_mod_256() {
         assert!(DType::HFP4G32.requires_k_mod_256());
         assert!(DType::MFP4G32.requires_k_mod_256());
+        assert!(DType::FP8E4M3G256.requires_k_mod_256());
         for dt in [
             DType::HFQ4G256,
             DType::MQ4G256,

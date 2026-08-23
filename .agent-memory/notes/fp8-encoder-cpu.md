@@ -11,9 +11,10 @@ E4M3]`. Per-group scale is `amax/448` (OCP E4M3fn max finite). Embeddings
 stay Q8F16. Ragged K falls back to HFQ4G128. No MoE-3D expert path yet.
 
 CPU tests (`cargo test -p hipfire-quantize --lib -- fp8e4m3`): max code
-0x7E = 448, G256 row size, Gaussian NRMSE < 5%. Runtime **cannot load**
-qt=40 until `DType::FP8E4M3G256` + RAW_CODECS + one prefill GEMM dispatch
-land. `fp8_wmma` stays default-off.
+0x7E = 448, G256 row size, Gaussian NRMSE < 5%. Runtime now loads qt=40
+(`DType::FP8E4M3G256` + RAW_CODECS + GEMV/GEMM dispatch). Prefill is
+per-token GEMV until batched arms exist. See [[fp8-runtime-dtype-dispatch]].
+`fp8_wmma` stays default-off.
 
 Related: [[fp8-gemm-pack-prepass]], [[r9700-fp8-branch-status]],
 [[fp8-g256-not-llamacpp-34b]].

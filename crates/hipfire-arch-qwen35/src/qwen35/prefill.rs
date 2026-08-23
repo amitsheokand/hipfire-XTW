@@ -7599,6 +7599,10 @@ mod tests {
                 !is_batchable_la(DType::BF16, arch),
                 "BF16 must fall back until the batched BF16 dispatch family is wired"
             );
+            assert!(
+                !is_batchable_la(DType::FP8E4M3G256, arch),
+                "FP8E4M3G256 must fall back; no fused QKV/gate_up arm yet"
+            );
         }
     }
 
