@@ -21,6 +21,10 @@ Branch `r9700-fp8-adaptive` (fork hipfire-XTW) on `master` `80a572c8`.
   Encoder gates restored (3D expert + F16 fallback). Flattened-X GEMM
   numel assert. 0.8B output attractor is known-incoherent, not FP8.
   See [[fp8-e2e-qwen35-08b]].
+- E2E: Qwen3.5-4B qt=40 HFQ (4.1 GB, 248× FP8E4M3G256) thinking-off
+  serve on gfx1201 produced readable Paris/Seine + merge_sort text.
+  Attractor=0. Serve JIT must run inside `nix develop`. Not a tok/s
+  or admission claim. See [[fp8-e2e-qwen35-4b]].
 
 Packed-X Radiowave: **68 VGPR / 20 SGPR / 0 spill**, 375 inst, 34 gld,
 94 waits. NRMSE unchanged vs in-kernel cvt. Large-N prefill GEMM-only
