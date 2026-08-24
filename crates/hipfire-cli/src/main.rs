@@ -3054,6 +3054,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
+        let mut tau = Vec::new();
         for _ in 0..args.runs {
             let done = bench_generate_with_reasoning(
                 &mut engine,
@@ -3076,6 +3077,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             if let Some(value) = done.get("ttft_ms").and_then(serde_json::Value::as_f64) {
                 ttft.push(value);
             }
+            if let Some(value) = done.get("tau").and_then(serde_json::Value::as_f64) {
+                tau.push(value);
+            }
             eprint!(".");
             std::io::stderr().flush()?;
         }
@@ -3089,11 +3093,13 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "max_tokens": args.max_tokens,
             "runs": args.runs,
             "batch": 1,
+            "speculation": args.speculation,
             "decode_tok_s": sample_stats(&decode),
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
             "ttft_ms": sample_stats(&ttft),
-            "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
+            "tau": sample_stats(&tau),
+            "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft, "tau": tau },
         });
         if args.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3102,6 +3108,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             print_sample_row("prefill", sample_stats(&prefill));
             print_sample_row("wall", sample_stats(&wall));
             print_sample_row("ttft ms", sample_stats(&ttft));
+            print_sample_row("tau", sample_stats(&tau));
         }
         Ok(())
     }
@@ -3353,6 +3360,9 @@ fn open_bench_engine(
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
     }
+    // Same as `run`: load_params may have stripped draft while config
+    // dflash_mode was off; a later `--spec dflash` must re-project it.
+    project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
