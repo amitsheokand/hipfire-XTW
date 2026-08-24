@@ -20,5 +20,7 @@ MTP 75.7 τ=3.74 vs AR 36.6. Genre-conditional. Do not put DFlash 2 on
 Whittle. Adaptive-B 8→4 rejected. Do not shrink B=8.
 
 Pager / q* only if traces say miss-bound and DDR idle — not indicated
-on this 32 GB box. Plan:
+on this 32 GB box. Serve battery (greedy, max=64): attractor=0 vs parent;
+Whittle decode 29.6 at default max_seq=32768 vs 43.5 at 2048. Pin max_seq.
+Plan:
 docs/plans/2026-08-24-r9700-whittle-bandwidth.md.
