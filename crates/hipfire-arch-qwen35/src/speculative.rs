@@ -3346,7 +3346,43 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            if use_temp_sampling && fast_sample_active {
+            if let (Some(d2), Some(sel)) = (
+                draft_cfg.dflash2.as_ref(),
+                draft_weights.selector.as_ref(),
+            ) {
+                // DFlash 2: never independent argmax (same class as vLLM.cpp #1314).
+                let host_logits = gpu.download_f32(&logits_batch)?;
+                let hidden_view = draft_scratch.x.sub_offset(h, batch * h);
+                let host_hidden = gpu.download_f32(&hidden_view)?;
+                let picked = dflash::dflash2_greedy_select(
+                    &host_logits,
+                    &host_hidden,
+                    sel,
+                    d2,
+                    h,
+                    vocab,
+                    batch,
+                    seed_token,
+                );
+                if use_temp_sampling {
+                    static D2_TEMP_WARN: std::sync::Once = std::sync::Once::new();
+                    D2_TEMP_WARN.call_once(|| {
+                        eprintln!(
+                            "[dflash2] temperature>0: draft path is still the greedy selector \
+                             (verify sampling unchanged)"
+                        );
+                    });
+                    for &t in &picked {
+                        drafted.push(t);
+                        let mut probs = vec![0f32; vocab];
+                        probs[t as usize] = 1.0;
+                        draft_softmaxes.push(probs);
+                        draft_probs_at_drafted.push(1.0);
+                    }
+                } else {
+                    drafted.extend(picked);
+                }
+            } else if use_temp_sampling && fast_sample_active {
                 // C8 GPU-sample path: softmax stays device-resident; only
                 // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
                 // draft_probs_dev is kept alive in c8_draft_probs_dev until
@@ -3478,6 +3514,31 @@ pub fn spec_step_dflash(
             }
         } else {
             // Fallback: per-row weight_gemv loop.
+            if let (Some(d2), Some(sel)) = (
+                draft_cfg.dflash2.as_ref(),
+                draft_weights.selector.as_ref(),
+            ) {
+                let batch = b - 1;
+                let mut host_logits = Vec::with_capacity(batch * vocab);
+                for i in 1..b {
+                    let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+                    llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
+                    host_logits.extend(gpu.download_f32(&target.scratch.logits)?);
+                }
+                let hidden_view = draft_scratch.x.sub_offset(h, batch * h);
+                let host_hidden = gpu.download_f32(&hidden_view)?;
+                let picked = dflash::dflash2_greedy_select(
+                    &host_logits,
+                    &host_hidden,
+                    sel,
+                    d2,
+                    h,
+                    vocab,
+                    batch,
+                    seed_token,
+                );
+                drafted.extend(picked);
+            } else {
             for i in 1..b {
                 let hidden_row = draft_scratch.x.sub_offset(i * h, h);
                 llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
@@ -3511,6 +3572,7 @@ pub fn spec_step_dflash(
                 } else {
                     drafted.push(argmax_u32(&logits));
                 }
+            }
             }
         }
     } // close else (DFlash draft path)

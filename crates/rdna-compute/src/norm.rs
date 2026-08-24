@@ -593,6 +593,89 @@ impl Gpu {
         result
     }
 
+    /// DFlash 2 grouped conv: `out[b,h] = Σ_tap (base[tap,h] + delta[b,tap,g]) ⊙ x[b-tap,h]`
+    /// with tap-1 zeroed at query row 0 (`pos = b % block_size`).
+    ///
+    /// `coeff` is `[B, 2, taps, num_groups]` from `kernel_projection`; `side` is
+    /// 0 (prepare) or 1 (finish). `base` is one side of `base_kernel`, `[taps, H]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash2_grouped_conv_f32(
+        &mut self,
+        x: &GpuTensor,
+        coeff: &GpuTensor,
+        base: &GpuTensor,
+        out: &GpuTensor,
+        batch: i32,
+        hidden: i32,
+        taps: i32,
+        group_size: i32,
+        block_size: i32,
+        side: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "dflash2_grouped_conv",
+            kernels::DFLASH2_GROUPED_CONV_SRC,
+            "dflash2_grouped_conv_f32",
+        )?;
+
+        let n = batch * hidden;
+        let mut x_ptr = x.buf.as_ptr();
+        let mut coeff_ptr = coeff.buf.as_ptr();
+        let mut base_ptr = base.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut b_val = batch;
+        let mut h_val = hidden;
+        let mut taps_val = taps;
+        let mut gs_val = group_size;
+        let mut bs_val = block_size;
+        let mut side_val = side;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut coeff_ptr as *mut _ as *mut c_void,
+            &mut base_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut b_val as *mut _ as *mut c_void,
+            &mut h_val as *mut _ as *mut c_void,
+            &mut taps_val as *mut _ as *mut c_void,
+            &mut gs_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+            &mut side_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "dflash2_grouped_conv_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "dflash2_grouped_conv_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(coeff_ptr);
+                blob.push_ptr(base_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(b_val);
+                blob.push_i32(h_val);
+                blob.push_i32(taps_val);
+                blob.push_i32(gs_val);
+                blob.push_i32(bs_val);
+                blob.push_i32(side_val);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// In-place softmax over last dimension
     pub fn softmax_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;

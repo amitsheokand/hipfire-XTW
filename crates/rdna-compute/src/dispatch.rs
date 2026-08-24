@@ -3241,6 +3241,10 @@ impl Gpu {
             ("add_inplace", kernels::ADD_INPLACE_SRC.to_string()),
             ("mul", kernels::MUL_SRC.to_string()),
             ("silu_mul", kernels::SILU_MUL_SRC.to_string()),
+            (
+                "dflash2_grouped_conv",
+                kernels::DFLASH2_GROUPED_CONV_SRC.to_string(),
+            ),
             ("sigmoid", kernels::SIGMOID_SRC.to_string()),
             ("alpha_gate", kernels::ALPHA_GATE_SRC.to_string()),
             ("conv1d_silu", kernels::CONV1D_SILU_SRC.to_string()),
@@ -3819,6 +3823,7 @@ impl Gpu {
                 "add_inplace" => vec!["add_inplace_f32"],
                 "mul" => vec!["mul_f32"],
                 "silu_mul" => vec!["silu_mul_f32"],
+                "dflash2_grouped_conv" => vec!["dflash2_grouped_conv_f32"],
                 "sigmoid" => vec!["sigmoid_f32"],
                 "alpha_gate" => vec!["alpha_gate_f32"],
                 "conv1d_silu" => vec!["conv1d_silu_f32"],

@@ -478,9 +478,12 @@ fn main() {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let is_dflash = architectures
-        .iter()
-        .any(|v| v.as_str() == Some("DFlashDraftModel"));
+    let is_dflash = architectures.iter().any(|v| {
+        matches!(
+            v.as_str(),
+            Some("DFlashDraftModel") | Some("DFlash2DraftModel")
+        )
+    });
     if !is_dflash {
         eprintln!(
             "warning: config.json architectures = {architectures:?}; expected DFlashDraftModel"
@@ -490,10 +493,13 @@ fn main() {
     let dflash_cfg = config
         .get("dflash_config")
         .expect("config.json missing dflash_config block");
+    // DFlash 1 puts `block_size` at the config root. DFlash 2 (`DFlash2DraftModel`)
+    // keeps it only under `dflash_config`.
     let block_size = config
         .get("block_size")
+        .or_else(|| dflash_cfg.get("block_size"))
         .and_then(|v| v.as_u64())
-        .expect("config.json missing block_size") as u32;
+        .expect("config.json missing block_size (root or dflash_config)") as u32;
     let mask_token_id = dflash_cfg
         .get("mask_token_id")
         .and_then(|v| v.as_u64())
@@ -565,10 +571,12 @@ fn main() {
     } else {
         Vec::new()
     };
+    let is_dflash2 = architectures.iter().any(|v| v.as_str() == Some("DFlash2DraftModel"));
     let metadata = serde_json::json!({
         "architecture": "dflash",
         "config": config,
         "dflash": {
+            "variant": if is_dflash2 { "dflash2" } else { "dflash" },
             "block_size": block_size,
             "mask_token_id": mask_token_id,
             "target_layer_ids": target_layer_ids,
@@ -583,6 +591,10 @@ fn main() {
             "rope_theta": config.get("rope_theta").cloned().unwrap_or_else(|| serde_json::Value::from(10_000_000.0)),
             "vocab_size": config.get("vocab_size").cloned(),
             "draft_dtype": draft_dtype,
+            "conv_kernel_size": dflash_cfg.get("conv_kernel_size"),
+            "conv_group_size": dflash_cfg.get("conv_group_size"),
+            "selector_rank": dflash_cfg.get("selector_rank"),
+            "selector_top_k": dflash_cfg.get("selector_top_k"),
         },
         "tokenizer": serde_json::Value::Null,
     });

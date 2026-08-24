@@ -4140,6 +4140,10 @@ pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
 /// Saves one kernel launch + one intermediate buffer.
 pub const SILU_MUL_SRC: &str = include_str!("../../../kernels/src/silu_mul.hip");
 
+/// DFlash 2 grouped two-tap conv wrapping attention / MLP (prepare + finish).
+pub const DFLASH2_GROUPED_CONV_SRC: &str =
+    include_str!("../../../kernels/src/dflash2_grouped_conv.hip");
+
 /// Softmax over last dimension (one block per row)
 pub const SOFTMAX_SRC: &str = include_str!("../../../kernels/src/softmax.hip");
 

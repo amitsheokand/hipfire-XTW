@@ -14,7 +14,11 @@
 //! reference and lets a single tokenizer / embedding table be shared.
 //!
 //! Architectural notes:
-//! - 5-layer Qwen3 decoder, all full attention, non-causal.
+//! - 5-layer Qwen3 decoder, all full attention, non-causal (DFlash 1).
+//! - DFlash 2 (`DFlash2DraftModel`) wraps each attention / MLP with a
+//!   grouped two-tap conv and replaces independent argmax with a
+//!   codebook path selector. Loading a DFlash 2 artifact as DFlash 1
+//!   is refused — conv/selector tensors must not be silently dropped.
 //! - Per-layer cross-attention over `target_hidden` (the projected
 //!   concatenation of hidden states from a configured set of target
 //!   layers, default `[1, 8, 15, 22, 29]` for a 32-layer target).
@@ -75,6 +79,33 @@ pub struct DflashConfig {
     /// SWA-trained layer over a different span is a train/inference mask
     /// mismatch, which degrades acceptance silently (verify stays exact).
     pub declared_window: Option<usize>,
+    /// Present only for `DFlash2DraftModel`. Absence means DFlash 1.
+    pub dflash2: Option<Dflash2Config>,
+}
+
+/// DFlash 2 extras: grouped conv around attn/MLP, plus the candidate selector.
+#[derive(Debug, Clone)]
+pub struct Dflash2Config {
+    pub conv_kernel_size: usize,
+    pub conv_group_size: usize,
+    pub selector_rank: usize,
+    pub selector_top_k: usize,
+}
+
+impl Dflash2Config {
+    pub fn num_groups(&self, hidden: usize) -> usize {
+        assert!(
+            hidden % self.conv_group_size == 0,
+            "dflash2: hidden {hidden} not divisible by conv_group_size {}",
+            self.conv_group_size
+        );
+        hidden / self.conv_group_size
+    }
+
+    /// `kernel_projection` output width: 2 sides × taps × groups.
+    pub fn coeff_width(&self, hidden: usize) -> usize {
+        2 * self.conv_kernel_size * self.num_groups(hidden)
+    }
 }
 
 impl DflashConfig {
@@ -124,9 +155,61 @@ impl DflashConfig {
             .filter_map(|v| v.as_u64().map(|x| x as usize))
             .collect();
         let num_target_layers = df.get("num_target_layers").and_then(|v| v.as_u64())? as usize;
+        let cfg_obj = meta.get("config");
+        let is_dflash2 = df.get("variant").and_then(|v| v.as_str()) == Some("dflash2")
+            || cfg_obj
+                .and_then(|c| c.get("architectures"))
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .any(|v| v.as_str() == Some("DFlash2DraftModel"))
+                })
+                .unwrap_or(false)
+            || hfq.find_tensor_info("layers.0.attention_conv.base_kernel").is_some();
+        let dflash_cfg_block = cfg_obj.and_then(|c| c.get("dflash_config"));
+        let dflash2 = if is_dflash2 {
+            let conv_kernel_size = dflash_cfg_block
+                .and_then(|c| c.get("conv_kernel_size"))
+                .or_else(|| df.get("conv_kernel_size"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as usize;
+            let conv_group_size = dflash_cfg_block
+                .and_then(|c| c.get("conv_group_size"))
+                .or_else(|| df.get("conv_group_size"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(16) as usize;
+            let selector_rank = dflash_cfg_block
+                .and_then(|c| c.get("selector_rank"))
+                .or_else(|| df.get("selector_rank"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(256) as usize;
+            let selector_top_k = dflash_cfg_block
+                .and_then(|c| c.get("selector_top_k"))
+                .or_else(|| df.get("selector_top_k"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(16) as usize;
+            if conv_group_size == 0 || hidden % conv_group_size != 0 {
+                eprintln!(
+                    "dflash2: refusing load — conv_group_size={conv_group_size} does not divide hidden={hidden}"
+                );
+                return None;
+            }
+            if conv_kernel_size == 0 || selector_rank == 0 || selector_top_k == 0 {
+                eprintln!("dflash2: refusing load — conv/selector dims must be > 0");
+                return None;
+            }
+            Some(Dflash2Config {
+                conv_kernel_size,
+                conv_group_size,
+                selector_rank,
+                selector_top_k,
+            })
+        } else {
+            None
+        };
         // The window fields live in the sibling `config` object (HF-style),
         // not in the `dflash` block, so they are read separately.
-        let declared_window = meta.get("config").and_then(|cfg| {
+        let declared_window = cfg_obj.and_then(|cfg| {
             if !cfg
                 .get("use_sliding_window")
                 .and_then(|v| v.as_bool())
@@ -155,6 +238,11 @@ impl DflashConfig {
                         });
                     if matches_split {
                         Some(w)
+                    } else if dflash2.is_some() {
+                        // DFlash 2 27B drafts declare all layers sliding_attention
+                        // (no full last layer). Windowed mode is DFlash-1-shaped;
+                        // stay on Legacy rather than mis-execute the 1-full split.
+                        None
                     } else {
                         eprintln!(
                             "  DFlash draft declares sliding_window={w} but layer_types do not \
@@ -184,6 +272,7 @@ impl DflashConfig {
             target_layer_ids,
             num_target_layers,
             declared_window,
+            dflash2,
         })
     }
 }
@@ -202,6 +291,24 @@ pub struct DflashLayerWeights {
     pub w_gate: WeightTensor, // [intermediate, hidden]
     pub w_up: WeightTensor,   // [intermediate, hidden]
     pub w_down: WeightTensor, // [hidden, intermediate]
+    pub attention_conv: Option<Dflash2GroupedConvWeights>,
+    pub mlp_conv: Option<Dflash2GroupedConvWeights>,
+}
+
+pub struct Dflash2GroupedConvWeights {
+    /// `[2, taps, hidden]` F32 — side 0 prepare, side 1 finish.
+    pub base_kernel: GpuTensor,
+    /// `[2 * taps * num_groups, hidden]`
+    pub kernel_projection: WeightTensor,
+}
+
+pub struct Dflash2SelectorWeights {
+    /// `[rank, hidden]` row-major F32 (host). Applied to mask-position hiddens.
+    pub hidden_projection: Vec<f32>,
+    /// `[vocab, rank]` row-major F32 (host).
+    pub predecessor_codebook: Vec<f32>,
+    /// `[vocab, rank]` row-major F32 (host).
+    pub successor_codebook: Vec<f32>,
 }
 
 pub struct DflashWeights {
@@ -213,6 +320,7 @@ pub struct DflashWeights {
     /// True when at least one matrix weight is MQ4G256 — drives whether
     /// the draft_forward path needs to allocate FWHT rotation scratches.
     pub has_mq: bool,
+    pub selector: Option<Dflash2SelectorWeights>,
 }
 
 /// Load a F32-only tensor (norms, embedding-shaped scalars). Always F32 on GPU.
@@ -245,6 +353,33 @@ fn hfq_tensor_f32(
         expected,
     );
     gpu.upload_f32(&f32_data, &shape)
+}
+
+/// Decode a tensor to host F32 without uploading (DFlash 2 selector tables).
+fn hfq_tensor_f32_host(hfq: &HfqFile, name: &str, shape: Vec<usize>) -> Vec<f32> {
+    let (info, data) = hfq
+        .tensor_data(name)
+        .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
+    let f32_data: Vec<f32> = match info.quant_type {
+        1 => data
+            .chunks_exact(2)
+            .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        q => panic!("dflash: unsupported quant_type {q} for {name}"),
+    };
+    let expected: usize = shape.iter().product();
+    assert_eq!(
+        f32_data.len(),
+        expected,
+        "dflash: shape mismatch for {name}: have {}, expected {}",
+        f32_data.len(),
+        expected,
+    );
+    f32_data
 }
 
 /// Load a matrix tensor as a `WeightTensor` carrying its native dtype.
@@ -401,7 +536,7 @@ impl DflashWeights {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = format!("layers.{i}");
-            let layer = DflashLayerWeights {
+            let mut layer = DflashLayerWeights {
                 attn_norm: hfq_tensor_f32(
                     hfq,
                     gpu,
@@ -475,9 +610,94 @@ impl DflashWeights {
                     cfg.hidden,
                     cfg.intermediate,
                 )?,
+                attention_conv: None,
+                mlp_conv: None,
             };
-            layers.push(layer);
+            if let Some(d2) = cfg.dflash2.as_ref() {
+                let taps = d2.conv_kernel_size;
+                let coeff_w = d2.coeff_width(cfg.hidden);
+                let attn_name = format!("{p}.attention_conv.base_kernel");
+                if hfq.find_tensor_info(&attn_name).is_none() {
+                    panic!(
+                        "DFlash 2 draft is missing {attn_name}; refusing silent DFlash 1 load"
+                    );
+                }
+                layer.attention_conv = Some(Dflash2GroupedConvWeights {
+                    base_kernel: hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &attn_name,
+                        vec![2, taps, cfg.hidden],
+                    )?,
+                    kernel_projection: hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.attention_conv.kernel_projection.weight"),
+                        coeff_w,
+                        cfg.hidden,
+                    )?,
+                });
+                layer.mlp_conv = Some(Dflash2GroupedConvWeights {
+                    base_kernel: hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp_conv.base_kernel"),
+                        vec![2, taps, cfg.hidden],
+                    )?,
+                    kernel_projection: hfq_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp_conv.kernel_projection.weight"),
+                        coeff_w,
+                        cfg.hidden,
+                    )?,
+                });
+                layers.push(layer);
+            } else {
+                if hfq
+                    .find_tensor_info(&format!("{p}.attention_conv.base_kernel"))
+                    .is_some()
+                {
+                    panic!(
+                        "DFlash 2 conv tensors present on {p} but metadata is DFlash 1; \
+                         refusing silent DFlash 1 load"
+                    );
+                }
+                layers.push(layer);
+            }
         }
+
+        let selector = if let Some(d2) = cfg.dflash2.as_ref() {
+            let rank = d2.selector_rank;
+            let vocab = cfg.vocab_size;
+            if hfq
+                .find_tensor_info("candidate_selector.hidden_projection.weight")
+                .is_none()
+            {
+                panic!(
+                    "DFlash 2 draft is missing candidate_selector; refusing silent DFlash 1 load"
+                );
+            }
+            Some(Dflash2SelectorWeights {
+                hidden_projection: hfq_tensor_f32_host(
+                    hfq,
+                    "candidate_selector.hidden_projection.weight",
+                    vec![rank, cfg.hidden],
+                ),
+                predecessor_codebook: hfq_tensor_f32_host(
+                    hfq,
+                    "candidate_selector.predecessor_codebook",
+                    vec![vocab, rank],
+                ),
+                successor_codebook: hfq_tensor_f32_host(
+                    hfq,
+                    "candidate_selector.successor_codebook",
+                    vec![vocab, rank],
+                ),
+            })
+        } else {
+            None
+        };
 
         let has_mq = std::iter::once(&fc)
             .chain(layers.iter().flat_map(|l| {
@@ -501,6 +721,7 @@ impl DflashWeights {
             norm,
             layers,
             has_mq,
+            selector,
         })
     }
 
@@ -523,6 +744,14 @@ impl DflashWeights {
             l.w_gate.free_all(gpu);
             l.w_up.free_all(gpu);
             l.w_down.free_all(gpu);
+            if let Some(c) = l.attention_conv {
+                let _ = gpu.free_tensor(c.base_kernel);
+                c.kernel_projection.free_all(gpu);
+            }
+            if let Some(c) = l.mlp_conv {
+                let _ = gpu.free_tensor(c.base_kernel);
+                c.kernel_projection.free_all(gpu);
+            }
         }
     }
 }
@@ -762,6 +991,10 @@ pub struct DflashScratch {
     /// including under the per-layer FFN graph, so separate planes only pin
     /// another B×hidden allocation without enabling overlap.
     pub residual: GpuTensor, // [B, hidden]
+    /// DFlash 2: `kernel_projection` output `[B, 2, taps, num_groups]`.
+    pub conv_coeff: Option<GpuTensor>,
+    /// DFlash 2: grouped-conv output `[B, hidden]` (not in-place; tap-1 reads x[t-1]).
+    pub conv_out: Option<GpuTensor>,
 
     // Context activations (L rows), where L ≤ max_ctx_len.
     pub target_hidden: GpuTensor,      // [L, num_extract × hidden]
@@ -962,6 +1195,15 @@ impl DflashScratch {
             gate_up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
             attn_out: gpu.alloc_tensor(&[b * qd], DType::F32)?,
             residual: gpu.alloc_tensor(&[b * h], DType::F32)?,
+            conv_coeff: match cfg.dflash2.as_ref() {
+                Some(d2) => Some(gpu.alloc_tensor(&[b * d2.coeff_width(h)], DType::F32)?),
+                None => None,
+            },
+            conv_out: if cfg.dflash2.is_some() {
+                Some(gpu.alloc_tensor(&[b * h], DType::F32)?)
+            } else {
+                None
+            },
 
             target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
             target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
@@ -1034,6 +1276,12 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.gate_up);
         let _ = gpu.free_tensor(self.attn_out);
         let _ = gpu.free_tensor(self.residual);
+        if let Some(t) = self.conv_coeff {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.conv_out {
+            let _ = gpu.free_tensor(t);
+        }
         let _ = gpu.free_tensor(self.target_hidden);
         let _ = gpu.free_tensor(self.target_hidden_proj);
         let _ = gpu.free_tensor(self.k_cat);
@@ -1275,6 +1523,43 @@ fn abort_draft_ffn_graph_capture(gpu: &mut Gpu) {
     gpu.graphs.capture_blobs.clear();
 }
 
+/// `side == 0` (prepare) projects `x` into `coeff` then convolves.
+/// `side == 1` (finish) reuses `coeff` from prepare.
+#[allow(clippy::too_many_arguments)]
+fn dflash2_conv_side(
+    gpu: &mut Gpu,
+    conv: &Dflash2GroupedConvWeights,
+    x: &GpuTensor,
+    coeff: &GpuTensor,
+    out: &GpuTensor,
+    b: usize,
+    h: usize,
+    d2: &Dflash2Config,
+    block_size: usize,
+    side: i32,
+    mq_rot: Option<&GpuTensor>,
+) -> HipResult<()> {
+    let taps = d2.conv_kernel_size;
+    if side == 0 {
+        gemm_dispatch(gpu, x, &conv.kernel_projection, coeff, b, mq_rot)?;
+    }
+    let base = conv
+        .base_kernel
+        .sub_offset(side as usize * taps * h, taps * h);
+    gpu.dflash2_grouped_conv_f32(
+        x,
+        coeff,
+        &base,
+        out,
+        b as i32,
+        h as i32,
+        taps as i32,
+        d2.conv_group_size as i32,
+        block_size as i32,
+        side,
+    )
+}
+
 fn draft_ffn_layer(
     gpu: &mut Gpu,
     layer: &DflashLayerWeights,
@@ -1283,6 +1568,8 @@ fn draft_ffn_layer(
     h: usize,
     eps: f32,
     graph_safe: bool,
+    d2: Option<&Dflash2Config>,
+    block_size: usize,
 ) -> HipResult<()> {
     if graph_safe {
         gpu.memcpy_dtod_auto(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
@@ -1292,9 +1579,38 @@ fn draft_ffn_layer(
     }
 
     gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
+    if let (Some(conv), Some(d2cfg), Some(coeff), Some(out)) = (
+        layer.mlp_conv.as_ref(),
+        d2,
+        scratch.conv_coeff.as_ref(),
+        scratch.conv_out.as_ref(),
+    ) {
+        dflash2_conv_side(
+            gpu,
+            conv,
+            &scratch.x_norm,
+            coeff,
+            out,
+            b,
+            h,
+            d2cfg,
+            block_size,
+            0,
+            scratch.mq_x_rot.as_ref(),
+        )?;
+    }
+    let ffn_in = if layer.mlp_conv.is_some() {
+        scratch
+            .conv_out
+            .as_ref()
+            .expect("dflash2 conv_out")
+            .sub_offset(0, b * h)
+    } else {
+        scratch.x_norm.sub_offset(0, b * h)
+    };
     gemm_dispatch(
         gpu,
-        &scratch.x_norm,
+        &ffn_in,
         &layer.w_gate,
         &scratch.gate,
         b,
@@ -1302,7 +1618,7 @@ fn draft_ffn_layer(
     )?;
     gemm_dispatch(
         gpu,
-        &scratch.x_norm,
+        &ffn_in,
         &layer.w_up,
         &scratch.up,
         b,
@@ -1317,7 +1633,31 @@ fn draft_ffn_layer(
         b,
         scratch.mq_x_rot.as_ref(),
     )?;
-    if graph_safe {
+    if let (Some(conv), Some(d2), Some(coeff), Some(out)) = (
+        layer.mlp_conv.as_ref(),
+        d2,
+        scratch.conv_coeff.as_ref(),
+        scratch.conv_out.as_ref(),
+    ) {
+        dflash2_conv_side(
+            gpu,
+            conv,
+            &scratch.x,
+            coeff,
+            out,
+            b,
+            h,
+            d2,
+            block_size,
+            1,
+            scratch.mq_x_rot.as_ref(),
+        )?;
+        if graph_safe {
+            gpu.add_f32_graph_safe(&scratch.residual, out, &scratch.x)
+        } else {
+            gpu.add_f32(&scratch.residual, out, &scratch.x)
+        }
+    } else if graph_safe {
         gpu.add_f32_graph_safe(&scratch.residual, &scratch.x, &scratch.x)
     } else {
         gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)
@@ -1333,9 +1673,13 @@ fn draft_ffn_layer_maybe_graph(
     h: usize,
     eps: f32,
     use_graph: bool,
+    d2: Option<&Dflash2Config>,
+    block_size: usize,
 ) -> HipResult<()> {
+    // DFlash 2 conv wraps the FFN body; the captured graph is DFlash-1-shaped.
+    let use_graph = use_graph && layer.mlp_conv.is_none();
     if !use_graph {
-        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false);
+        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false, d2, block_size);
     }
 
     if gpu.active_stream.is_none() {
@@ -1352,11 +1696,11 @@ fn draft_ffn_layer_maybe_graph(
 
     if !scratch.draft_ffn_warmed_up[layer_idx].contains(&b) {
         scratch.draft_ffn_warmed_up[layer_idx].insert(b);
-        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false);
+        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false, d2, block_size);
     }
 
     begin_draft_ffn_graph_capture(gpu)?;
-    let r = draft_ffn_layer(gpu, layer, scratch, b, h, eps, true);
+    let r = draft_ffn_layer(gpu, layer, scratch, b, h, eps, true, d2, block_size);
     if r.is_ok() {
         let entry = end_draft_ffn_graph_capture(gpu)?;
         scratch.draft_ffn_graphs[layer_idx].insert(b, entry);
@@ -1817,6 +2161,35 @@ pub fn draft_forward_opts(
 
         // attn_norm.
         gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+        if let (Some(conv), Some(d2cfg), Some(coeff), Some(out)) = (
+            layer.attention_conv.as_ref(),
+            cfg.dflash2.as_ref(),
+            scratch.conv_coeff.as_ref(),
+            scratch.conv_out.as_ref(),
+        ) {
+            dflash2_conv_side(
+                gpu,
+                conv,
+                &scratch.x_norm,
+                coeff,
+                out,
+                b,
+                h,
+                d2cfg,
+                cfg.block_size,
+                0,
+                scratch.mq_x_rot.as_ref(),
+            )?;
+        }
+        let attn_in = if layer.attention_conv.is_some() {
+            scratch
+                .conv_out
+                .as_ref()
+                .expect("dflash2 conv_out")
+                .sub_offset(0, b * h)
+        } else {
+            scratch.x_norm.sub_offset(0, b * h)
+        };
 
         let t0 = if dbg {
             gpu.hip.device_synchronize()?;
@@ -1831,7 +2204,7 @@ pub fn draft_forward_opts(
         // are *incrementally* cached — see the per-layer block below.
         gemm_dispatch(
             gpu,
-            &scratch.x_norm,
+            &attn_in,
             &layer.wq,
             &scratch.q,
             b,
@@ -1839,7 +2212,7 @@ pub fn draft_forward_opts(
         )?;
         gemm_dispatch(
             gpu,
-            &scratch.x_norm,
+            &attn_in,
             &layer.wk,
             &scratch.k_noise,
             b,
@@ -1847,7 +2220,7 @@ pub fn draft_forward_opts(
         )?;
         gemm_dispatch(
             gpu,
-            &scratch.x_norm,
+            &attn_in,
             &layer.wv,
             &scratch.v_noise,
             b,
@@ -2104,14 +2477,48 @@ pub fn draft_forward_opts(
             scratch.mq_x_rot.as_ref(),
         )?;
 
-        // x = residual + projected attention
-        gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)?;
+        // x = residual + projected attention (DFlash 2: conv-finish the wo
+        // output before the residual add, matching vLLM DFlash2DecoderLayer).
+        if let (Some(conv), Some(d2cfg), Some(coeff), Some(out)) = (
+            layer.attention_conv.as_ref(),
+            cfg.dflash2.as_ref(),
+            scratch.conv_coeff.as_ref(),
+            scratch.conv_out.as_ref(),
+        ) {
+            dflash2_conv_side(
+                gpu,
+                conv,
+                &scratch.x,
+                coeff,
+                out,
+                b,
+                h,
+                d2cfg,
+                cfg.block_size,
+                1,
+                scratch.mq_x_rot.as_ref(),
+            )?;
+            gpu.add_f32(&scratch.residual, out, &scratch.x)?;
+        } else {
+            gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)?;
+        }
 
         // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
         // per-layer/per-B hipGraph; the attention/context work above is left
         // direct because `ctx_len` changes every accepted cycle.
         let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
-        draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
+        draft_ffn_layer_maybe_graph(
+            gpu,
+            layer,
+            scratch,
+            li,
+            b,
+            h,
+            eps,
+            graph_ffn_active,
+            cfg.dflash2.as_ref(),
+            cfg.block_size,
+        )?;
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
         // on 27B HumanEval (median 76.47 fused vs 76.74 baseline; ±7 % run-to-
@@ -2144,6 +2551,127 @@ pub fn draft_forward_opts(
     scratch.thlog.mark_proj_cached(l);
 
     Ok(())
+}
+
+/// Per-row top-`k` (descending). Ties keep the lower index.
+pub fn dflash2_topk_rows(
+    logits: &[f32],
+    vocab: usize,
+    batch: usize,
+    k: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    assert_eq!(logits.len(), batch * vocab);
+    let mut ids = vec![0u32; batch * k];
+    let mut vals = vec![f32::NEG_INFINITY; batch * k];
+    for b in 0..batch {
+        let row = &logits[b * vocab..(b + 1) * vocab];
+        for (i, &v) in row.iter().enumerate() {
+            let base = b * k;
+            let mut slot = k;
+            for j in 0..k {
+                if v > vals[base + j] || (v == vals[base + j] && (i as u32) < ids[base + j]) {
+                    slot = j;
+                    break;
+                }
+            }
+            if slot < k {
+                for j in (slot + 1..k).rev() {
+                    ids[base + j] = ids[base + j - 1];
+                    vals[base + j] = vals[base + j - 1];
+                }
+                ids[base + slot] = i as u32;
+                vals[base + slot] = v;
+            }
+        }
+    }
+    (ids, vals)
+}
+
+fn dflash2_dot_modulated(pred: &[f32], hidden: &[f32], succ: &[f32]) -> f32 {
+    pred.iter()
+        .zip(hidden.iter())
+        .zip(succ.iter())
+        .map(|((p, h), s)| p * h * s)
+        .sum()
+}
+
+/// Greedy DFlash 2 lattice walk (vLLM `_selector_walk_kernel` at T=0).
+///
+/// `candidate_ids` / `unary` are `[batch, top_k]`. `hidden_proj` is
+/// `[batch, rank]` (`H @ W_hp`). Walks from `anchor` through each step's
+/// top-k using `score = unary[c] + ⟨A[p] ⊙ h, B[c]⟩`.
+pub fn dflash2_greedy_walk(
+    candidate_ids: &[u32],
+    unary: &[f32],
+    hidden_proj: &[f32],
+    selector: &Dflash2SelectorWeights,
+    batch: usize,
+    top_k: usize,
+    rank: usize,
+    vocab: usize,
+    anchor: u32,
+) -> Vec<u32> {
+    assert_eq!(candidate_ids.len(), batch * top_k);
+    assert_eq!(unary.len(), batch * top_k);
+    assert_eq!(hidden_proj.len(), batch * rank);
+    assert_eq!(selector.predecessor_codebook.len(), vocab * rank);
+    assert_eq!(selector.successor_codebook.len(), vocab * rank);
+    let mut out = Vec::with_capacity(batch);
+    let mut prev_idx = 0usize;
+    for step in 0..batch {
+        let h = &hidden_proj[step * rank..(step + 1) * rank];
+        let pred_tok = if step == 0 {
+            anchor
+        } else {
+            candidate_ids[(step - 1) * top_k + prev_idx]
+        };
+        let pred = &selector.predecessor_codebook[pred_tok as usize * rank..][..rank];
+        let mut best_i = 0usize;
+        let mut best_s = f32::NEG_INFINITY;
+        for c in 0..top_k {
+            let cand = candidate_ids[step * top_k + c];
+            let succ = &selector.successor_codebook[cand as usize * rank..][..rank];
+            let s = unary[step * top_k + c] + dflash2_dot_modulated(pred, h, succ);
+            if s > best_s {
+                best_s = s;
+                best_i = c;
+            }
+        }
+        out.push(candidate_ids[step * top_k + best_i]);
+        prev_idx = best_i;
+    }
+    out
+}
+
+/// Project mask-position hiddens, take per-row top-k, walk the DFlash 2 path.
+///
+/// `logits` is `[batch, vocab]` from the target lm_head on draft rows 1..B.
+/// `hidden` is `[batch, hidden_size]` for those same rows.
+pub fn dflash2_greedy_select(
+    logits: &[f32],
+    hidden: &[f32],
+    selector: &Dflash2SelectorWeights,
+    d2: &Dflash2Config,
+    hidden_size: usize,
+    vocab: usize,
+    batch: usize,
+    anchor: u32,
+) -> Vec<u32> {
+    let k = d2.selector_top_k;
+    let rank = d2.selector_rank;
+    assert_eq!(selector.hidden_projection.len(), rank * hidden_size);
+    let (ids, unary) = dflash2_topk_rows(logits, vocab, batch, k);
+    let mut hp = vec![0f32; batch * rank];
+    for b in 0..batch {
+        let x = &hidden[b * hidden_size..(b + 1) * hidden_size];
+        for r in 0..rank {
+            let w = &selector.hidden_projection[r * hidden_size..(r + 1) * hidden_size];
+            hp[b * rank + r] = x.iter().zip(w.iter()).map(|(a, b)| a * b).sum();
+        }
+    }
+    dflash2_greedy_walk(
+        &ids, &unary, &hp, selector, batch, k, rank, vocab, anchor,
+    )
 }
 
 #[cfg(test)]
@@ -2186,5 +2714,38 @@ mod ring_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dflash2_selector_tests {
+    use super::{dflash2_greedy_walk, dflash2_topk_rows, Dflash2SelectorWeights};
+
+    #[test]
+    fn topk_keeps_highest_and_lower_index_on_tie() {
+        let logits = vec![1.0, 3.0, 3.0, 2.0];
+        let (ids, vals) = dflash2_topk_rows(&logits, 4, 1, 2);
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(vals, vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn greedy_walk_follows_chosen_predecessor_index() {
+        // rank=1, vocab=4, batch=2, top_k=2.
+        // step0 candidates [1, 2]; unary both 0; hidden=1.
+        // pred codebook: token 0 (anchor) = 1.0, others 0.
+        // succ codebook: token 1 = 1.0, token 2 = 0.5 → pick 1.
+        // step1 candidates [3, 0]; pred is token 1 (= 2.0); succ token 3 = 1
+        // → 2*1=2 vs token 0 succ 0 → pick 3.
+        let selector = Dflash2SelectorWeights {
+            hidden_projection: vec![1.0],
+            predecessor_codebook: vec![1.0, 2.0, 0.0, 0.0],
+            successor_codebook: vec![0.0, 1.0, 0.5, 1.0],
+        };
+        let ids = vec![1u32, 2, 3, 0];
+        let unary = vec![0.0; 4];
+        let hp = vec![1.0, 1.0];
+        let out = dflash2_greedy_walk(&ids, &unary, &hp, &selector, 2, 2, 1, 4, 0);
+        assert_eq!(out, vec![1, 3]);
     }
 }

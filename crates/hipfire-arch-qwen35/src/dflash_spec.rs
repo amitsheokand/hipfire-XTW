@@ -222,6 +222,12 @@ pub fn load_dflash_state(
         };
     }
     let draft_weights = or_free!(DflashWeights::load(gpu, &draft_hfq, &draft_config), "");
+    if draft_config.dflash2.is_some() {
+        eprintln!(
+            "[hipfire] DFlash 2 draft detected (grouped conv + candidate selector); \
+             not running as DFlash 1"
+        );
+    }
     let block_size = draft_config.block_size;
     // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
     // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
@@ -231,7 +237,13 @@ pub fn load_dflash_state(
     // single parser shared with the dense path — env wins, else the CLI param,
     // else 0 (chain-only). An explicit `HIPFIRE_DDTREE_BUDGET=0` reads as None
     // (unset) here and falls through to the param, matching the dense semantics.
-    let ddtree_budget: usize = gpu.flags.ddtree_budget.or(ddtree_budget_param).unwrap_or(0);
+    let mut ddtree_budget: usize = gpu.flags.ddtree_budget.or(ddtree_budget_param).unwrap_or(0);
+    if draft_config.dflash2.is_some() && ddtree_budget > 0 {
+        eprintln!(
+            "  DFlash 2: DDTree is DFlash-1-shaped — ignoring HIPFIRE_DDTREE_BUDGET={ddtree_budget}"
+        );
+        ddtree_budget = 0;
+    }
     let max_n = (block_size + 1).max(ddtree_budget + 1);
     // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
     // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
