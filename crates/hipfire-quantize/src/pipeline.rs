@@ -4288,9 +4288,17 @@ fn handle_moe_expert_3d(
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
-                    } else {
+                    } else if inner_k_e % 128 == 0 {
                         let q = quantize_hfq4g128(&f32_slice);
                         (q, QuantType::HFQ4G128, 128u32)
+                    } else {
+                        // Whittle routed down is [hidden, 192]. Grouped MMQ
+                        // needs K % 256 == 0 and HFQ4G128 needs K % 128 == 0;
+                        // 192 is neither. Q8 groups of 32 fit (192 % 32 == 0)
+                        // and keep the stamped shape [hidden, moe_intermediate]
+                        // the loader already checks.
+                        let q = quantize_q8f16(&f32_slice);
+                        (q, QuantType::Q8F16, 32u32)
                     };
                     let weight = HfqTensor {
                         name: format!("{parent_owned}{slot}.{base_owned}.weight"),
@@ -4378,8 +4386,10 @@ fn handle_moe_expert_3d(
                 "MFP4G32E8SOA"
             } else if supports_g256 {
                 "MQ4G256"
-            } else {
+            } else if inner_k % 128 == 0 {
                 "HFQ4G128"
+            } else {
+                "Q8F16"
             };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!(

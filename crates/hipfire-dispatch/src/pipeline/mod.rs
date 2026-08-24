@@ -1347,9 +1347,29 @@ fn run_moe_decode_cpu_fallback(
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
         let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
 
-        // gate_up: y = W·x  (run_auto auto-rotates for MQ/Paro dtypes).
+        // gate_up: y = W·x. When the caller already FWHT-rotated post-rmsnorm
+        // into `x_rot_local` (`x_rot_prerotated`, the ffn_all_mq4 fused path),
+        // `run_auto` on `x_norm` would GEMV the residual (or double-rotate).
+        // k≠8 models (Whittle top-16) always land here, so this must consume
+        // the prerotated buffer with the Prerotated kernel.
         {
-            gemv.run_auto(ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
+            if p.x_rot_prerotated {
+                gemv.run(
+                    ctx,
+                    gpu,
+                    &crate::families::gemv::GemvParams {
+                        w: gate_up_w,
+                        x: p.x_rot_local,
+                        y: p.gate_up_buf,
+                        variant: crate::types::GemvVariant::Prerotated,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )?;
+            } else {
+                gemv.run_auto(ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
+            }
         }
         let gate_view = unsafe { slice_moe_f32_view(p.gate_up_buf, 0, mi) };
         let up_view = unsafe { slice_moe_f32_view(p.gate_up_buf, mi, mi) };
