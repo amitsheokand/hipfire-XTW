@@ -25390,11 +25390,33 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
-            kernels::GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
-            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
-        )?;
+        // Analytical: n_ranks × Q8 GEMV (weight + hidden) plus one residual
+        // write. Was untimed — HIPFIRE_PROFILE_DECODE was blind to Whittle
+        // routed-down, the kernel class the k=16 campaign named as leftover.
+        let bytes = n_ranks
+            .saturating_mul(batch_size)
+            .saturating_mul(crate::profile::gemv_q8_0_bytes(m, k));
+        static WHITTLE_Q8_STAGED: OnceLock<bool> = OnceLock::new();
+        let staged = k == 192
+            && n_ranks == 16
+            && batch_size == 1
+            && m % 16 == 0
+            && *WHITTLE_Q8_STAGED.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_WHITTLE_Q8_STAGED").as_deref() != Ok("0")
+            });
+        if staged {
+            self.ensure_kernel(
+                "gemv_q8_0_moe_down_k16_staged_r16",
+                kernels::GEMV_Q8_0_MOE_DOWN_K16_STAGED_R16_SRC,
+                "gemv_q8_0_moe_down_k16_staged_r16",
+            )?;
+        } else {
+            self.ensure_kernel(
+                "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
+                kernels::GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
+                "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
+            )?;
+        }
         let mut pp = expert_ptrs.buf.as_ptr();
         let mut ip = topk_indices.buf.as_ptr();
         let mut wp = topk_weights.buf.as_ptr();
@@ -25413,25 +25435,56 @@ impl Gpu {
             &mut m_val as *mut _ as *mut std::ffi::c_void,
             &mut k_val as *mut _ as *mut std::ffi::c_void,
         ];
-        let result = self.launch_maybe_blob(
-            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
-            [m as u32, n_ranks as u32, batch_size as u32],
-            [32u32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(sp);
-                b.push_ptr(hbp);
-                b.push_ptr(xrp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
-        );
+        let kernel_name = if staged {
+            "gemv_q8_0_moe_down_k16_staged_r16"
+        } else {
+            "gemv_q8_0_moe_down_residual_scaled_k8_indexed"
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", kernel_name, bytes);
+        let result = if staged {
+            self.launch_maybe_blob(
+                kernel_name,
+                [(m / 16) as u32, 1, 1],
+                [256u32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pp);
+                    b.push_ptr(ip);
+                    b.push_ptr(wp);
+                    b.push_ptr(sp);
+                    b.push_ptr(hbp);
+                    b.push_ptr(xrp);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                },
+            )
+        } else {
+            self.launch_maybe_blob(
+                kernel_name,
+                [m as u32, n_ranks as u32, batch_size as u32],
+                [32u32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pp);
+                    b.push_ptr(ip);
+                    b.push_ptr(wp);
+                    b.push_ptr(sp);
+                    b.push_ptr(hbp);
+                    b.push_ptr(xrp);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                },
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
