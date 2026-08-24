@@ -15,4 +15,9 @@ AR 36.6; MTP live (`HIPFIRE_QWEN_MTP=1`) 47.7 τ=2.40; DFlash 2 37.2 τ=2.43.
 `--spec mtp` without the env is silent AR. Checkpoint
 `docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-vs-mtp-ar-r9700.md`.
 
+Code prompt (md5 `51a6c7360e00a7853521a6575975b8e3`, same protocol): AR 36.6;
+MTP 75.7 τ=3.74; DFlash 2 84.7 τ=6.94. Genre-conditional: DFlash 2 converts
+τ on code, not on the relativity cell. Checkpoint
+`docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-code-r9700.md`.
+
 Whittle v2+v2.1 download finished 2026-08-24 (~53 GB) at `~/.hipfire/hf-cache/Qwen3.8-Whittle-MoE-27B-A17.8B`. v2.1 is a PEFT LoRA (`r=128`, `alpha=256`) plus `modules_to_save` = 64 routers and late-layer shared experts — merge before encode. Shape: 64 experts / top-16 / moe_intermediate 192 / shared 5120. First encode risk: routed `down` K=192 vs group-256.
