@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| State | **planned** |
+| State | **step 4 measured** (32k FA-tile tax fixed 2026-08-25; pager not indicated) |
 | Date | 2026-08-24 |
 | Hardware | Radeon AI PRO R9700 (`gfx1201`), 32 GB GDDR6, decode DRAM roofline ~631 GB/s |
 | Dense floor | Qwen3.8-27B MQ4 (selected 2026-08-24; not an admission) |
@@ -10,7 +10,7 @@
 | Validation | [`docs/VALIDATION.md`](../VALIDATION.md) — serve_harness for generation; redline harness only if kernels/dispatch change; [`docs/methodology/perf-benchmarking.md`](../methodology/perf-benchmarking.md) for tok/s |
 | Not | Product default, registry tag, or `admissions.yml` row |
 
-Dense-then-MoE on one 32 GB card. Compute kernels (FP8 GEMV/GEMM, fused overwrite) stay on `r9700-fp8-adaptive`. This campaign targets **HBM bytes/token**, then **HBM+DDR overlap**, not VRAM spill. Truth state is **planned** until a dated measured note exists.
+Dense-then-MoE on one 32 GB card. Compute kernels (FP8 GEMV/GEMM, fused overwrite) stay on `r9700-fp8-adaptive`. This campaign targets **HBM bytes/token**, then **HBM+DDR overlap**, not VRAM spill. Step 4 is measured: Whittle AR beats dense MQ4 on serve at `max_seq=32768` after the AR hipGraph FA tile-grid fix ([`2026-08-25-whittle-ar-fa-actual-tiles-r9700.md`](../perf-checkpoints/2026-08-25-whittle-ar-fa-actual-tiles-r9700.md)). Do not start the pager from that row.
 
 Companion briefing: [`docs/investigations/2026-08-23-r9700-fp8-external-refs.md`](../investigations/2026-08-23-r9700-fp8-external-refs.md) § FreeToken. Pager spec: [`docs/specs/2026-07-19-weight-pager-eviction-policy.md`](../specs/2026-07-19-weight-pager-eviction-policy.md). Selection ledger: `.agent-memory/notes/qwen38-27b-r9700-selection-2026-08-24.md`.
 

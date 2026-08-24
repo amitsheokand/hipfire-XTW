@@ -1239,6 +1239,23 @@ fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
     requested && compact_offset == 0
 }
 
+#[inline]
+fn q8_fa_actual_tiles(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    kv_cache: &llama::KvCache,
+    pos: usize,
+) -> usize {
+    rdna_compute::attention::q8_flash_actual_tiles(
+        &gpu.arch,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_cache.physical_cap,
+        pos + 1,
+    )
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -1386,6 +1403,7 @@ pub fn forward_scratch(
         && graph_eligible
         && !gpu.replay.is_enabled()
         && (config.num_experts == 0 || allow_moe);
+    gpu.graphs.ar_fa_grow_recapture = use_graph;
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
@@ -1432,12 +1450,19 @@ pub fn forward_scratch(
             }
         };
     }
+    if use_graph {
+        gpu.graphs.recapture_ar_if_fa_tiles_grew(
+            &gpu.hip,
+            gpu.device_id,
+            q8_fa_actual_tiles(gpu, config, kv_cache, pos),
+        );
+    }
     if use_graph && gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_exec.is_some() {
         // ── Replay path: graph captured + kernels clean. Cheapest path: pos
-        // memcpy + graph replay. The graph is position-agnostic (pos via
-        // pos_buf), so replay is correct across positions and requests as long
-        // as the buffers are the plain-AR continuation — which the spec markers
-        // + verify invalidation guarantee. ──
+        // memcpy + graph replay. pos_buf is live; the Q8 flash Y-grid is not —
+        // recapture_ar_if_fa_tiles_grew above drops the graph when seq_len
+        // crosses a tile boundary. Spec markers + verify invalidation still
+        // guarantee the buffers are a plain-AR continuation. ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graphs
@@ -1492,6 +1517,7 @@ pub fn forward_scratch(
         // token. The per-token instantiate is why the path "did nothing" — the
         // daemon never calls end_decode_turn() to enable replay.
         gpu.graphs.ar_forward_replay_enabled = true;
+        gpu.graphs.ar_fa_tiles = q8_fa_actual_tiles(gpu, config, kv_cache, pos);
     } else {
         // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip

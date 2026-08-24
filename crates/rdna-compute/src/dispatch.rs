@@ -1032,6 +1032,8 @@ impl Gpu {
                 ar_forward_kernel_dirty: true,
                 ar_forward_replay_enabled: false,
                 ar_graph_eligible: true,
+                ar_fa_grow_recapture: false,
+                ar_fa_tiles: 0,
                 verify: crate::graph::PerBGraphCache {
                     cache: std::collections::HashMap::new(),
                     warmed_up: std::collections::HashSet::new(),

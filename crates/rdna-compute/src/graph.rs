@@ -121,6 +121,13 @@ pub struct GraphState {
     /// their `forward_scratch` call so the plain-AR graph can't capture/replay
     /// in their non-sequential context.
     pub ar_graph_eligible: bool,
+    /// When true, AR hipGraph capture bakes the live Q8 flash Y-grid
+    /// (`actual_tiles`) instead of `ceil(max_seq / tile)`. The Qwen35 AR
+    /// path recaptures when that count grows. Other AR graph owners leave
+    /// this false so they keep the historical max_tiles grid.
+    pub ar_fa_grow_recapture: bool,
+    /// Q8 flash tile count baked into the current AR hipGraph. 0 if none.
+    pub ar_fa_tiles: usize,
 
     // Verify (DFlash, per-B)
     pub verify: PerBGraphCache,
@@ -221,6 +228,24 @@ impl GraphState {
         }
         self.capture_blobs.clear();
         self.ar_forward_blobs.clear();
+        self.ar_fa_tiles = 0;
+    }
+
+    /// Drop the AR graph when Q8 flash needs more Y-tiles than were captured.
+    /// No-op unless `ar_fa_grow_recapture` and a graph exists.
+    pub fn recapture_ar_if_fa_tiles_grew(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        actual_tiles: usize,
+    ) {
+        if !self.ar_fa_grow_recapture || self.graph_exec.is_none() {
+            return;
+        }
+        if actual_tiles > self.ar_fa_tiles {
+            self.drop_captured_graph(hip, device_id);
+            self.ar_forward_replay_enabled = false;
+        }
     }
 
     /// Caller signals a kernel-module change (model load, dtype switch, etc).
@@ -230,6 +255,7 @@ impl GraphState {
     pub fn mark_kernels_dirty(&mut self) {
         self.ar_forward_kernel_dirty = true;
         self.ar_forward_replay_enabled = false;
+        self.ar_fa_tiles = 0;
     }
 
     /// Destroy the captured graph and free all retained kernarg blobs.
@@ -245,6 +271,7 @@ impl GraphState {
         self.ar_forward_blobs.clear();
         self.ar_forward_kernel_dirty = true;
         self.ar_forward_replay_enabled = false;
+        self.ar_fa_tiles = 0;
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────
@@ -291,6 +318,7 @@ impl GraphState {
         // caller-side `ar_graph_eligible=false` + position-continuity gate.
         self.ar_forward_replay_enabled = false;
         self.ar_forward_kernel_dirty = true;
+        self.ar_fa_tiles = 0;
         self.verify.capturing = Some(b);
         self.capture_mode = true;
         hip.stream_begin_capture(stream, 0) // hipStreamCaptureModeGlobal

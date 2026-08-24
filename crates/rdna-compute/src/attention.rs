@@ -108,6 +108,20 @@ pub fn q8_flash_tile_size(
         .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq))
 }
 
+/// Y-grid tile count for a live `seq_len` under the same tile size the
+/// Q8 flash tile kernel uses. Always ≥ 1 so a launch grid is valid.
+pub fn q8_flash_actual_tiles(
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    seq_len: usize,
+) -> usize {
+    let tile = q8_flash_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq).max(1);
+    ((seq_len + tile - 1) / tile).max(1)
+}
+
 const V_MODE_Q8: i32 = 8;
 
 fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
@@ -126,17 +140,28 @@ fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
         })
 }
 
+/// True when the Q8 flash Y-grid must cover `max_seq` even if `seq_len` is
+/// short. Redline and per-B verify/tape graphs replay across growing context
+/// without recapture. AR hipGraph can bake `actual_tiles` when the caller
+/// recaptures on growth (`GraphState::ar_fa_grow_recapture`).
+#[inline]
+fn q8_flash_keep_max_tile_grid(gpu: &Gpu) -> bool {
+    gpu.replay.is_recording()
+        || gpu.graphs.verify.capturing.is_some()
+        || gpu.graphs.replay.capturing.is_some()
+        || (gpu.graphs.capture_mode && !gpu.graphs.ar_fa_grow_recapture)
+}
+
 #[inline]
 fn replay_stable_tile_count(
     actual_tiles: usize,
     max_tiles: usize,
-    graph_capture: bool,
-    redline_recording: bool,
+    keep_max_tiles: bool,
 ) -> usize {
-    if graph_capture || redline_recording {
-        max_tiles
+    if keep_max_tiles {
+        max_tiles.max(1)
     } else {
-        actual_tiles
+        actual_tiles.max(1)
     }
 }
 
@@ -3732,20 +3757,19 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
-        // Graph-safe: use max_tiles so the grid is position-independent.
-        // The tile kernel exits early for tiles beyond actual seq_len.
+        // Direct dispatch and AR hipGraph (when `ar_fa_grow_recapture`) launch
+        // only the live tile count. Dummy tiles beyond seq_len still occupy
+        // the CP: at max_seq=32768 / tile=128 that is a 256-wide Y-grid on
+        // every replay, which is why Whittle decode fell 43.5 → 29.6 tok/s
+        // vs max_seq=2048 (16 tiles) on short prompts. Redline and per-B
+        // verify/tape graphs cannot grow a recorded grid, so they keep
+        // max_tiles. The tile kernel still exits early for tiles past seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
-        // For profiling / non-graph code paths, the actual tile count:
         let actual_tiles = (seq_len_hint + tile_size - 1) / tile_size;
-        // Redline records an immutable launch sequence independently of
-        // hipGraph's capture_mode. Its replay updates pos_buf but cannot grow a
-        // recorded grid when seq_len crosses a tile boundary, so the
-        // recording pass must capture the same max_tiles superset as hipGraph.
         let launch_tiles = replay_stable_tile_count(
             actual_tiles,
             max_tiles,
-            self.graphs.capture_mode,
-            self.replay.is_recording(),
+            q8_flash_keep_max_tile_grid(self),
         );
 
         // ── Tile kernel ──
@@ -6197,8 +6221,7 @@ impl Gpu {
         let launch_tiles = replay_stable_tile_count(
             actual_tiles,
             max_tiles,
-            self.graphs.capture_mode,
-            self.replay.is_recording(),
+            q8_flash_keep_max_tile_grid(self),
         );
 
         self.ensure_givens4_kernel(
@@ -6740,8 +6763,7 @@ impl Gpu {
         let launch_tiles = replay_stable_tile_count(
             actual_tiles,
             max_tiles,
-            self.graphs.capture_mode,
-            self.replay.is_recording(),
+            q8_flash_keep_max_tile_grid(self),
         );
 
         self.ensure_givens4_kernel(
@@ -6852,8 +6874,7 @@ impl Gpu {
         let launch_tiles = replay_stable_tile_count(
             actual_tiles,
             max_tiles,
-            self.graphs.capture_mode,
-            self.replay.is_recording(),
+            q8_flash_keep_max_tile_grid(self),
         );
 
         self.ensure_givens4_kernel(
@@ -14726,9 +14747,25 @@ mod tests {
     }
 
     #[test]
-    fn q8_flash_uses_max_tiles_for_both_capture_backends() {
-        assert_eq!(replay_stable_tile_count(2, 64, false, false), 2);
-        assert_eq!(replay_stable_tile_count(2, 64, true, false), 64);
-        assert_eq!(replay_stable_tile_count(2, 64, false, true), 64);
+    fn q8_flash_keep_max_tiles_only_when_requested() {
+        assert_eq!(replay_stable_tile_count(2, 64, false), 2);
+        assert_eq!(replay_stable_tile_count(2, 64, true), 64);
+        assert_eq!(replay_stable_tile_count(0, 64, false), 1);
+    }
+
+    #[test]
+    fn q8_flash_actual_tiles_matches_ceil_div() {
+        assert_eq!(
+            super::q8_flash_actual_tiles("gfx1201", 16, 2, 256, 32_768, 64),
+            1
+        );
+        assert_eq!(
+            super::q8_flash_actual_tiles("gfx1201", 16, 2, 256, 32_768, 129),
+            2
+        );
+        assert_eq!(
+            super::q8_flash_actual_tiles("gfx1201", 16, 2, 256, 2_048, 2_048),
+            16
+        );
     }
 }
