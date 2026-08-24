@@ -5455,6 +5455,9 @@ pub const GEMM_F16_WMMA_MB8_SRC: &str = include_str!("../../../kernels/src/gemm_
 /// gfx12/RDNA4 sibling of the MB=8 fused-transpose F16 WMMA GEMM.
 pub const GEMM_F16_WMMA_MB8_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_wmma_mb8.gfx12.hip");
+/// gfx12 small-N sibling: NB=1 (16 N-cols) for DFlash B≤32. Same Y[N,M] contract.
+pub const GEMM_F16_WMMA_MB1_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_wmma_mb1.gfx12.hip");
 /// Tiled F16 GEMM with shared memory (no WMMA dependency, works on all RDNA).
 /// ~5-10x faster than naive gemm_f16 via LDS data reuse. Tile size 64K.
 pub const GEMM_F16_TILED_SRC: &str = include_str!("../../../kernels/src/gemm_f16_tiled.hip");

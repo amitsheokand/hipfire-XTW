@@ -21711,8 +21711,7 @@ impl Gpu {
 
         let row_tiles = ((m + 15) / 16) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
-        let bytes =
-            crate::profile::q8_0_weight_bytes(m, k) + m_total * k * 2 + m_total * m * 4;
+        let bytes = crate::profile::q8_0_weight_bytes(m, k) + m_total * k * 2 + m_total * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KNAME, bytes);
         let result = self.launch_maybe_blob(
             KNAME,
@@ -23673,17 +23672,31 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (kernel_name, kernel_src, symbol) = if self.arch_caps.has_wmma_w32_gfx12() {
-            (
-                "gemm_f16_wmma_mb8_gfx12",
-                kernels::GEMM_F16_WMMA_MB8_GFX12_SRC,
-                "gemm_f16_wmma_mb8_gfx12",
-            )
+        // gfx12 MB8 tiles N by 128 (NB=8). DFlash decode is N=B≤8, so seven
+        // of those WMMA multiply zeros and grid_n stays 1. MB1 (16-col N)
+        // is the small-N path; N>32 keeps MB8 for vision-scale A-tile reuse.
+        let (kernel_name, kernel_src, symbol, n_tile) = if self.arch_caps.has_wmma_w32_gfx12() {
+            if n <= 32 {
+                (
+                    "gemm_f16_wmma_mb1_gfx12",
+                    kernels::GEMM_F16_WMMA_MB1_GFX12_SRC,
+                    "gemm_f16_wmma_mb1_gfx12",
+                    16u32,
+                )
+            } else {
+                (
+                    "gemm_f16_wmma_mb8_gfx12",
+                    kernels::GEMM_F16_WMMA_MB8_GFX12_SRC,
+                    "gemm_f16_wmma_mb8_gfx12",
+                    128u32,
+                )
+            }
         } else if self.arch_caps.has_wmma_w32() {
             (
                 "gemm_f16_wmma_mb8",
                 kernels::GEMM_F16_WMMA_MB8_SRC,
                 "gemm_f16_wmma_mb8",
+                128u32,
             )
         } else {
             return Err(hip_bridge::HipError::new(
@@ -23711,7 +23724,7 @@ impl Gpu {
             &mut ni as *mut _ as *mut c_void,
         ];
         let grid_m = ((m + 15) / 16) as u32;
-        let grid_n = ((n + 127) / 128) as u32;
+        let grid_n = (n as u32 + n_tile - 1) / n_tile;
         unsafe {
             self.hip.launch_kernel(
                 func,

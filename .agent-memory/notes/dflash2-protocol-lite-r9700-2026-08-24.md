@@ -13,6 +13,7 @@ After `mtp_mode=on` generate opt-in (daemon `661c230a…`) `--spec mtp` is
 `HIPFIRE_VERIFY_GRAPH=0` 40.9 τ=2.43. Code prompt still DFlash 2 84.7
 τ=6.94. After GPU selector top-k (daemon `ff448beb…`): prose nograph
 **44.9** τ=2.43; code **101.8** τ=6.94. Adaptive-B 8→4 on prose
-**rejected** (38.5 τ=1.89). Checkpoints: prose, code,
-mtp/nograph, gpu-topk, and
-docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-adaptive-b-r9700.md.
+**rejected** (38.5 τ=1.89). gfx12 F16 GEMM MB1 (N≤32): prose nograph
+**47.1** τ=2.43 (+4.9% vs 44.9, under the 5% claim bar; MTP still 47.8).
+Checkpoints: prose, code, mtp/nograph, gpu-topk, adaptive-B, and
+docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-f16-mb1-r9700.md.
