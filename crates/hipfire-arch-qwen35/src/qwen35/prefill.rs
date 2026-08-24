@@ -2904,20 +2904,60 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     //
     // Reads shared_scalar[token] as the pre-sigmoid logit, applies sigmoid
     // internally, and += sigmoid(scalar) × (W_down · rot) into
-    // pbs.x_batch[token × dim + row]. (Note: HFQ4 sister uses += not
-    // atomicAdd; each (bid, row) writes a unique cell.)
-    // Per-projection dispatch: MQ4 → HFQ4 kernel, MQ6 → HFQ6 sister
-    // (shipped via feat/hfq6-sigmoid-scaled-batched).
+    // pbs.x_batch[token × dim + row]. MQ4 n>1 uses residual WMMA into a
+    // temp then the batched sigmoid fold (Q8 shared-down pattern). n==1
+    // and MQ6/PARO keep the fused GEMV.
     match ffn.shared_expert.down.gpu_dtype {
-        DType::MQ4G256 => gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
-            &ffn.shared_expert.down.buf,
-            shared_rot,
-            &pbs.x_batch,
-            shared_scalar,
-            ffn.shared_expert.down.m,
-            ffn.shared_expert.down.k,
-            n,
-        )?,
+        DType::MQ4G256 => {
+            // Batched fused GEMV is 32-thread grid.y=N. On gfx1201 Whittle
+            // N=128 it was ~20% of prefill GPU at ~1085 GiB/s while the
+            // sibling `gemm_hfq4g256_residual_wmma_gfx12_bt8` (shared
+            // gate_up's residual cousin) was 17 ms. Same Q8 shared-down
+            // pattern: overwrite-shaped GEMM into the free down_expanded
+            // prefix, then sigmoid-scale-add into the residual. n==1 keeps
+            // the fused GEMV (residual WMMA fast-path is batch>1).
+            if n > 1 {
+                let nbytes = n * dim * 4;
+                let down_tmp = GpuTensor {
+                    buf: unsafe { down_expanded.buf.alias() },
+                    shape: vec![n * dim],
+                    dtype: DType::F32,
+                };
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.memset_async(&down_tmp.buf, 0, nbytes, stream)?;
+                } else {
+                    gpu.hip.memset(&down_tmp.buf, 0, nbytes)?;
+                }
+                run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                    &ffn.shared_expert.down.buf,
+                    ffn.shared_expert.down.gpu_dtype,
+                    shared_rot,
+                    &down_tmp,
+                    ffn.shared_expert.down.m,
+                    ffn.shared_expert.down.k,
+                    n,
+                )?;
+                gpu.sigmoid_scaled_residual_add_batched_f32(
+                    &pbs.x_batch,
+                    &down_tmp,
+                    shared_scalar,
+                    n,
+                    dim,
+                )?;
+            } else {
+                gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
+                    &ffn.shared_expert.down.buf,
+                    shared_rot,
+                    &pbs.x_batch,
+                    shared_scalar,
+                    ffn.shared_expert.down.m,
+                    ffn.shared_expert.down.k,
+                    n,
+                )?;
+            }
+        }
         DType::MQ6G256 => gpu.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
             &ffn.shared_expert.down.buf,
             shared_rot,
