@@ -408,8 +408,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     // Q8 KV at any physical_cap is capture-safe: forward_prefill_chunk
     // dispatches through the unified DispatchCtx → AttnQ8_0KvBatchedMasked,
     // which routes max_ctx_len > 8192 to the tiled attention_flash_q8_0_tile_batched
-    // (O(1) LDS, no per-position malloc). The former physical_cap > 15000 guard
-    // predated that crossover (landed 2026-06-09) and is now obsolete.
+    // (O(1) LDS, no per-position malloc). The flash *grid* follows live
+    // logical_max_ctx; verify graphs recapture when that tile count grows.
     forward_prefill_chunk(
         gpu,
         weights,
@@ -7276,11 +7276,12 @@ pub(crate) fn forward_batch_chunk_impl(
             "independent decode requires the fully batched FullAttention weight path",
         ));
     }
-    let max_ctx_len = if gpu.graphs.capture_mode {
-        kv_cache.physical_cap
-    } else {
-        logical_max_ctx
-    };
+    // Capture-safe at any physical_cap: the tiled Q8 kernel is O(1) LDS.
+    // Do NOT substitute physical_cap for max_ctx_len during hipGraph capture.
+    // Dummy tiles past live seq_len still occupy the CP (Whittle 32k AR tax;
+    // DFlash verify graphs are the same class). Bake logical_max_ctx and
+    // recapture when the tile count grows (`verify_invalidate_if_fa_tiles_grew`).
+    let max_ctx_len = logical_max_ctx;
 
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);

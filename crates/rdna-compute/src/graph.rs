@@ -8,6 +8,21 @@ use hip_bridge::{Graph, GraphExec, HipResult, HipRuntime, Stream};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
+/// Batched Q8 flash tile count for a live context length.
+///
+/// DFlash verify hipGraphs must bake this (not `ceil(physical_cap / tile)`).
+/// Dummy tiles past seq_len still occupy the command processor — the same
+/// class as the AR max-tile tax fixed in `0a88d7e8`.
+pub fn verify_flash_tiles(ctx_len: usize, tile_size: usize) -> usize {
+    let tile = tile_size.max(1);
+    ((ctx_len.max(1) + tile - 1) / tile).max(1)
+}
+
+/// True when a captured verify graph still covers `live_tiles`.
+pub fn verify_graph_covers_live_tiles(captured_tiles: usize, live_tiles: usize) -> bool {
+    live_tiles <= captured_tiles
+}
+
 /// Set once any hipGraph is instantiated in this process.
 ///
 /// A captured graph's nodes embed the device pointers that were live at
@@ -97,6 +112,10 @@ pub struct PerBGraphCache {
     /// DFlash verify lm_head + argmax tail. Callers check this before
     /// deciding whether to enqueue lm_head outside the graph.
     pub lmhead_argmax: HashSet<usize>,
+    /// Q8 flash tile count baked into the captured verify graph for each B.
+    /// Used to drop and recapture when live context crosses a tile boundary
+    /// (same class as `GraphState::ar_fa_tiles`).
+    pub fa_tiles: HashMap<usize, usize>,
 }
 
 /// Graph-capture state split across AR forward, DFlash verify, and DeltaNet replay.
@@ -379,6 +398,43 @@ impl GraphState {
         self.verify.lmhead_argmax.insert(b);
     }
 
+    /// Record the Q8 flash tile count baked into the verify graph for `b`.
+    pub fn verify_record_fa_tiles(&mut self, b: usize, tiles: usize) {
+        self.verify.fa_tiles.insert(b, tiles.max(1));
+    }
+
+    /// Drop the cached verify graph for `b` without clearing warmup, so the
+    /// next cycle recaptures instead of re-JITing.
+    pub fn verify_drop_graph(&mut self, hip: &HipRuntime, device_id: i32, b: usize) {
+        bind_thread_or_warn(hip, device_id);
+        if let Some((graph, exec, _blobs)) = self.verify.cache.remove(&b) {
+            let _ = hip.graph_exec_destroy(exec);
+            let _ = hip.graph_destroy(graph);
+        }
+        self.verify.lmhead_argmax.remove(&b);
+        self.verify.fa_tiles.remove(&b);
+    }
+
+    /// Drop the verify graph for `b` when live Q8 flash needs more tiles than
+    /// were captured. Missing tile metadata on a cached graph is treated as
+    /// stale (forces recapture).
+    pub fn verify_invalidate_if_fa_tiles_grew(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        b: usize,
+        live_tiles: usize,
+    ) {
+        if !self.verify.cache.contains_key(&b) {
+            return;
+        }
+        let captured = self.verify.fa_tiles.get(&b).copied();
+        if captured.is_some_and(|c| verify_graph_covers_live_tiles(c, live_tiles)) {
+            return;
+        }
+        self.verify_drop_graph(hip, device_id, b);
+    }
+
     /// Destroy all cached verify graphs and their blobs.
     pub fn verify_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
         bind_thread_or_warn(hip, device_id);
@@ -388,6 +444,7 @@ impl GraphState {
         }
         self.verify.warmed_up.clear();
         self.verify.lmhead_argmax.clear();
+        self.verify.fa_tiles.clear();
         self.verify.capturing = None;
     }
 
@@ -485,5 +542,28 @@ impl GraphState {
         }
         self.replay.warmed_up.clear();
         self.replay.capturing = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{verify_flash_tiles, verify_graph_covers_live_tiles};
+
+    #[test]
+    fn verify_flash_tiles_uses_live_ctx_not_physical_cap() {
+        // Campaign fixture: tile 128, 32k cap, short verify window.
+        assert_eq!(verify_flash_tiles(64, 128), 1);
+        assert_eq!(verify_flash_tiles(128, 128), 1);
+        assert_eq!(verify_flash_tiles(129, 128), 2);
+        assert_eq!(verify_flash_tiles(32_768, 128), 256);
+        assert_ne!(verify_flash_tiles(64, 128), verify_flash_tiles(32_768, 128));
+    }
+
+    #[test]
+    fn verify_graph_covers_until_tile_count_grows() {
+        assert!(verify_graph_covers_live_tiles(1, 1));
+        assert!(verify_graph_covers_live_tiles(2, 1));
+        assert!(!verify_graph_covers_live_tiles(1, 2));
+        assert!(!verify_graph_covers_live_tiles(1, 256));
     }
 }

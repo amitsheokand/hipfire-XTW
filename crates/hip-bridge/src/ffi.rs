@@ -1519,6 +1519,7 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync H2D")
     }
 
+    #[track_caller]
     pub fn memcpy_dtoh_async(
         &self,
         dst: &mut [u8],
@@ -1526,6 +1527,7 @@ impl HipRuntime {
         stream: &Stream,
     ) -> HipResult<()> {
         assert!(dst.len() <= src.size);
+        let loc = std::panic::Location::caller();
         let code = unsafe {
             (self.fn_memcpy_async)(
                 dst.as_mut_ptr() as *mut c_void,
@@ -1535,6 +1537,21 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOH_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        if dump {
+            eprintln!(
+                "dtoh-async bytes={} at {}:{}",
+                dst.len(),
+                loc.file(),
+                loc.line()
+            );
+        }
         self.check(code, "hipMemcpyAsync D2H")
     }
 

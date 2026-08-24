@@ -2396,9 +2396,10 @@ fn verify_dflash_block_inner(
     // is no malloc-in-capture and no per-ctx LDS scaling — see the comment in
     // forward_prefill_batch_single_chunk_captured in qwen35.rs. The former
     // `VERIFY_GRAPH_Q8_CTX_LIMIT = 15000` skip (re-introduced by #481, obsolete once
-    // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
-    // would skip a verify-graph that now replays fine and forfeit the long-context
-    // spec speedup.
+    // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated.
+    // The flash *grid* still follows live context (not physical_cap) and the
+    // cache recaptures when that tile count grows; baking max_tiles at 32k
+    // was the DFlash graph-on tax (37.2 vs 40.9 nograph).
     let verify_graph_ok = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH")
         .ok()
         .as_deref()
@@ -2446,6 +2447,12 @@ fn verify_dflash_block_inner(
         if gpu.active_stream.is_none() {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
+        let live_tiles = rdna_compute::graph::verify_flash_tiles(
+            start_pos.saturating_add(b),
+            gpu.attn_tile_size(),
+        );
+        gpu.graphs
+            .verify_invalidate_if_fa_tiles_grew(&gpu.hip, gpu.device_id, b, live_tiles);
         if gpu.graphs.verify_has_graph(b) {
             vg_mode = "replay";
             graph_includes_lmhead_argmax =
@@ -2537,6 +2544,7 @@ fn verify_dflash_block_inner(
                     gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
+                gpu.graphs.verify_record_fa_tiles(b, live_tiles);
                 if capture_lmhead_argmax {
                     gpu.graphs.verify_mark_graph_lmhead_argmax(b);
                     graph_includes_lmhead_argmax = true;
@@ -2897,7 +2905,12 @@ pub fn download_hidden_block(
 /// DFlash 2 draft tokens from batched lm_head logits.
 ///
 /// GPU top-k (k ≤ 16) avoids downloading `[B, vocab]` logits; hidden rows
-/// still come back for the host lattice walk + projection.
+/// still come back for the host lattice walk + projection. The three D2H
+/// payloads (ids, values, hidden) enqueue on the active stream and wait once
+/// — same-stream copies still serialize on the copy engine; this collapses
+/// three blocking `hipMemcpy` round-trips into one `hipStreamSynchronize`.
+/// A packed staging buffer is the next experiment if `HIPFIRE_DTOH_DUMP=1`
+/// still shows the selector on the cycle critical path.
 fn dflash2_pick_from_logits_batch(
     gpu: &mut Gpu,
     logits_batch: &GpuTensor,
@@ -2918,14 +2931,32 @@ fn dflash2_pick_from_logits_batch(
         let ids_buf = verify_scratch.topk_ids.sub_offset(0, n);
         let vals_buf = verify_scratch.topk_vals.sub_offset(0, n);
         gpu.topk_f32_batched(logits_batch, &ids_buf, &vals_buf, vocab, batch, k)?;
+        let n_hidden = hidden_view.numel();
         let mut host_ids = vec![0i32; n];
+        let mut host_vals = vec![0.0f32; n];
+        let mut host_hidden = vec![0.0f32; n_hidden];
+        gpu.bind_thread()?;
         {
-            let bytes: &mut [u8] =
+            let ids_bytes: &mut [u8] =
                 unsafe { std::slice::from_raw_parts_mut(host_ids.as_mut_ptr() as *mut u8, n * 4) };
-            gpu.hip.memcpy_dtoh(bytes, &ids_buf.buf)?;
+            let vals_bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(host_vals.as_mut_ptr() as *mut u8, n * 4) };
+            let hidden_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_hidden.as_mut_ptr() as *mut u8, n_hidden * 4)
+            };
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memcpy_dtoh_async(ids_bytes, &ids_buf.buf, stream)?;
+                gpu.hip
+                    .memcpy_dtoh_async(vals_bytes, &vals_buf.buf, stream)?;
+                gpu.hip
+                    .memcpy_dtoh_async(hidden_bytes, &hidden_view.buf, stream)?;
+                gpu.hip.stream_synchronize(stream)?;
+            } else {
+                gpu.hip.memcpy_dtoh(ids_bytes, &ids_buf.buf)?;
+                gpu.hip.memcpy_dtoh(vals_bytes, &vals_buf.buf)?;
+                gpu.hip.memcpy_dtoh(hidden_bytes, &hidden_view.buf)?;
+            }
         }
-        let host_vals = gpu.download_f32(&vals_buf)?;
-        let host_hidden = gpu.download_f32(&hidden_view)?;
         let ids: Vec<u32> = host_ids.iter().map(|&x| x as u32).collect();
         return Ok(dflash::dflash2_greedy_select_from_topk(
             &ids,
@@ -6478,6 +6509,22 @@ mod tests {
             false,
             Some("0")
         ));
+    }
+
+    #[test]
+    fn dflash_verify_graph_tiles_follow_live_ctx_not_physical_cap() {
+        let tile = 128;
+        let physical_cap = 32_768;
+        let start_pos = 40;
+        let b = 8;
+        let live = start_pos + b;
+        assert_eq!(rdna_compute::graph::verify_flash_tiles(live, tile), 1);
+        assert_eq!(
+            rdna_compute::graph::verify_flash_tiles(physical_cap, tile),
+            256
+        );
+        assert!(rdna_compute::graph::verify_graph_covers_live_tiles(1, 1));
+        assert!(!rdna_compute::graph::verify_graph_covers_live_tiles(1, 2));
     }
 
     #[test]

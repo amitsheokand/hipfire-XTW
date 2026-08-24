@@ -141,9 +141,13 @@ fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
 }
 
 /// True when the Q8 flash Y-grid must cover `max_seq` even if `seq_len` is
-/// short. Redline and per-B verify/tape graphs replay across growing context
-/// without recapture. AR hipGraph can bake `actual_tiles` when the caller
-/// recaptures on growth (`GraphState::ar_fa_grow_recapture`).
+/// short. Redline and tape-replay graphs replay across growing context
+/// without recapture. AR hipGraph bakes `actual_tiles` when
+/// `ar_fa_grow_recapture` is set. DFlash *batched* verify grids follow
+/// `max_ctx_len` from prefill (live ctx + recapture); this helper only
+/// covers the single-token tile kernel, which still keeps max_tiles during
+/// verify capture so DeepSeek4's per-B cache can replay without a Qwen-side
+/// recapture hook.
 #[inline]
 fn q8_flash_keep_max_tile_grid(gpu: &Gpu) -> bool {
     gpu.replay.is_recording()
@@ -3766,11 +3770,8 @@ impl Gpu {
         // max_tiles. The tile kernel still exits early for tiles past seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
         let actual_tiles = (seq_len_hint + tile_size - 1) / tile_size;
-        let launch_tiles = replay_stable_tile_count(
-            actual_tiles,
-            max_tiles,
-            q8_flash_keep_max_tile_grid(self),
-        );
+        let launch_tiles =
+            replay_stable_tile_count(actual_tiles, max_tiles, q8_flash_keep_max_tile_grid(self));
 
         // ── Tile kernel ──
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
@@ -6218,11 +6219,8 @@ impl Gpu {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = replay_stable_tile_count(
-            actual_tiles,
-            max_tiles,
-            q8_flash_keep_max_tile_grid(self),
-        );
+        let launch_tiles =
+            replay_stable_tile_count(actual_tiles, max_tiles, q8_flash_keep_max_tile_grid(self));
 
         self.ensure_givens4_kernel(
             "attention_flash_fwht3_tile",
@@ -6327,11 +6325,8 @@ impl Gpu {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.graphs.capture_mode {
-            max_tiles
-        } else {
-            actual_tiles
-        };
+        let launch_tiles =
+            replay_stable_tile_count(actual_tiles, max_tiles, q8_flash_keep_max_tile_grid(self));
 
         self.ensure_givens4_kernel(
             "attention_flash_asym3_tile",
@@ -6642,11 +6637,8 @@ impl Gpu {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.graphs.capture_mode {
-            max_tiles
-        } else {
-            actual_tiles
-        };
+        let launch_tiles =
+            replay_stable_tile_count(actual_tiles, max_tiles, q8_flash_keep_max_tile_grid(self));
 
         // Tile kernel
         self.ensure_givens4_kernel(
@@ -6760,11 +6752,8 @@ impl Gpu {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = replay_stable_tile_count(
-            actual_tiles,
-            max_tiles,
-            q8_flash_keep_max_tile_grid(self),
-        );
+        let launch_tiles =
+            replay_stable_tile_count(actual_tiles, max_tiles, q8_flash_keep_max_tile_grid(self));
 
         self.ensure_givens4_kernel(
             "attention_flash_fwht4_tile",
@@ -6871,11 +6860,8 @@ impl Gpu {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = replay_stable_tile_count(
-            actual_tiles,
-            max_tiles,
-            q8_flash_keep_max_tile_grid(self),
-        );
+        let launch_tiles =
+            replay_stable_tile_count(actual_tiles, max_tiles, q8_flash_keep_max_tile_grid(self));
 
         self.ensure_givens4_kernel(
             "attention_flash_fwht2_tile",
@@ -6979,11 +6965,8 @@ impl Gpu {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.graphs.capture_mode {
-            max_tiles
-        } else {
-            actual_tiles
-        };
+        let launch_tiles =
+            replay_stable_tile_count(actual_tiles, max_tiles, q8_flash_keep_max_tile_grid(self));
 
         self.ensure_givens4_kernel(
             "attention_flash_asym2_tile",
