@@ -170,6 +170,65 @@ impl Gpu {
         )
     }
 
+    /// Batched top-k over F32 rows. `ids`/`vals` are `[batch, k]` (ids stored
+    /// as i32 in an F32 tensor, same overlay as [`Self::argmax_f32_batched`]).
+    /// `k` must be in 1..=16.
+    pub fn topk_f32_batched(
+        &mut self,
+        data: &GpuTensor,
+        ids: &GpuTensor,
+        vals: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        if !(1..=16).contains(&k) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "topk_f32_batched: k must be 1..=16",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "topk_f32_batched",
+            kernels::TOPK_BATCHED_SRC,
+            "topk_f32_batched",
+        )?;
+
+        let mut dp = data.buf.as_ptr();
+        let mut ip = ids.buf.as_ptr();
+        let mut vp = vals.buf.as_ptr();
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared = block_size * 16 * 8; // KMAX f32+i32 per thread
+        self.launch_maybe_blob(
+            "topk_f32_batched",
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dp);
+                b.push_ptr(ip);
+                b.push_ptr(vp);
+                b.push_i32(nn);
+                b.push_i32(kk);
+                b
+            },
+        )
+    }
+
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;

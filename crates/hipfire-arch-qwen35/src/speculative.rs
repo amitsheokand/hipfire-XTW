@@ -1500,6 +1500,10 @@ pub struct VerifyScratch {
     pub rot: GpuTensor,
     /// Argmax output for greedy path, [max_n] f32 (treated as i32 host-side).
     pub argmax: GpuTensor,
+    /// DFlash 2 selector top-k ids, `[max_n * DFLASH2_GPU_TOPK_CAP]` i32 overlay.
+    pub topk_ids: GpuTensor,
+    /// DFlash 2 selector top-k values, `[max_n * DFLASH2_GPU_TOPK_CAP]` F32.
+    pub topk_vals: GpuTensor,
     /// Persistent per-layer batch scratch for `qwen35::forward_prefill_batch`.
     /// Sized to `max_n`, so `verify_dflash_block` processes each block in a
     /// single chunk without the ~25 hipMalloc/hipFree pairs the in-function
@@ -1527,6 +1531,14 @@ impl VerifyScratch {
             logits: gpu.alloc_tensor(&[max_n * vocab], rdna_compute::DType::F32)?,
             rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
+            topk_ids: gpu.alloc_tensor(
+                &[max_n * dflash::DFLASH2_GPU_TOPK_CAP],
+                rdna_compute::DType::F32,
+            )?,
+            topk_vals: gpu.alloc_tensor(
+                &[max_n * dflash::DFLASH2_GPU_TOPK_CAP],
+                rdna_compute::DType::F32,
+            )?,
             prefill_batch: None,
         })
     }
@@ -1554,6 +1566,8 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.rot);
         let _ = gpu.free_tensor(self.argmax);
+        let _ = gpu.free_tensor(self.topk_ids);
+        let _ = gpu.free_tensor(self.topk_vals);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
@@ -2880,6 +2894,65 @@ pub fn download_hidden_block(
     Ok(out)
 }
 
+/// DFlash 2 draft tokens from batched lm_head logits.
+///
+/// GPU top-k (k ≤ 16) avoids downloading `[B, vocab]` logits; hidden rows
+/// still come back for the host lattice walk + projection.
+fn dflash2_pick_from_logits_batch(
+    gpu: &mut Gpu,
+    logits_batch: &GpuTensor,
+    draft_scratch: &DflashScratch,
+    verify_scratch: &VerifyScratch,
+    sel: &dflash::Dflash2SelectorWeights,
+    d2: &dflash::Dflash2Config,
+    h: usize,
+    vocab: usize,
+    batch: usize,
+    seed_token: u32,
+) -> HipResult<Vec<u32>> {
+    let hidden_view = draft_scratch.x.sub_offset(h, batch * h);
+    let k = d2.selector_top_k;
+    let cap = verify_scratch.max_n * dflash::DFLASH2_GPU_TOPK_CAP;
+    if (1..=dflash::DFLASH2_GPU_TOPK_CAP).contains(&k) && batch * k <= cap {
+        let n = batch * k;
+        let ids_buf = verify_scratch.topk_ids.sub_offset(0, n);
+        let vals_buf = verify_scratch.topk_vals.sub_offset(0, n);
+        gpu.topk_f32_batched(logits_batch, &ids_buf, &vals_buf, vocab, batch, k)?;
+        let mut host_ids = vec![0i32; n];
+        {
+            let bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(host_ids.as_mut_ptr() as *mut u8, n * 4) };
+            gpu.hip.memcpy_dtoh(bytes, &ids_buf.buf)?;
+        }
+        let host_vals = gpu.download_f32(&vals_buf)?;
+        let host_hidden = gpu.download_f32(&hidden_view)?;
+        let ids: Vec<u32> = host_ids.iter().map(|&x| x as u32).collect();
+        return Ok(dflash::dflash2_greedy_select_from_topk(
+            &ids,
+            &host_vals,
+            &host_hidden,
+            sel,
+            d2,
+            h,
+            vocab,
+            batch,
+            seed_token,
+        ));
+    }
+    let host_logits = gpu.download_f32(logits_batch)?;
+    let host_hidden = gpu.download_f32(&hidden_view)?;
+    Ok(dflash::dflash2_greedy_select(
+        &host_logits,
+        &host_hidden,
+        sel,
+        d2,
+        h,
+        vocab,
+        batch,
+        seed_token,
+    ))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // DFlash spec step — one speculative decode iteration
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3346,24 +3419,22 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            if let (Some(d2), Some(sel)) = (
-                draft_cfg.dflash2.as_ref(),
-                draft_weights.selector.as_ref(),
-            ) {
+            if let (Some(d2), Some(sel)) =
+                (draft_cfg.dflash2.as_ref(), draft_weights.selector.as_ref())
+            {
                 // DFlash 2: never independent argmax (same class as vLLM.cpp #1314).
-                let host_logits = gpu.download_f32(&logits_batch)?;
-                let hidden_view = draft_scratch.x.sub_offset(h, batch * h);
-                let host_hidden = gpu.download_f32(&hidden_view)?;
-                let picked = dflash::dflash2_greedy_select(
-                    &host_logits,
-                    &host_hidden,
+                let picked = dflash2_pick_from_logits_batch(
+                    gpu,
+                    &logits_batch,
+                    draft_scratch,
+                    verify_scratch,
                     sel,
                     d2,
                     h,
                     vocab,
                     batch,
                     seed_token,
-                );
+                )?;
                 if use_temp_sampling {
                     static D2_TEMP_WARN: std::sync::Once = std::sync::Once::new();
                     D2_TEMP_WARN.call_once(|| {
@@ -3514,10 +3585,9 @@ pub fn spec_step_dflash(
             }
         } else {
             // Fallback: per-row weight_gemv loop.
-            if let (Some(d2), Some(sel)) = (
-                draft_cfg.dflash2.as_ref(),
-                draft_weights.selector.as_ref(),
-            ) {
+            if let (Some(d2), Some(sel)) =
+                (draft_cfg.dflash2.as_ref(), draft_weights.selector.as_ref())
+            {
                 let batch = b - 1;
                 let mut host_logits = Vec::with_capacity(batch * vocab);
                 for i in 1..b {
@@ -3539,40 +3609,40 @@ pub fn spec_step_dflash(
                 );
                 drafted.extend(picked);
             } else {
-            for i in 1..b {
-                let hidden_row = draft_scratch.x.sub_offset(i * h, h);
-                llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
-                let logits = gpu.download_f32(&target.scratch.logits)?;
-                debug_assert_eq!(logits.len(), vocab);
-                if use_temp_sampling {
-                    let mut probs = Vec::with_capacity(vocab);
-                    softmax_temp_into(&logits, temp, &mut probs);
-                    if topp_active {
-                        apply_host_nucleus(&mut probs, top_p);
+                for i in 1..b {
+                    let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+                    llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
+                    let logits = gpu.download_f32(&target.scratch.logits)?;
+                    debug_assert_eq!(logits.len(), vocab);
+                    if use_temp_sampling {
+                        let mut probs = Vec::with_capacity(vocab);
+                        softmax_temp_into(&logits, temp, &mut probs);
+                        if topp_active {
+                            apply_host_nucleus(&mut probs, top_p);
+                        }
+                        let u = xorshift_next_unit(rng_state);
+                        let t = sample_categorical(&probs, u);
+                        draft_probs_at_drafted.push(probs[t as usize]);
+                        drafted.push(t);
+                        draft_softmaxes.push(probs);
+                    } else if host_path_active {
+                        let mut row = logits.clone();
+                        if rp_active {
+                            llama::apply_repeat_penalty(
+                                &mut row,
+                                prev_committed,
+                                repeat_window,
+                                repeat_penalty,
+                            );
+                        }
+                        if ngram_block_active {
+                            llama::apply_ngram_block(&mut row, prev_committed);
+                        }
+                        drafted.push(argmax_u32(&row));
+                    } else {
+                        drafted.push(argmax_u32(&logits));
                     }
-                    let u = xorshift_next_unit(rng_state);
-                    let t = sample_categorical(&probs, u);
-                    draft_probs_at_drafted.push(probs[t as usize]);
-                    drafted.push(t);
-                    draft_softmaxes.push(probs);
-                } else if host_path_active {
-                    let mut row = logits.clone();
-                    if rp_active {
-                        llama::apply_repeat_penalty(
-                            &mut row,
-                            prev_committed,
-                            repeat_window,
-                            repeat_penalty,
-                        );
-                    }
-                    if ngram_block_active {
-                        llama::apply_ngram_block(&mut row, prev_committed);
-                    }
-                    drafted.push(argmax_u32(&row));
-                } else {
-                    drafted.push(argmax_u32(&logits));
                 }
-            }
             }
         }
     } // close else (DFlash draft path)

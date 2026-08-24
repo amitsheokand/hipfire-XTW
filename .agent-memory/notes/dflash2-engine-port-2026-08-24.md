@@ -23,4 +23,11 @@ MTP 75.7 τ=3.74; DFlash 2 84.7 τ=6.94. Genre-conditional: DFlash 2 converts
 τ on code, not on the relativity cell. Checkpoint
 `docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-code-r9700.md`.
 
+GPU `topk_f32_batched` (k≤16) replaced the `[B, vocab]` logit D2H on the
+batched lm_head path. Protocol-lite: prose nograph 40.9→**44.9** τ=2.43
+(37 windows); code graphs-on 84.7→**101.8** τ=6.94 (16 windows). τ/windows
+unchanged. daemon `ff448beb…`. Checkpoint
+`docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-gpu-topk-r9700.md`.
+GEMV lm_head fallback still host-selects.
+
 Whittle v2+v2.1 download finished 2026-08-24 (~53 GB) at `~/.hipfire/hf-cache/Qwen3.8-Whittle-MoE-27B-A17.8B`. v2.1 is a PEFT LoRA (`r=128`, `alpha=256`) plus `modules_to_save` = 64 routers and late-layer shared experts — merge before encode. Shape: 64 experts / top-16 / moe_intermediate 192 / shared 5120. First encode risk: routed `down` K=192 vs group-256.

@@ -5397,6 +5397,10 @@ pub const CHAIN_ACCEPT_SPEC_SRC: &str = include_str!("../../../kernels/src/chain
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
 
+/// Batched top-k: one block per row, writes `[B, k]` ids+vals (k ≤ 16).
+/// DFlash 2 greedy selector uses this instead of downloading `[B, vocab]` logits.
+pub const TOPK_BATCHED_SRC: &str = include_str!("../../../kernels/src/topk_f32_batched.hip");
+
 /// Single-row argmax that writes the selected token into an on-device MTP
 /// token chain, optionally remapping through a compressed-vocab sidecar.
 pub const ARGMAX_TOKEN_CHAIN_SRC: &str =

@@ -160,12 +160,11 @@ impl DflashConfig {
             || cfg_obj
                 .and_then(|c| c.get("architectures"))
                 .and_then(|a| a.as_array())
-                .map(|a| {
-                    a.iter()
-                        .any(|v| v.as_str() == Some("DFlash2DraftModel"))
-                })
+                .map(|a| a.iter().any(|v| v.as_str() == Some("DFlash2DraftModel")))
                 .unwrap_or(false)
-            || hfq.find_tensor_info("layers.0.attention_conv.base_kernel").is_some();
+            || hfq
+                .find_tensor_info("layers.0.attention_conv.base_kernel")
+                .is_some();
         let dflash_cfg_block = cfg_obj.and_then(|c| c.get("dflash_config"));
         let dflash2 = if is_dflash2 {
             let conv_kernel_size = dflash_cfg_block
@@ -618,17 +617,10 @@ impl DflashWeights {
                 let coeff_w = d2.coeff_width(cfg.hidden);
                 let attn_name = format!("{p}.attention_conv.base_kernel");
                 if hfq.find_tensor_info(&attn_name).is_none() {
-                    panic!(
-                        "DFlash 2 draft is missing {attn_name}; refusing silent DFlash 1 load"
-                    );
+                    panic!("DFlash 2 draft is missing {attn_name}; refusing silent DFlash 1 load");
                 }
                 layer.attention_conv = Some(Dflash2GroupedConvWeights {
-                    base_kernel: hfq_tensor_f32(
-                        hfq,
-                        gpu,
-                        &attn_name,
-                        vec![2, taps, cfg.hidden],
-                    )?,
+                    base_kernel: hfq_tensor_f32(hfq, gpu, &attn_name, vec![2, taps, cfg.hidden])?,
                     kernel_projection: hfq_weight(
                         hfq,
                         gpu,
@@ -2643,6 +2635,47 @@ pub fn dflash2_greedy_walk(
     out
 }
 
+/// Max `k` for GPU `topk_f32_batched` / the HIP kernel.
+pub const DFLASH2_GPU_TOPK_CAP: usize = 16;
+
+/// Project mask-position hiddens and walk using precomputed per-row top-k.
+pub fn dflash2_greedy_select_from_topk(
+    candidate_ids: &[u32],
+    unary: &[f32],
+    hidden: &[f32],
+    selector: &Dflash2SelectorWeights,
+    d2: &Dflash2Config,
+    hidden_size: usize,
+    vocab: usize,
+    batch: usize,
+    anchor: u32,
+) -> Vec<u32> {
+    let k = d2.selector_top_k;
+    let rank = d2.selector_rank;
+    assert_eq!(candidate_ids.len(), batch * k);
+    assert_eq!(unary.len(), batch * k);
+    assert_eq!(selector.hidden_projection.len(), rank * hidden_size);
+    let mut hp = vec![0f32; batch * rank];
+    for b in 0..batch {
+        let x = &hidden[b * hidden_size..(b + 1) * hidden_size];
+        for r in 0..rank {
+            let w = &selector.hidden_projection[r * hidden_size..(r + 1) * hidden_size];
+            hp[b * rank + r] = x.iter().zip(w.iter()).map(|(a, b)| a * b).sum();
+        }
+    }
+    dflash2_greedy_walk(
+        candidate_ids,
+        unary,
+        &hp,
+        selector,
+        batch,
+        k,
+        rank,
+        vocab,
+        anchor,
+    )
+}
+
 /// Project mask-position hiddens, take per-row top-k, walk the DFlash 2 path.
 ///
 /// `logits` is `[batch, vocab]` from the target lm_head on draft rows 1..B.
@@ -2661,16 +2694,16 @@ pub fn dflash2_greedy_select(
     let rank = d2.selector_rank;
     assert_eq!(selector.hidden_projection.len(), rank * hidden_size);
     let (ids, unary) = dflash2_topk_rows(logits, vocab, batch, k);
-    let mut hp = vec![0f32; batch * rank];
-    for b in 0..batch {
-        let x = &hidden[b * hidden_size..(b + 1) * hidden_size];
-        for r in 0..rank {
-            let w = &selector.hidden_projection[r * hidden_size..(r + 1) * hidden_size];
-            hp[b * rank + r] = x.iter().zip(w.iter()).map(|(a, b)| a * b).sum();
-        }
-    }
-    dflash2_greedy_walk(
-        &ids, &unary, &hp, selector, batch, k, rank, vocab, anchor,
+    dflash2_greedy_select_from_topk(
+        &ids,
+        &unary,
+        hidden,
+        selector,
+        d2,
+        hidden_size,
+        vocab,
+        batch,
+        anchor,
     )
 }
 
@@ -2719,7 +2752,10 @@ mod ring_tests {
 
 #[cfg(test)]
 mod dflash2_selector_tests {
-    use super::{dflash2_greedy_walk, dflash2_topk_rows, Dflash2SelectorWeights};
+    use super::{
+        dflash2_greedy_select, dflash2_greedy_select_from_topk, dflash2_greedy_walk,
+        dflash2_topk_rows, Dflash2Config, Dflash2SelectorWeights,
+    };
 
     #[test]
     fn topk_keeps_highest_and_lower_index_on_tie() {
@@ -2727,6 +2763,28 @@ mod dflash2_selector_tests {
         let (ids, vals) = dflash2_topk_rows(&logits, 4, 1, 2);
         assert_eq!(ids, vec![1, 2]);
         assert_eq!(vals, vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn greedy_select_matches_from_topk() {
+        let selector = Dflash2SelectorWeights {
+            hidden_projection: vec![1.0],
+            predecessor_codebook: vec![1.0, 2.0, 0.0, 0.0],
+            successor_codebook: vec![0.0, 1.0, 0.5, 1.0],
+        };
+        let d2 = Dflash2Config {
+            conv_kernel_size: 2,
+            conv_group_size: 1,
+            selector_rank: 1,
+            selector_top_k: 2,
+        };
+        let logits = vec![1.0, 3.0, 2.5, 0.0, 0.1, 0.2, 0.0, 4.0];
+        let hidden = vec![1.0, 1.0];
+        let full = dflash2_greedy_select(&logits, &hidden, &selector, &d2, 1, 4, 2, 0);
+        let (ids, unary) = dflash2_topk_rows(&logits, 4, 2, 2);
+        let from =
+            dflash2_greedy_select_from_topk(&ids, &unary, &hidden, &selector, &d2, 1, 4, 2, 0);
+        assert_eq!(full, from);
     }
 
     #[test]
