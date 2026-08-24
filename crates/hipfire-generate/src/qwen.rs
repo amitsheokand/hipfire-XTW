@@ -3552,7 +3552,7 @@ pub fn attach_mtp_window_timings(
 /// no recurrent MTP state survives between requests. The trunk's persistent DN
 /// state lives in the bundle and is cold-zeroed at the start of each request
 /// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
-/// persistent (loaded once on `LoadedModel.qwen35_mtp_head`).
+/// persistent (loaded once on `Qwen35Bundle.qwen35_mtp_head`).
 ///
 /// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
 /// head is present (see the dispatch site in `generate`), so the DEFAULT serve
@@ -3850,8 +3850,8 @@ pub fn generate_qwen35_mtp(
         kv_cache,
         dn_state,
         kv_adaptive: _,
-        pp_scratch_set: _, 
-        qwen35_mtp_head: _,
+        pp_scratch_set: _,
+        qwen35_mtp_head,
         vision_config,
         vision_weights,
         qwen35_decode_batch,
@@ -3862,11 +3862,17 @@ pub fn generate_qwen35_mtp(
             return;
         }
     };
-    let target_config = orig_config.clone();
-    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
-        Ok(h) => h,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("reopen model: {e}"));
+    // Park the GPU head locally for the whole request. Binding it as `_` dropped
+    // it on take; looking it up on `m.state` (now None) then panicked. ModelSlot
+    // keeps `qwen35_mtp_head: None` so `&mtp_head` and `&mut target` do not alias.
+    let mtp_head = match qwen35_mtp_head {
+        Some(h) => h,
+        None => {
+            emit_error_with_id(
+                stdout,
+                id,
+                "qwen35 MTP serve: MTP head missing after load — dispatch gate is wrong",
+            );
             m.state = Some(Box::new(Qwen35Bundle {
                 qwen35_mtp_head: None,
                 config: orig_config,
@@ -3874,7 +3880,28 @@ pub fn generate_qwen35_mtp(
                 scratch,
                 kv_cache,
                 dn_state,
-                                kv_adaptive: None,
+                kv_adaptive: None,
+                pp_scratch_set: None,
+                qwen35_decode_batch,
+                vision_config,
+                vision_weights,
+            }));
+            return;
+        }
+    };
+    let target_config = orig_config.clone();
+    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
+        Ok(h) => h,
+        Err(e) => {
+            emit_error_with_id(stdout, id, format!("reopen model: {e}"));
+            m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: Some(mtp_head),
+                config: orig_config,
+                weights,
+                scratch,
+                kv_cache,
+                dn_state,
+                kv_adaptive: None,
                 pp_scratch_set: None,
                 qwen35_decode_batch,
                 vision_config,
@@ -3927,7 +3954,7 @@ pub fn generate_qwen35_mtp(
             ),
         );
         m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
             config: orig_config,
             weights: target.weights,
             scratch: target.scratch,
@@ -3943,23 +3970,14 @@ pub fn generate_qwen35_mtp(
     }
 
     // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
-    let head = m
-        .state
-        .as_ref()
-        .and_then(|s| (s.as_ref() as &dyn std::any::Any)
-            .downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
-        .and_then(|b| b.qwen35_mtp_head.as_ref())
-        .expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
-    // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
-    // borrow of `head`/`m` past the state setup — the compressed-logits scratch
-    // alloc below needs &mut state + &mut gpu.
-    let cvs_opt = head.weights.compressed_vocab_size;
+    // Head is parked locally (`mtp_head`); do not look it up on `m.state`.
+    let cvs_opt = mtp_head.weights.compressed_vocab_size;
     let kv_mode = MtpKvMode::Q8;
     let mut state = if ngram_mod_pool.is_some() {
         match MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
             gpu,
             &target,
-            head,
+            &mtp_head,
             mtp_k,
             verify_capacity,
             kv_mode,
@@ -3968,7 +3986,7 @@ pub fn generate_qwen35_mtp(
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
                 m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
                     config: orig_config,
                     weights: target.weights,
                     scratch: target.scratch,
@@ -3984,12 +4002,12 @@ pub fn generate_qwen35_mtp(
             }
         }
     } else {
-        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, mtp_k, kv_mode) {
+        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, &mtp_head, mtp_k, kv_mode) {
             Ok(s) => s,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
                 m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
                     config: orig_config,
                     weights: target.weights,
                     scratch: target.scratch,
@@ -4014,7 +4032,7 @@ pub fn generate_qwen35_mtp(
             emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
             state.free_gpu(gpu);
             m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
                 config: orig_config,
                 weights: target.weights,
                 scratch: target.scratch,
@@ -4032,7 +4050,7 @@ pub fn generate_qwen35_mtp(
             emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
             state.free_gpu(gpu);
             m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
                 config: orig_config,
                 weights: target.weights,
                 scratch: target.scratch,
@@ -4080,9 +4098,7 @@ pub fn generate_qwen35_mtp(
     // Boundary hook downshifts at exclusive committed pos before the next chunk
     // can write past the current-tier capacity. Prefill/spec HipResult failures
     // (incl. lazy VMM growth) are request errors — never unwrap/panic.
-    let head = m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
-        .and_then(|b| b.qwen35_mtp_head.as_ref())
-        .expect("qwen35 MTP head must be loaded on this path");
+    let head = &mtp_head;
     let prefill_res = {
         let adaptive = &mut m.kv_adaptive;
         mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
@@ -4122,7 +4138,7 @@ pub fn generate_qwen35_mtp(
         emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
         state.free_gpu(gpu);
         m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
             config: orig_config,
             weights: target.weights,
             scratch: target.scratch,
@@ -4147,7 +4163,7 @@ pub fn generate_qwen35_mtp(
             emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
             state.free_gpu(gpu);
             m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
                 config: orig_config,
                 weights: target.weights,
                 scratch: target.scratch,
@@ -4621,7 +4637,7 @@ pub fn generate_qwen35_mtp(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head: None,
+                qwen35_mtp_head: Some(mtp_head),
         config: orig_config,
         weights: target.weights,
         scratch: target.scratch,
