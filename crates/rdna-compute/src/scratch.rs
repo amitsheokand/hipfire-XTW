@@ -60,6 +60,9 @@ pub struct ScratchState {
     /// in one allocation; grows-never-shrinks.
     pub sample_partials: Option<DeviceBuffer>,
     pub sample_partials_bytes: usize,
+    /// All-ones `[n_exp]` f32 scale for Q8 indexed MoE down (Gemma4 has a real
+    /// per-expert scale; Qwen Q8 group scale lives in the 34B blocks).
+    pub moe_unit_scale: Option<GpuTensor>,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -293,6 +296,31 @@ impl ScratchState {
             });
         }
         Ok(self.gemv_residual_tmp.as_ref().unwrap())
+    }
+
+    /// All-ones `[n]` f32 buffer for Q8 indexed MoE down's `per_expert_scale`.
+    /// Grows never-shrinks; filled with 1.0 on alloc/grow.
+    pub fn ensure_moe_unit_scale(
+        &mut self,
+        hip: &HipRuntime,
+        pool: &mut crate::pool::GpuPool,
+        device_id: i32,
+        n: usize,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = n * 4;
+        let needs_grow = self
+            .moe_unit_scale
+            .as_ref()
+            .map_or(true, |t| t.buf.size() < needed_bytes);
+        if needs_grow {
+            let ones = vec![1.0f32; n];
+            let bytes: Vec<u8> = ones.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let t = alloc_tensor_on(hip, pool, device_id, &[n], DType::F32)?;
+            hip.memcpy_htod(&t.buf, &bytes)?;
+            self.moe_unit_scale = Some(t);
+        }
+        Ok(())
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).

@@ -2110,6 +2110,12 @@ impl Gpu {
             .ensure_mq_signs(&self.hip, &mut self.pool, self.device_id)
     }
 
+    /// All-ones `[n_exp]` scale for Q8 indexed MoE down. Idempotent; grows.
+    pub fn ensure_moe_unit_scale(&mut self, n: usize) -> HipResult<()> {
+        self.scratch
+            .ensure_moe_unit_scale(&self.hip, &mut self.pool, self.device_id, n)
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables for G128 (128 floats each, seeds 43 and 1043).
     /// Also allocates the shared `mq_x_rot` scratch if not already present — the G256 path
     /// (`ensure_mq_signs`) normally owns that allocation, but the G128 path must be
@@ -8038,6 +8044,117 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             "moe_topk_renorm_k8",
             [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Top-16 companion of [`Self::moe_topk_renorm_k8`]. Same kernarg contract;
+    /// writes 16 indices/weights. Used by Whittle (k=16, n_exp=64).
+    pub fn moe_topk_renorm_k16(
+        &mut self,
+        probs: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_topk_renorm_k16",
+            kernels::MOE_TOPK_RENORM_K16_SRC,
+            "moe_topk_renorm_k16",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = n_exp * 4 + 16 * 8;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_topk_renorm_k16", bytes);
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k16",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Batched companion of [`Self::moe_topk_renorm_k16`] for prefill.
+    /// Grid.x = `batch_size` (one workgroup per token row).
+    pub fn moe_topk_renorm_k16_batched(
+        &mut self,
+        probs: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_topk_renorm_k16_batched",
+            kernels::MOE_TOPK_RENORM_K16_BATCHED_SRC,
+            "moe_topk_renorm_k16_batched",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = (n_exp * 4 + 16 * 8) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_topk_renorm_k16_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k16_batched",
+            [batch_size as u32, 1, 1],
             [256, 1, 1],
             0,
             &mut params,

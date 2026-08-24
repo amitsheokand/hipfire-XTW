@@ -303,11 +303,10 @@ fn confirmed_oproj_dtypes_have_a_plan() {
 }
 
 /// LAYER 1d — MoE CPU-top-K fallback coverage (catches the #393 regression).
-/// `run_moe_decode`'s GPU-top-K fast path only serves `k == 8` MoE layers whose
-/// routed experts are `{MQ4G256, MQ6G256, ParoQ4G128}`. Every OTHER MoE layer
-/// (`k != 8`, or a routed dtype like Q8_0) MUST take the generic CPU-top-K
-/// per-expert fallback — #393 deleted that fallback so those layers hit
-/// `UnsupportedVariant{cpu-topk-fallback}` and HARD-PANIC on decode.
+/// `run_moe_decode`'s GPU-top-K fast path serves `k == 8` or `k == 16` MoE
+/// layers whose routed experts are indexable. Every OTHER MoE layer
+/// (`k` not in {8,16}, or a routed dtype like all-Q8_0) MUST take the generic
+/// CPU-top-K per-expert fallback.
 ///
 /// GPU-free assertion in two parts, mirroring the runtime guarantees:
 ///   (a) The eligibility lattice routes these layers to the fallback, NOT the

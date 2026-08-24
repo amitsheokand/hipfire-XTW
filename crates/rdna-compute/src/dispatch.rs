@@ -1015,6 +1015,7 @@ impl Gpu {
                 ksplit_det_partials_bytes: 0,
                 sample_partials: None,
                 sample_partials_bytes: 0,
+                moe_unit_scale: None,
             },
             replay: crate::replay::ReplayController::from_config(),
             mmq_screen: MmqScreenState {

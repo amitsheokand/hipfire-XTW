@@ -957,9 +957,42 @@ fn moe_res_q8_router_still_gpu_topk() {
 
 #[test]
 fn moe_res_k6_disables_gpu_topk_even_when_indexable() {
-    // deepseek-shaped: indexable routed dtype but k != 8 => no GPU fast path
+    // deepseek-shaped: indexable routed dtype but k != 8 and != 16 => no GPU fast path
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 6);
     assert!(r.routed_indexable_mq4);
+    assert!(!r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_k16_mq4_q8_uses_gpu_topk() {
+    // Whittle: MQ4 gate_up, Q8 down (K=192), k=16.
+    let mut d = dtypes_all_mq4();
+    d.routed_down = DType::Q8_0;
+    let r8 = MoeResolution::resolve(&d, 8);
+    assert!(r8.routed_indexable_mq4_q8);
+    assert!(r8.use_gpu_topk);
+    assert!(r8.needs_x_rot_local);
+    let r16 = MoeResolution::resolve(&d, 16);
+    assert!(r16.routed_indexable_mq4_q8);
+    assert!(r16.use_gpu_topk);
+    assert!(r16.routed_indexable());
+}
+
+#[test]
+fn moe_res_k16_all_mq4_uses_gpu_topk() {
+    let r = MoeResolution::resolve(&dtypes_all_mq4(), 16);
+    assert!(r.routed_indexable_mq4);
+    assert!(r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_k16_mq5_stays_cpu_fallback() {
+    // MQ5 decode gate_up hardcodes grid.y=8.
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ5G256;
+    d.routed_down = DType::MQ5G256;
+    let r = MoeResolution::resolve(&d, 16);
+    assert!(r.routed_indexable_mq5);
     assert!(!r.use_gpu_topk);
 }
 
@@ -1577,6 +1610,12 @@ fn moe_dtypes_paro() -> MoeDtypes {
     d
 }
 
+fn moe_dtypes_mq4_q8() -> MoeDtypes {
+    let mut d = moe_dtypes_mq4();
+    d.routed_down = DType::Q8_0;
+    d
+}
+
 fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
     rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100")
 }
@@ -1598,6 +1637,37 @@ fn moe_prefill_resolution_path2_gfx12_mq4() {
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "gfx12 should have Path 2 (WMMA)");
     assert!(!r.down_path0);
+}
+
+#[test]
+fn moe_prefill_resolution_mq4_q8_forces_path1_on_wmma() {
+    // Whittle: MQ4 gate_up + Q8 down. grouped-WMMA has no Q8 arm.
+    for arch_name in ["gfx1100", "gfx1200", "gfx1201"] {
+        let arch = crate::context::DispatchCtx::for_test(arch_name);
+        let r = MoePrefillResolution::resolve(&moe_dtypes_mq4_q8(), &arch.arch, &arch.flags);
+        assert!(
+            !r.use_path2,
+            "{arch_name}: Q8 down must not take Path 2 grouped GEMM"
+        );
+        assert!(
+            !r.down_path0,
+            "{arch_name}: Q8 down must not take Path 0 (MQ4-only launcher)"
+        );
+    }
+    let mq4 = crate::context::DispatchCtx::for_test("gfx1200");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &mq4.arch, &mq4.flags);
+    assert!(r.use_path2, "pure MQ4 on gfx12 must still take Path 2");
+}
+
+#[test]
+fn moe_prefill_resolution_mq4_q8_no_path0_on_gfx906() {
+    let arch = crate::context::DispatchCtx::for_test("gfx906");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4_q8(), &arch.arch, &arch.flags);
+    assert!(!r.use_path2);
+    assert!(
+        !r.down_path0,
+        "Q8 down must skip Path 0 even on gfx9 (launcher is MQ4-only)"
+    );
 }
 
 #[test]

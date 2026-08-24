@@ -1572,8 +1572,10 @@ impl MoePrefillDtypes {
     }
 }
 
-fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
-    k_top == 8 && num_experts <= 1024
+/// Batched MoE top-K kernels exist for k=8 (A3B) and k=16 (Whittle).
+/// `num_experts` is the batched-kernel LDS cap (`MAX_NEXP`).
+pub(crate) fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
+    (k_top == 8 || k_top == 16) && num_experts <= 1024
 }
 
 /// Routed-expert dtypes the batched-prefill grouped-GEMM path (Path 2) serves
@@ -1789,14 +1791,17 @@ fn moe_ffn_batched_admissible_for_dtypes(
             && dtypes.shared_expert_up == shared_gu_dt;
         let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ6G256);
         let experts_ok = matches!(dtypes.expert_gate_up, DType::MQ4G256 | DType::MQ6G256)
-            && matches!(dtypes.expert_down, DType::MQ4G256 | DType::MQ6G256);
+            && matches!(
+                dtypes.expert_down,
+                DType::MQ4G256 | DType::MQ6G256 | DType::Q8_0
+            );
         shared_gu_ok && shared_dn_ok && experts_ok
     } else {
         dtypes.shared_expert_gate == DType::MQ4G256
             && dtypes.shared_expert_up == DType::MQ4G256
             && dtypes.shared_expert_down == DType::MQ4G256
             && dtypes.expert_gate_up == DType::MQ4G256
-            && dtypes.expert_down == DType::MQ4G256
+            && matches!(dtypes.expert_down, DType::MQ4G256 | DType::Q8_0)
     }
 }
 
@@ -1929,6 +1934,14 @@ pub fn prefill_batch_pbs_eligible(
              all_layers_ok={all_layers_ok}",
             n >= MIN_BATCH,
         );
+        if !all_layers_ok {
+            for (i, lw) in weights.layers.iter().enumerate() {
+                if let Err(e) = qwen35_layer_batch_admissible(lw, config, arch) {
+                    eprintln!("[hipfire::batch_eligible] first_fail layer={i} {e}");
+                    break;
+                }
+            }
+        }
     }
     result
 }
@@ -2446,8 +2459,8 @@ pub(crate) fn run_fused_qkvza_key(
 ///   be MQ4G256 *or* Q8_0; all other MoE weights must be MQ4G256
 /// - `pbs.moe_*_batch` tensors are allocated (num_experts > 0 at scratch
 ///   construction time) and sized to max_batch ≥ N
-/// - `config.num_experts_per_tok == 8` and `config.num_experts <= 1024`
-///   (hard limits of the batched top-K kernel)
+/// - `config.num_experts_per_tok` is 8 or 16 and `config.num_experts <= 1024`
+///   (hard limits of the batched top-K kernels)
 ///
 /// Sequence mirrors `moe_ffn_decode_impl`'s GPU fast path, with every
 /// per-token launch replaced by its N-batched equivalent. Byte-exact
@@ -2822,14 +2835,25 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         dtype: DType::F32,
     };
     gpu.softmax_f32(&router_logits_2d)?;
-    gpu.moe_topk_renorm_k8_batched(
-        router_logits,
-        topk_indices,
-        topk_weights,
-        n_exp,
-        config.norm_topk_prob,
-        n,
-    )?;
+    if k_top == 16 {
+        gpu.moe_topk_renorm_k16_batched(
+            router_logits,
+            topk_indices,
+            topk_weights,
+            n_exp,
+            config.norm_topk_prob,
+            n,
+        )?;
+    } else {
+        gpu.moe_topk_renorm_k8_batched(
+            router_logits,
+            topk_indices,
+            topk_weights,
+            n_exp,
+            config.norm_topk_prob,
+            n,
+        )?;
+    }
 
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
     //
@@ -7954,17 +7978,39 @@ mod tests {
     }
 
     #[test]
-    fn moe_prefill_topk_shape_requires_k8_and_bounded_experts() {
+    fn moe_prefill_topk_shape_requires_k8_or_k16_and_bounded_experts() {
         assert!(moe_prefill_topk_shape_supported(8, 256));
         assert!(moe_prefill_topk_shape_supported(8, 1024));
+        assert!(moe_prefill_topk_shape_supported(16, 64));
+        assert!(moe_prefill_topk_shape_supported(16, 1024));
         assert!(!moe_prefill_topk_shape_supported(4, 256));
         assert!(!moe_prefill_topk_shape_supported(8, 1025));
+        assert!(!moe_prefill_topk_shape_supported(16, 1025));
     }
 
     #[test]
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn moe_prefill_admits_mq4_gate_q8_down() {
+        // Whittle: MQ4 gate_up + shared, Q8 routed down (inner K=192).
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_down = DType::Q8_0;
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+        // gfx12 default-on MQ6 admit must not refuse the Q8 down pair.
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+        // All-Q8 routed pair is still refused (no indexed gate_up for Q8).
+        dtypes.expert_gate_up = DType::Q8_0;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
             &dtypes, false, false, false, false
         ));
     }

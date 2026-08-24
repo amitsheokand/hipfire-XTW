@@ -1074,6 +1074,9 @@ impl Qwen35Scratch {
                 // blows up hipGraph capture with a hipMalloc-in-capture
                 // error). Idempotent if already computed.
                 gpu.ensure_mq_signs()?;
+                // Q8 indexed down reads per_expert_scale; pre-warm the all-ones
+                // buffer so hipGraph capture does not hipMalloc mid-decode.
+                gpu.ensure_moe_unit_scale(n_exp)?;
             }
             if hipfire_config::developer_var("HIPFIRE_PREFILL_REUSE_PBS")
                 .ok()

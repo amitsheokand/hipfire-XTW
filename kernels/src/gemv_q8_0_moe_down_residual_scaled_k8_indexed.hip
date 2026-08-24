@@ -14,29 +14,32 @@
 // Q8_0 layout: 34 bytes per block of 32 elements (2B f16 scale + 32B int8).
 //
 // Expert ptrs: [n_exp] array of `const char*` weight-base pointers.
-// Grid: (M, K_TOP, 1). Block = 32 threads.
+// Grid: (M, K_TOP, N). Block = 32 threads.
+// Decode uses N=1 (grid.z=1); prefill uses N = token batch. K_TOP is gridDim.y.
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_q8_0_moe_down_residual_scaled_k8_indexed(
     const unsigned long long* __restrict__ expert_ptrs,   // [n_exp]
-    const int* __restrict__ topk_indices,                   // [k_top]
-    const float* __restrict__ topk_weights,                 // [k_top]
+    const int* __restrict__ topk_indices,                   // [N × k_top]
+    const float* __restrict__ topk_weights,                 // [N × k_top]
     const float* __restrict__ per_expert_scale,             // [n_exp]
-    const float* __restrict__ hidden_batch,                 // [k_top × K]
-    float* __restrict__ x_residual,                         // [M] — accumulator
+    const float* __restrict__ hidden_batch,                 // [N × k_top × K]
+    float* __restrict__ x_residual,                         // [N × M] — accumulator
     int M, int K
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
     const int krank = blockIdx.y;
+    const int bid = blockIdx.z;
+    const int k_top = (int)gridDim.y;
     const int tid = threadIdx.x;
+    const int slot = bid * k_top + krank;
 
-    const int expert_id = topk_indices[krank];
+    const int expert_id = topk_indices[slot];
     const unsigned char* __restrict__ A =
         reinterpret_cast<const unsigned char*>(expert_ptrs[expert_id]);
 
-    // Each krank's hidden input is at hidden_batch[krank * K ... (krank+1) * K].
-    const float* __restrict__ x = hidden_batch + (size_t)krank * K;
+    const float* __restrict__ x = hidden_batch + (size_t)slot * K;
 
     const int blocks_per_row = K / 32;
     const unsigned char* row_data = A + (size_t)row * blocks_per_row * 34;
@@ -70,7 +73,7 @@ extern "C" __global__ void gemv_q8_0_moe_down_residual_scaled_k8_indexed(
         sum += __shfl_down(sum, offset);
 
     if (tid == 0) {
-        float scale = topk_weights[krank] * per_expert_scale[expert_id];
-        atomicAdd(&x_residual[row], scale * sum);
+        float scale = topk_weights[slot] * per_expert_scale[expert_id];
+        atomicAdd(&x_residual[(size_t)bid * M + row], scale * sum);
     }
 }

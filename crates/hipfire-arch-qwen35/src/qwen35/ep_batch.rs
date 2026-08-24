@@ -31,6 +31,7 @@ use super::forward::Qwen35ScratchSet;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_chunk;
 use super::prefill::is_batchable_la;
+use super::prefill::moe_prefill_topk_shape_supported;
 use super::prefill::qwen35_layer_batch_admissible;
 use super::prefill::PrefillBandCtx;
 use super::prefill::PREFILL_MAX_BATCH;
@@ -4004,7 +4005,8 @@ pub fn forward_prefill_batch_multi(
     // layer fails the batched gate, fall back to per-token forward —
     // correctness preserved at the cost of per-token kernel sequence.
     let arch0 = gpus.devices[0].arch.as_str();
-    let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    let moe_topk_ok =
+        moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
     let eligible = !force_fallback
         && n_total >= 2
         && dn_state.quant == StateQuant::Q8

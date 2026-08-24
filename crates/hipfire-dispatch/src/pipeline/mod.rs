@@ -411,17 +411,12 @@ pub fn run_moe_decode(
     }
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
-    // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
-    // ports master's `moe_ffn_decode_impl` CPU-fallback per-expert loop
-    // (origin/master qwen35.rs, the `else` arm of `if use_gpu_topk`) so MoE
-    // layers outside the {k=8, MQ4G256|MQ5G256|MQ6G256|ParoQ4G128-routed} fast path
-    // run instead of hard-panicking. #393 deleted this; restoring it keeps the
-    // dispatch migration behavior-preserving.
+    // Fires when `!use_gpu_topk` (k not in {8,16} OR routed dtype not indexable).
     //
     // The fallback is self-contained: it does softmax → CPU top-K + renorm →
     // shared-expert down → generic per-expert routed loop, then returns. It
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
-    // k=8 + an indexable routed dtype).
+    // k in {8,16} + an indexable routed dtype).
     if !res.use_gpu_topk {
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
@@ -446,7 +441,8 @@ pub fn run_moe_decode(
     }
     let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
     let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
-    let exact_wave64_router = p.n_exp == 256
+    let exact_wave64_router = p.k == 8
+        && p.n_exp == 256
         && ((ctx.arch.is_gfx1100()
             // The exact fused router is the production gfx1100 path. `0` retains
             // the two-launch reference path for A/B diagnosis; `approx` retains
@@ -464,13 +460,14 @@ pub fn run_moe_decode(
         && *ROUTER_SHARED_FUSE.get_or_init(|| {
             hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1")
         });
-    let wave64_router = (ctx.arch.is_gfx1201()
-        && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
-        || (ctx.arch.is_gfx1100()
-            && p.n_exp == 256
-            // Research-only: faster on gfx1100, but its routing drift can
-            // change greedy trajectories and trigger an attractor.
-            && gfx1100_router_mode.as_deref() == Some("approx"));
+    let wave64_router = p.k == 8
+        && ((ctx.arch.is_gfx1201()
+            && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
+            || (ctx.arch.is_gfx1100()
+                && p.n_exp == 256
+                // Research-only: faster on gfx1100, but its routing drift can
+                // change greedy trajectories and trigger an attractor.
+                && gfx1100_router_mode.as_deref() == Some("approx")));
     if router_shared_fuse {
         let shared_x_rot = unsafe {
             GpuTensor {
@@ -510,13 +507,23 @@ pub fn run_moe_decode(
         ))?;
     } else {
         hip!(gpu.softmax_f32(p.router_logits))?;
-        hip!(gpu.moe_topk_renorm_k8(
-            p.router_logits,
-            p.topk_indices,
-            p.topk_weights,
-            p.n_exp,
-            p.norm_topk_prob
-        ))?;
+        if p.k == 16 {
+            hip!(gpu.moe_topk_renorm_k16(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob
+            ))?;
+        } else {
+            hip!(gpu.moe_topk_renorm_k8(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob
+            ))?;
+        }
     }
 
     // ── Shared expert down ───────────────────────────────────────────────────
@@ -826,6 +833,10 @@ pub fn run_moe_decode(
                 p.mi,
                 paro_down.krot,
             ))?;
+        } else if p.dtypes.routed_down == DType::Q8_0 {
+            // Q8 down is unrotated: silu(g)*u only. FWHT would scramble the
+            // [k × mi] hidden the Q8 indexed down reads as x[krank * K].
+            hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
         } else if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
             // Route A MoE-AWQ: per-routed-expert down.awq_scale selected by
             // topk_indices[krank]. Divides silu(g)*u by the expert's scale before
@@ -988,6 +999,30 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
+        } else if p.dtypes.routed_down == DType::Q8_0 {
+            // Q8 indexed down: atomic weighted accumulate into residual.
+            // per_expert_scale is all-ones (Qwen group scale is in the Q8
+            // blocks). Skip moe_down_combine (self-combines).
+            hip!(gpu.ensure_moe_unit_scale(p.n_exp))?;
+            let unit_scale = unsafe {
+                GpuTensor {
+                    buf: gpu.scratch.moe_unit_scale.as_ref().unwrap().buf.alias(),
+                    shape: gpu.scratch.moe_unit_scale.as_ref().unwrap().shape.clone(),
+                    dtype: DType::F32,
+                }
+            };
+            hip!(gpu.gemv_q8_0_moe_down_residual_scaled_k8_indexed(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                &unit_scale,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
         } else if p.dtypes.routed_down == DType::MFP4G32E8 {
             // mfp4-E8 grouped expert down (atomic-free expanded; combine below).
             hip!(gpu.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
@@ -1056,7 +1091,11 @@ pub fn run_moe_decode(
         || (p.expert_dtype_tags.is_none()
             && matches!(
                 p.dtypes.routed_down,
-                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+                DType::MQ2G256Lloyd
+                    | DType::MQ3G256Lloyd
+                    | DType::MQ2G256GL
+                    | DType::MQ3G256GL
+                    | DType::Q8_0
             ));
     if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
@@ -2673,6 +2712,17 @@ pub fn run_moe_prefill(
                     ))?;
                 }
             }
+            DType::Q8_0 => {
+                // Q8 down is quantized against un-rotated silu(g)*u. Do not
+                // FWHT: fused_silu_mul_rotate_mq_batched with mi=192 yields
+                // n_groups=0. View the live [n × k_top × mi] prefix of the
+                // max-batch scratch allocation.
+                let n_elem = n * k_top * mi;
+                let gate_view = unsafe { slice_moe_f32_view(p.gate_batch, 0, n_elem) };
+                let up_view = unsafe { slice_moe_f32_view(p.up_batch, 0, n_elem) };
+                let rot_view = unsafe { slice_moe_f32_view(p.rot_batch, 0, n_elem) };
+                hip!(gpu.silu_mul_f32(&gate_view, &up_view, &rot_view))?;
+            }
             _other => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "moe",
@@ -2741,6 +2791,30 @@ pub fn run_moe_prefill(
             }
         };
         down_result?;
+    } else if p.dtypes.routed_down == DType::Q8_0 {
+        // Q8 indexed down: atomic weighted accumulate into residual.
+        // per_expert_scale is all-ones (Qwen group scale is in the Q8
+        // blocks). Skip moe_down_combine (self-combines).
+        hip!(gpu.ensure_moe_unit_scale(n_exp))?;
+        let unit_scale = unsafe {
+            GpuTensor {
+                buf: gpu.scratch.moe_unit_scale.as_ref().unwrap().buf.alias(),
+                shape: gpu.scratch.moe_unit_scale.as_ref().unwrap().shape.clone(),
+                dtype: DType::F32,
+            }
+        };
+        hip!(gpu.gemv_q8_0_moe_down_residual_scaled_k8_indexed(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.topk_weights,
+            &unit_scale,
+            p.rot_batch,
+            out_target,
+            down_m,
+            down_k,
+            k_top,
+            n,
+        ))?;
     } else {
         // Path 1: atomic-free expanded GEMV write + combine.
         // MQ6 only reaches here on archs where it's admitted without WMMA

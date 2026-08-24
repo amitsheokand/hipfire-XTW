@@ -1899,6 +1899,15 @@ pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_SRC: &st
 pub const MOE_TOPK_RENORM_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_topk_renorm_k8.hip");
 
+/// Top-16 companion of MOE_TOPK_RENORM_K8_SRC (Whittle k=16). Kept as a
+/// separate kernel so the A3B k=8 exact-256 unroll stays bit-identical.
+pub const MOE_TOPK_RENORM_K16_SRC: &str =
+    include_str!("../../../kernels/src/moe_topk_renorm_k16.hip");
+
+/// Batched companion of MOE_TOPK_RENORM_K16_SRC for the prefill path.
+pub const MOE_TOPK_RENORM_K16_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_topk_renorm_k16_batched.hip");
+
 /// Batched companion of MOE_TOPK_RENORM_K8_SRC for the prefill path.
 /// Same per-block algorithm; one workgroup per token row.
 pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =

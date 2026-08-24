@@ -25372,6 +25372,9 @@ impl Gpu {
 
     /// Indexed MoE down-projection for Q8_0 expert weights, with fused
     /// scaled atomicAdd into the residual stream.
+    ///
+    /// `n_ranks` is grid.y (top-k ranks). Gemma4 passes 8; Whittle passes 16.
+    /// `batch_size` is grid.z: decode / Gemma4 pass 1; batched prefill passes N.
     #[allow(unused_variables)]
     pub fn gemv_q8_0_moe_down_residual_scaled_k8_indexed(
         &mut self,
@@ -25383,6 +25386,8 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize,
         k: usize,
+        n_ranks: usize,
+        batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -25410,7 +25415,7 @@ impl Gpu {
         ];
         let result = self.launch_maybe_blob(
             "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
-            [m as u32, 8, 1],
+            [m as u32, n_ranks as u32, batch_size as u32],
             [32u32, 1, 1],
             0,
             &mut params,

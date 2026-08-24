@@ -1535,7 +1535,7 @@ fn apply_moe_branch(
                 &moe.per_expert_scale,
                 &scratch.moe_expert_hidden_batch,
                 &scratch.moe_cur_moe,
-                dim, mi,
+                dim, mi, k_top, 1,
             )?;
         } else {
             // down_hfq4g128 path.

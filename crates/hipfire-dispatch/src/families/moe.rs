@@ -147,6 +147,10 @@ pub struct MoeResolution {
     /// likewise not admitted by `moe_ffn_batched_admissible_for_dtypes`, so a
     /// GL model prefills through the per-token path.
     pub routed_indexable_mixed_lloyd: bool,
+    /// MQ4 gate_up + Q8_0 down (Whittle K=192 down is not a multiple of 128/256).
+    /// Indexable: MQ4 indexed gate_up + Q8 indexed atomic-residual down.
+    /// SiLU must NOT FWHT (Q8 down reads unrotated hidden).
+    pub routed_indexable_mq4_q8: bool,
     /// Per-expert N-tier graded routed experts (MQ6 hot / MQ4 mid / MQ2L or
     /// MQ3L cold, applied to BOTH gate_up and down). Indexable on the decode
     /// GPU-top-K path via the merged dtype-tag-branched gate_up AND down
@@ -193,6 +197,7 @@ impl MoeResolution {
         let routed_gate_up_mq3lloyd = d.routed_gate_up == MQ3G256Lloyd;
 
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
+        let routed_indexable_mq4_q8 = routed_gate_up_mq4 && (d.routed_down == Q8_0);
         let routed_indexable_mq5 = (d.routed_down == MQ5G256) && routed_gate_up_mq5;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
@@ -233,6 +238,7 @@ impl MoeResolution {
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
         let routed_dtype_indexable = routed_indexable_mq4
+            || routed_indexable_mq4_q8
             || routed_indexable_mq5
             || routed_indexable_mq6
             || routed_indexable_mixed_gu4_dn6
@@ -243,7 +249,19 @@ impl MoeResolution {
             || routed_indexable_paro
             || routed_indexable_e8;
 
-        let use_gpu_topk = k == 8 && routed_dtype_indexable;
+        // k=8 is the A3B indexed path. k=16 is Whittle (and any other
+        // indexable k=16 model whose gate_up launcher takes `n_ranks`).
+        // MQ5 / E8 decode gate_up still hardcode grid.y=8 — keep those on
+        // the CPU fallback at k=16 rather than silently dropping 8 ranks.
+        let k16_launchers_ok = !matches!(
+            d.routed_gate_up,
+            MQ5G256 | MFP4G32E8 | MFP3G32E8 | MFP2G32E8
+        );
+        let use_gpu_topk = match k {
+            8 => routed_dtype_indexable,
+            16 => routed_dtype_indexable && k16_launchers_ok,
+            _ => false,
+        };
         let needs_x_rot_local = gate_side_mq4
             || routed_indexable_mixed_per_expert
             || routed_gate_up_mq4
@@ -274,6 +292,7 @@ impl MoeResolution {
             gate_side_mq4,
             gate_fusable,
             routed_indexable_mq4,
+            routed_indexable_mq4_q8,
             routed_indexable_mq5,
             routed_indexable_mq6,
             routed_indexable_mixed_gu4_dn6,
@@ -290,6 +309,7 @@ impl MoeResolution {
 
     pub fn routed_indexable(&self) -> bool {
         self.routed_indexable_mq4
+            || self.routed_indexable_mq4_q8
             || self.routed_indexable_mq5
             || self.routed_indexable_mq6
             || self.routed_indexable_mixed_gu4_dn6
@@ -371,7 +391,7 @@ pub struct MoeParams<'a> {
     pub routed_down_m: usize,
     pub routed_down_k: usize,
     /// Per-expert (gate_up, down) weight refs for the generic CPU-top-K
-    /// fallback (`!use_gpu_topk`: k != 8 OR routed dtype not indexable).
+    /// fallback (`!use_gpu_topk`: k not in {8,16} OR routed dtype not indexable).
     /// Master's `moe_ffn_decode_impl` indexed `ffn.experts[expert_idx]` in a
     /// host loop; the indexed-kernel pointer tables above can't drive that
     /// path (they assume k=8 + an indexable routed dtype). One ref pair per
@@ -808,9 +828,14 @@ impl MoePrefillResolution {
             DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8
         ) && !(arch.is_rdna3() || arch.is_rdna4());
         let use_path2 = use_path2 && !e8_no_grouped;
+        // Q8 routed projections have no grouped-WMMA GEMM arm. Force Path 1
+        // (indexed batched GEMV). Path 0's residual-scaled launcher is MQ4-only.
+        let q8_no_grouped = d.routed_down == DType::Q8_0 || d.routed_gate_up == DType::Q8_0;
+        let use_path2 = use_path2 && !q8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
-        let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
+        let down_path0 =
+            (arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3()) && !q8_no_grouped;
         let is_gfx1151 = arch.is_gfx1151();
         let use_paro_i8 = paro_mode && use_path2 && is_gfx1151 && flags.moe_paro_i8.unwrap_or(true);
         let use_paro_i8_k8 = use_paro_i8 && flags.moe_paro_i8_k8.unwrap_or(true);
@@ -867,12 +892,12 @@ impl MoeFamily {
     /// Run a single-token MoE decode step through the centralized executor.
     ///
     /// Delegates to [`crate::pipeline::run_moe_decode`], which dispatches the
-    /// GPU top-K fast path (k=8 with an indexable routed dtype ∈ {MQ4G256,
-    /// MQ6G256, ParoQ4G128}) or the generic CPU-top-K fallback (k != 8 or a
-    /// non-indexable routed dtype). Resolution is owned here (the family
-    /// resolves [`MoeDtypes`] → [`MoeResolution`]), and `ctx` is threaded
-    /// through every inner GEMV so the call site builds one `DispatchCtx`
-    /// per token (not 6+). Scratch stays model-owned.
+    /// GPU top-K fast path (k=8 or k=16 with an indexable routed dtype) or the
+    /// generic CPU-top-K fallback (other k, or a non-indexable routed dtype).
+    /// Resolution is owned here (the family resolves [`MoeDtypes`] →
+    /// [`MoeResolution`]), and `ctx` is threaded through every inner GEMV so
+    /// the call site builds one `DispatchCtx` per token (not 6+). Scratch stays
+    /// model-owned.
     pub fn run(
         &self,
         ctx: &DispatchCtx,
