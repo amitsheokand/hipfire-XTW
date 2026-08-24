@@ -30,4 +30,9 @@ unchanged. daemon `ff448beb…`. Checkpoint
 `docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-gpu-topk-r9700.md`.
 GEMV lm_head fallback still host-selects.
 
+Adaptive-B trip-wire (mean accept < 2.5 → B=trained/2) **rejected** on
+this DFlash 2: prose 8→4 made τ 2.43→1.89 and decode 44.9→38.5. Code
+unmoved (stayed B=8). Default `dflash_adaptive_b=false`. Checkpoint
+`docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-adaptive-b-r9700.md`.
+
 Whittle v2+v2.1 download finished 2026-08-24 (~53 GB) at `~/.hipfire/hf-cache/Qwen3.8-Whittle-MoE-27B-A17.8B`. v2.1 is a PEFT LoRA (`r=128`, `alpha=256`) plus `modules_to_save` = 64 routers and late-layer shared experts — merge before encode. Shape: 64 experts / top-16 / moe_intermediate 192 / shared 5120. First encode risk: routed `down` K=192 vs group-256.

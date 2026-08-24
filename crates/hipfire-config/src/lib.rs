@@ -1031,12 +1031,12 @@ pub static FIELDS: &[ConfigField] = &[
         "dflash_adaptive_b",
         Speculation,
         ModelLoad,
-        DefaultValue::Bool(true),
+        DefaultValue::Bool(false),
         ValueRule::Bool,
         true,
         false,
-        None,
-        "Adapt the DFlash block size to observed acceptance."
+        Some("HIPFIRE_DFLASH_ADAPTIVE_B"),
+        "Adapt the DFlash block size to observed acceptance. Off: DFlash 2 trained at B=8 loses τ when shrunk to 4."
     ),
     field!(
         "speculation.dflash",

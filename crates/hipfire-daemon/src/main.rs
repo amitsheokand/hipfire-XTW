@@ -1328,15 +1328,13 @@ fn main() {
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
-                // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
-                // Accepted here; the generate loop will honor it in the
-                // 0.1.7-stable release where we port the demo's outer τ-window
-                // trip-wire (below 2.5 → shrink block to 8).
+                // `dflash_adaptive_b` is honored by `DflashSpeculator` (τ-window
+                // trip-wire: mean accept below 2.5 → shrink to trained/2).
                 let _adaptive_b = msg
                     .get("params")
                     .and_then(|p| p.get("dflash_adaptive_b"))
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                    .unwrap_or(false);
 
                 // 0.1.7: TriAttention / CASK eviction protocol fields. When
                 // `cask_sidecar` is set, `load_model` sizes the KV cache to a

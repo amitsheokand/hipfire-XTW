@@ -286,7 +286,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | Key | Default | Values / range | Notes |
 |---|---|---|---|
 | `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
-| `dflash_adaptive_b` | `true` | bool | Adaptive draft block size. |
+| `dflash_adaptive_b` | `false` | bool | Adaptive draft block size. Off: DFlash 2 B=8→4 lost τ on R9700 prose. |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when weights present (DeepSeek path primary). Separate Qwen35 MTP env gate may apply — see env doc. |
 | `mtp_k` | `3` | int 1–10 | |

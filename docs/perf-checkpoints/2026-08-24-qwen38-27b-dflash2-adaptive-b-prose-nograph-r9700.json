@@ -1,0 +1,93 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/amitsheokand/.hipfire/models/qwen38-27b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 10480,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 32558,
+  "max_tokens": 128,
+  "runs": 3,
+  "batch": 1,
+  "speculation": "dflash",
+  "decode_tok_s": {
+    "median": 38.5,
+    "mean": 38.53333333333333,
+    "min": 38.5,
+    "max": 38.6,
+    "stdev": 0.04714045207910384
+  },
+  "prefill_tok_s": {
+    "median": 262.1,
+    "mean": 262.03333333333336,
+    "min": 261.9,
+    "max": 262.1,
+    "stdev": 0.09428090415822778
+  },
+  "wall_tok_s": {
+    "median": 37.4,
+    "mean": 37.43333333333333,
+    "min": 37.4,
+    "max": 37.5,
+    "stdev": 0.04714045207910384
+  },
+  "ttft_ms": {
+    "median": 91.6,
+    "mean": 91.59999999999998,
+    "min": 91.6,
+    "max": 91.6,
+    "stdev": 1.4210854715202004e-14
+  },
+  "tau": {
+    "median": 1.89,
+    "mean": 1.89,
+    "min": 1.89,
+    "max": 1.89,
+    "stdev": 0.0
+  },
+  "samples": {
+    "decode": [
+      38.6,
+      38.5,
+      38.5
+    ],
+    "prefill": [
+      262.1,
+      261.9,
+      262.1
+    ],
+    "wall": [
+      37.5,
+      37.4,
+      37.4
+    ],
+    "ttft_ms": [
+      91.6,
+      91.6,
+      91.6
+    ],
+    "tau": [
+      1.89,
+      1.89,
+      1.89
+    ]
+  }
+}
