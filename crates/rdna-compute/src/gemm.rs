@@ -21648,6 +21648,98 @@ impl Gpu {
         result
     }
 
+    /// gfx12 grouped-WMMA Q8_0 MoE GEMM. Same scatter contract as
+    /// [`Self::gemm_hfq4g256_moe_grouped_wmma_k2`]; Q8_0 block math from
+    /// [`Self::gemm_q8_0_wmma`]. K must be a multiple of 32.
+    ///
+    /// `rot_batch` is rewritten every layer, so FP16 conversion is uncached
+    /// (pointer-keyed `ensure_fp16_x` would reuse layer-0 activations).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_moe_grouped_wmma(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            self.arch_caps.is_rdna4(),
+            "gemm_q8_0_moe_grouped_wmma: gfx12 only; got arch {}",
+            self.arch
+        );
+        debug_assert_eq!(
+            k % 32,
+            0,
+            "gemm_q8_0_moe_grouped_wmma: K must be a multiple of 32 (got K={k})"
+        );
+        const KNAME: &str = "gemm_q8_0_moe_grouped_wmma_gfx12";
+        self.ensure_kernel(KNAME, kernels::GEMM_Q8_0_MOE_GROUPED_WMMA_GFX12_SRC, KNAME)?;
+        let x_f16_ptr = if matches!(x_src.dtype, DType::F16) {
+            x_src.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x_src, x_src_rows * k)?
+        };
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes =
+            crate::profile::q8_0_weight_bytes(m, k) + m_total * k * 2 + m_total * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KNAME, bytes);
+        let result = self.launch_maybe_blob(
+            KNAME,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// WMMA 4-way fused Q8_0 GEMM (wqkv + wz + w_beta + w_alpha).
     /// DeltaNet LA preamble. Auto-routes to gfx12 sibling on RDNA4.
     pub fn gemm_qkvza_q8_0_wmma(

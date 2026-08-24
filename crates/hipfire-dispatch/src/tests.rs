@@ -1640,14 +1640,23 @@ fn moe_prefill_resolution_path2_gfx12_mq4() {
 }
 
 #[test]
-fn moe_prefill_resolution_mq4_q8_forces_path1_on_wmma() {
-    // Whittle: MQ4 gate_up + Q8 down. grouped-WMMA has no Q8 arm.
-    for arch_name in ["gfx1100", "gfx1200", "gfx1201"] {
+fn moe_prefill_resolution_mq4_q8_path2_gfx12_only() {
+    // Whittle: MQ4 gate_up + Q8 down. gfx12 has `gemm_q8_0_moe_grouped_wmma_gfx12`.
+    // gfx11 stays Path 1 (no Q8 grouped sister). Path 0 is MQ4-only.
+    let gfx11 = crate::context::DispatchCtx::for_test("gfx1100");
+    let r11 = MoePrefillResolution::resolve(&moe_dtypes_mq4_q8(), &gfx11.arch, &gfx11.flags);
+    assert!(
+        !r11.use_path2,
+        "gfx1100: Q8 down must not take Path 2 grouped GEMM"
+    );
+    assert!(!r11.down_path0, "gfx1100: Q8 down must not take Path 0");
+
+    for arch_name in ["gfx1200", "gfx1201"] {
         let arch = crate::context::DispatchCtx::for_test(arch_name);
         let r = MoePrefillResolution::resolve(&moe_dtypes_mq4_q8(), &arch.arch, &arch.flags);
         assert!(
-            !r.use_path2,
-            "{arch_name}: Q8 down must not take Path 2 grouped GEMM"
+            r.use_path2,
+            "{arch_name}: MQ4 gate_up + Q8 down should take Path 2"
         );
         assert!(
             !r.down_path0,

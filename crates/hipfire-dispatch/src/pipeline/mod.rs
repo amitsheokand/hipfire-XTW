@@ -2381,6 +2381,18 @@ fn dispatch_grouped_gemm(
             m_total,
             rows,
         )),
+        DType::Q8_0 => hip!(gpu.gemm_q8_0_moe_grouped_wmma(
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
+        )),
         _other => Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "prefill-grouped-gemm-dtype",

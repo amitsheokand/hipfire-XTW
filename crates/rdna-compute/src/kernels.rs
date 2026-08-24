@@ -2755,6 +2755,13 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX11_DGPU_SRC: &str =
 pub const GEMM_Q8_0_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_wmma.gfx12.hip");
 
+/// gfx12 grouped-WMMA Q8_0 MoE GEMM. Same scatter contract as
+/// `GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC`; Q8_0 block math from
+/// `GEMM_Q8_0_WMMA_GFX12_SRC`. K must be a multiple of 32. Whittle
+/// routed down (K=192) is the first caller.
+pub const GEMM_Q8_0_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_moe_grouped_wmma.gfx12.hip");
+
 /// Non-residual WMMA Q8_0 GEMM (RDNA3+ / gfx1100+). Generic variant
 /// using the cross-RDNA `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
 /// intrinsic — works on gfx1100/gfx115x/gfx1200, distinct from the

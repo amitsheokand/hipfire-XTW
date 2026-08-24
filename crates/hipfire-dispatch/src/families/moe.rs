@@ -828,9 +828,15 @@ impl MoePrefillResolution {
             DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8
         ) && !(arch.is_rdna3() || arch.is_rdna4());
         let use_path2 = use_path2 && !e8_no_grouped;
-        // Q8 routed projections have no grouped-WMMA GEMM arm. Force Path 1
-        // (indexed batched GEMV). Path 0's residual-scaled launcher is MQ4-only.
-        let q8_no_grouped = d.routed_down == DType::Q8_0 || d.routed_gate_up == DType::Q8_0;
+        // Q8 gate_up has no grouped-WMMA arm. Q8 down on gfx12 uses
+        // `gemm_q8_0_moe_grouped_wmma_gfx12` (Whittle K=192). Other archs
+        // and Q8 gate_up stay on Path 1 (indexed GEMV). Path 0's
+        // residual-scaled launcher is MQ4-only.
+        let q8_grouped_down_ok = d.routed_down == DType::Q8_0
+            && d.routed_gate_up != DType::Q8_0
+            && arch.is_rdna4();
+        let q8_no_grouped = (d.routed_down == DType::Q8_0 || d.routed_gate_up == DType::Q8_0)
+            && !q8_grouped_down_ok;
         let use_path2 = use_path2 && !q8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
