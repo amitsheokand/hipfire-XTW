@@ -48,7 +48,10 @@ evidence that LRU actually hurts on our routing distributions.
    (off by default; zero cost when unset).
 2. Trace fixtures: A3B MoE decode (TG512, greedy + sampled) on a dGPU with
    `vram_soft_cap` forced to 25% / 50% / 75% of expert bytes — simulates
-   >VRAM pressure without new hardware.
+   >VRAM pressure without new hardware. Preferred first 32 GB R9700
+   fixture, once encoded: Qwen3.8-Whittle-MoE-27B-A17.8B (64×192 routed +
+   5120 shared, top-16; ~1.5 MB MQ4 per expert). A3B remains the fallback.
+   Campaign: [`docs/plans/2026-08-24-r9700-whittle-bandwidth.md`](../plans/2026-08-24-r9700-whittle-bandwidth.md).
 3. Analysis (scripted, committed under `autoresearch/` or `scripts/`):
    reuse-distance distribution per layer; LRU vs optimal (Belady) miss-rate
    gap per cap; cross-token routing correlation (layer-L expert at token t

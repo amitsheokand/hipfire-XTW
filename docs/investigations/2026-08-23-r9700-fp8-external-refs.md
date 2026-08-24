@@ -79,7 +79,7 @@ corrected to 8.0625 bpw (256 B leaf + 2 B scale) on 2026-08-23.
 | [AMD-AGI/Hyperloom](https://github.com/AMD-AGI/Hyperloom) | Claude/Codex agent that auto-tunes **vLLM/SGLang** on Instinct (MI300X/MI325X/MI355X). MIT. No in-tree HIP kernels. | Domain only (AMD LLM serving). | **Ignore product.** Optional: read GEAK/AITER, not Hyperloom Python. |
 | [The-Monk/The-Rock8](https://github.com/The-Monk/The-Rock8) | gfx1201 llama.cpp + Lemonade **appliance** on TheRock ROCm 7.13/7.14. Kernels live in [The-Monk/llama.cpp `roc8`](https://github.com/The-Monk/llama.cpp/tree/roc8). MIT. Validated on 2× R9700. | Same silicon ops (`v_wmma_f32_16x16x16_fp8_fp8`, `v_dot4_f32_fp8_fp8`). Different weight layout. | **Steal tiling, geom sweep, profiling traps.** Do not steal GGUF/Lemonade. |
 | [RDNA4 ISA](https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture) | Family ISA, doc **70651**, 7 Apr 2025, 697 pp. Never names gfx1200 vs gfx1201. | Confirms current GEMM fragment layout and C-map. | **Keep as ISA authority.** F8_Mode for WMMA is unspecified — prove on silicon. |
-| [arXiv:2608.16157](https://arxiv.org/abs/2608.16157) | FreeToken paper (17 Aug 2026). NVIDIA-only edge MoE serving. | Serving/MoE pager, not GEMM. Matches the unused `moe_expert_cache_mb` knob. | **Park until experts do not fit VRAM.** |
+| [arXiv:2608.16157](https://arxiv.org/abs/2608.16157) | FreeToken paper (17 Aug 2026). NVIDIA-only edge MoE serving. | Serving/MoE pager, not GEMM. Matches the unused `moe_expert_cache_mb` knob. | **Unpark on Whittle for HBM bytes/token, not VRAM spill.** See [`docs/plans/2026-08-24-r9700-whittle-bandwidth.md`](../plans/2026-08-24-r9700-whittle-bandwidth.md). |
 | [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) | Apache-2.0 Python/CUDA implementation of that paper. Not a tokenizer, not spec-decode. | Algorithm only (LRU experts, \(q^\star\), semantic anchors). | **Do not vendor.** Ideas → `WeightPager` later. |
 
 ---
@@ -235,7 +235,7 @@ Skills in play: `.agents/skills/hipfire-arch-port/` (WMMA C-map, chip tag),
 | **3d** | Fix qt=40 comment (G256 vs 32-elem 34 B) | **Done** — 8.0625 bpw in `hfq.rs` | minutes |
 | **4** | One tiling lever after 3b is green | **LDS X-panel rejected.** Pack pre-pass **landed**: GEMM-only −42–51% large-N; ffn1 +8.3%. Occupancy unchanged. See `.agent-memory/notes/fp8-gemm-pack-prepass.md` | done |
 | **5** | Encoder + `fp8_wmma` dispatch into one prefill GEMM | **Landed (not default-on).** CPU `--format fp8e4m3` qt=40; runtime `DType` + GEMV/GEMM; gfx1201 overwrite-GEMM prefill + **fused gate+up**. 0.8B encode→load→serve (known-incoherent). **4B encode→thinking-off serve on R9700 produced readable text**. `fp8_wmma` stays off. Not a tok/s or admission claim. | done |
-| **Parked** | FreeToken \(q^\star\) / semantic anchors | Only if a MoE pool does not fit 32 GB | later |
+| **Parked → Whittle** | FreeToken \(q^\star\) / expert residency / semantic anchors | Dense MQ4 floor first; DFlash 2 on parent; then Whittle-MoE-27B-A17.8B v2.1 (192-wide top-16). Pager traces before \(q^\star\). Not a dense-FP8 experiment. Plan: [`docs/plans/2026-08-24-r9700-whittle-bandwidth.md`](../plans/2026-08-24-r9700-whittle-bandwidth.md) | later |
 | **Never** | Hyperloom, Lemonade, GGUF F8 layout, `HSA_OVERRIDE` as product | — | — |
 
 hipBLASLt as a large-M prefill fallback is **opt-in, per-shape M-threshold
