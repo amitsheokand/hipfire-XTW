@@ -8,4 +8,6 @@ DFlash 2 is no longer a silent DFlash 1 load. `DflashConfig::from_hfq` tags `DFl
 
 Packed draft: `~/.hipfire/models/qwen38-27b-dflash2.hfq` (F16, 81 tensors, block 8). Existing packed file has no `variant` key; detection uses `config.architectures`.
 
+2026-08-24 serve_harness on dense `qwen38-27b.mq4` (thinking off, greedy, kv q8, max=64, same Paris/`merge_sort` prompts): DFlash 2 fired (not silent DFlash 1). attractor=0. τ=2.94 factual / 6.88 code. First-turn decode 16.5 tok/s is JIT; second 93.5. Not a bench claim.
+
 Whittle v2+v2.1 download finished 2026-08-24 (~53 GB) at `~/.hipfire/hf-cache/Qwen3.8-Whittle-MoE-27B-A17.8B`. v2.1 is a PEFT LoRA (`r=128`, `alpha=256`) plus `modules_to_save` = 64 routers and late-layer shared experts — merge before encode. Shape: 64 experts / top-16 / moe_intermediate 192 / shared 5120. First encode risk: routed `down` K=192 vs group-256.
