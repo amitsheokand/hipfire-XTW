@@ -3554,9 +3554,10 @@ pub fn attach_mtp_window_timings(
 /// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
 /// persistent (loaded once on `Qwen35Bundle.qwen35_mtp_head`).
 ///
-/// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
-/// head is present (see the dispatch site in `generate`), so the DEFAULT serve
-/// path (DFlash/AR) is unchanged.
+/// Gated behind opt-in: this is only reached when native MTP is selected
+/// (`mtp_mode=on` / `--spec mtp`, or `HIPFIRE_QWEN_MTP=1`) AND the head is
+/// present (see the dispatch site in `generate`), so the DEFAULT serve path
+/// (DFlash/AR) stays unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_qwen35_mtp(
     m: &mut LoadedModel,

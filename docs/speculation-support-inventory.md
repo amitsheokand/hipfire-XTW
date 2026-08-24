@@ -40,7 +40,7 @@ n-gram arch gate in `build_speculator`:
 | Arch crate | arch_id | Family | In-repo mechanisms | Native learned drafter? | Daemon / load wiring (summary) |
 |---|---|---|---|---|---|
 | llama | 0 / 1 | LLaMA / Mistral / plain Qwen3 dense | **DSpark** sidecar + DFlash generic (arch_id=20 draft) + n-gram + SpecTarget | External DSpark (`-dspark`) and/or DFlash HFQ draft when present and mode allows | Carrier precedence **DSpark > DFlash > n-gram**; daemon routes via `generate_dflash`→`generate_spec` when `speculator.is_some()` |
-| qwen35 | 5 / 6 | Qwen3.5/3.6 DeltaNet hybrid | **DSpark** sidecar + DFlash + dual MTP surfaces + n-gram + SpecTarget | DSpark; DFlash draft; native MTP head (bundled trailer or sibling `.mtp`); strict `build_speculator` MTP arm under separate gates | Load precedence **DSpark > DFlash/`build_speculator` MTP/n-gram**. Serve: `HIPFIRE_QWEN_MTP=1` + loaded `qwen35_mtp_head` routes **native MTP before DFlash** (sampled also needs `HIPFIRE_MTP_SAMPLED=1`). Default CLI `dflash_mode=off` |
+| qwen35 | 5 / 6 | Qwen3.5/3.6 DeltaNet hybrid | **DSpark** sidecar + DFlash + dual MTP surfaces + n-gram + SpecTarget | DSpark; DFlash draft; native MTP head (bundled trailer or sibling `.mtp`); strict `build_speculator` MTP arm under separate gates | Load precedence **DSpark > DFlash/`build_speculator` MTP/n-gram**. Serve: `mtp_mode=on` (`--spec mtp`) or `HIPFIRE_QWEN_MTP=1` + loaded `qwen35_mtp_head` routes **native MTP before DFlash** (sampled also needs `HIPFIRE_MTP_SAMPLED=1`). Default CLI `dflash_mode=off` |
 | qwen2 | 7 | Qwen2/2.5, VibeThinker | n-gram + SpecTarget (block-parallel verify available) | No | n-gram opt-in; daemon `arch_id==7 && speculator` → `generate_dflash` |
 | dots-ocr | 8 | rednote dots.ocr (Qwen2-1.5B decoder) | n-gram on **decode phase only** after vision prefill | No | `generate_vl_dots_ocr` → n-gram decode loop when speculator built; vision prefill unchanged |
 | deepseek4 | 9 | DeepSeek-V4 MLA+MoE | **DSpark** and/or in-trunk MTP + SpecTarget | Yes — `-dspark` sidecar and/or in-trunk MTP | Precedence **DSpark > MTP**; `mtp_mode` load param (default `auto`); generate gate `deepseek4_spec_requested` + temp policy; **n-gram not in the n-gram arch gate** |
@@ -96,7 +96,8 @@ Two distinct qwen35 surfaces — do **not** collapse them:
 2. **Native qwen35 MTP serve path** (independent of the arm above): loader
    always attempts `qwen35_mtp_head` from a bundled `.mq4-mtp` trailer **or** a
    sibling `.mtp` sidecar (`<trunk>.mtp`). Daemon generate routes
-   `generate_qwen35_mtp` when `HIPFIRE_QWEN_MTP=1` **and** the head is loaded
+   `generate_qwen35_mtp` when `mtp_mode=on` (`--spec mtp`) or `HIPFIRE_QWEN_MTP=1`
+   **and** the head is loaded
    **before** DFlash/AR; greedy (`temp≈0`) always, sampled (`temp>0`) only with
    additional `HIPFIRE_MTP_SAMPLED=1`. Default serve without those envs stays
    DFlash/AR.

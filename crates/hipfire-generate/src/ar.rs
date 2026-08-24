@@ -1056,7 +1056,7 @@ pub fn generate(
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
-        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
+        qwen_mtp_opt_in: qwen_native_mtp_opt_in(m),
         mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
@@ -4401,6 +4401,26 @@ pub fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
         &m.mtp_mode,
         m.mtp_weights_present,
     )
+}
+
+/// Resolve whether Qwen native MTP generate is opted in.
+///
+/// Load already discovers a sibling `.mtp` sidecar under `mtp_mode=auto`.
+/// Generate used to require a second env (`HIPFIRE_QWEN_MTP=1`), so
+/// `--spec mtp` loaded the head and still routed AR. `mtp_mode=on` (CLI
+/// `--spec mtp`) is now sufficient. `HIPFIRE_QWEN_MTP=1` still opts in under
+/// `auto`; `HIPFIRE_QWEN_MTP=0` opts out.
+pub fn qwen_native_mtp_opt_in_from(mtp_mode: &str, env: Option<&str>) -> bool {
+    match env {
+        Some("0") => false,
+        Some("1") => true,
+        _ => mtp_mode == "on",
+    }
+}
+
+pub fn qwen_native_mtp_opt_in(m: &LoadedModel) -> bool {
+    let env = std::env::var("HIPFIRE_QWEN_MTP");
+    qwen_native_mtp_opt_in_from(&m.mtp_mode, env.ok().as_deref())
 }
 
 /// Emit the full Qwen AR `done` envelope via serde (hostile-id safe).

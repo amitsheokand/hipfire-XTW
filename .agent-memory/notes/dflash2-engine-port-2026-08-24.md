@@ -12,8 +12,11 @@ Packed draft: `~/.hipfire/models/qwen38-27b-dflash2.hfq` (F16, 81 tensors, block
 
 Protocol-lite on the default relativity prompt (md5 `d94d3115a3001f08a654d91461d6bdc4`):
 AR 36.6; MTP live (`HIPFIRE_QWEN_MTP=1`) 47.7 τ=2.40; DFlash 2 37.2 τ=2.43.
-`--spec mtp` without the env is silent AR. Checkpoint
-`docs/perf-checkpoints/2026-08-24-qwen38-27b-dflash2-vs-mtp-ar-r9700.md`.
+`--spec mtp` without the env is silent AR on daemon `51ef5fe2…`. After
+`mtp_mode=on` generate opt-in (daemon `661c230a…`), `--spec mtp` alone is
+47.8 τ=2.40 on the same prompt. DFlash 2 `HIPFIRE_VERIFY_GRAPH=0` is 40.9
+vs 37.2 graphs-on; τ stays 2.43. Checkpoint
+`docs/perf-checkpoints/2026-08-24-qwen38-mtp-spec-and-dflash-nograph-r9700.md`.
 
 Code prompt (md5 `51a6c7360e00a7853521a6575975b8e3`, same protocol): AR 36.6;
 MTP 75.7 τ=3.74; DFlash 2 84.7 τ=6.94. Genre-conditional: DFlash 2 converts

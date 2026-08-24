@@ -43,6 +43,15 @@ use hipfire_generate::common::*;
     }
 
     #[test]
+    fn qwen_native_mtp_follows_spec_mtp_without_env() {
+        assert!(qwen_native_mtp_opt_in_from("on", None));
+        assert!(!qwen_native_mtp_opt_in_from("auto", None));
+        assert!(!qwen_native_mtp_opt_in_from("off", None));
+        assert!(qwen_native_mtp_opt_in_from("auto", Some("1")));
+        assert!(!qwen_native_mtp_opt_in_from("on", Some("0")));
+    }
+
+    #[test]
     fn dspark_request_is_independent_of_mtp_mode() {
         assert!(deepseek4_spec_requested_from_policy(
             Some("dspark"),
