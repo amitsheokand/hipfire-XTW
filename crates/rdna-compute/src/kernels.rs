@@ -6169,8 +6169,9 @@ pub const GEMV_Q8_0_MOE_GATE_UP_K8_INDEXED_SRC: &str =
 pub const GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip");
 
-/// Whittle decode: stage 16×192 Q8 down activations, 16 rows × 16 ranks per
-/// 256-thread CTA. Same Q8_0 math as the indexed kernel; atomic-free fold.
+/// Whittle decode/prefill: stage 16×192 Q8 down activations, 16 rows × 16
+/// ranks per 256-thread CTA (`grid.z` = token batch). Same Q8_0 math as the
+/// indexed kernel; atomic-free fold.
 pub const GEMV_Q8_0_MOE_DOWN_K16_STAGED_R16_SRC: &str =
     include_str!("../../../kernels/src/gemv_q8_0_moe_down_k16_staged_r16.hip");
 

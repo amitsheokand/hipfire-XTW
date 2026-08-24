@@ -25399,7 +25399,7 @@ impl Gpu {
         static WHITTLE_Q8_STAGED: OnceLock<bool> = OnceLock::new();
         let staged = k == 192
             && n_ranks == 16
-            && batch_size == 1
+            && batch_size >= 1
             && m % 16 == 0
             && *WHITTLE_Q8_STAGED.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_WHITTLE_Q8_STAGED").as_deref() != Ok("0")
@@ -25444,7 +25444,7 @@ impl Gpu {
         let result = if staged {
             self.launch_maybe_blob(
                 kernel_name,
-                [(m / 16) as u32, 1, 1],
+                [(m / 16) as u32, 1, batch_size as u32],
                 [256u32, 1, 1],
                 0,
                 &mut params,
