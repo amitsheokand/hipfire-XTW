@@ -3043,11 +3043,13 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
-        // The warmup exists to populate kernel caches and its output is
-        // discarded, so it stays in answer mode even under --reasoning-on: a
-        // 16-token budget cannot close a think span, and letting the warmup
-        // think would abort the run before a single measured sample.
-        let _ = bench_generate(&mut engine, "Hello", 16)?;
+        // Warmups populate kernel caches and are discarded. They stay in
+        // answer mode even under --reasoning-on: a 16-token budget cannot
+        // close a think span, and letting a warmup think would abort the
+        // run before a single measured sample.
+        for _ in 0..args.warmups {
+            let _ = bench_generate(&mut engine, "Hello", 16)?;
+        }
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
