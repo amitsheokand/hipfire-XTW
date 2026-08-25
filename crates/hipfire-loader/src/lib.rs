@@ -1667,6 +1667,7 @@ fn finish_qwen35_load(
                 Some(s)
             }
             Err(e) => {
+                ctx.gpu.drain_pool();
                 eprintln!(
                     "  DFlash draft load failed ({}): {} — falling back to AR only",
                     dp, e

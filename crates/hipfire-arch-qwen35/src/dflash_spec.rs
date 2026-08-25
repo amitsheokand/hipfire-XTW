@@ -176,7 +176,6 @@ impl DflashState {
 
 // ─── DFlash state load ────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 /// Default ceiling for the DFlash draft's context-indexed structures
 /// (`target_hidden` [L × extract×hidden], the per-layer K/V caches, the
 /// hidden ring, `mq_x_rot`, and the host hidden log). Serve loads default
@@ -187,8 +186,189 @@ impl DflashState {
 /// request that outgrows the cap simply falls back to AR in the daemon —
 /// emitted tokens are never at risk. `HIPFIRE_DFLASH_CTX_CAP=0` opts out
 /// (legacy uncapped behaviour); any other value overrides the ceiling.
+///
+/// A cap that cannot fit in remaining VRAM is not a silent AR fallback:
+/// [`load_dflash_state`] halves the Legacy cap down to this default,
+/// drains the GPU pool so hipFree actually returns memory, and only then
+/// errors (the loader may still AR). Windowed mode does not shrink `W`.
 pub const DEFAULT_DFLASH_CTX_CAP: usize = 8192;
 
+/// Next Legacy DFlash ctx-cap to try after a VRAM OOM. Floor is
+/// [`DEFAULT_DFLASH_CTX_CAP`]; `None` means the current cap is already
+/// at/under that floor (caller should fail, not retry forever).
+pub fn next_legacy_dflash_cap_after_oom(current: usize) -> Option<usize> {
+    let next = (current / 2).max(DEFAULT_DFLASH_CTX_CAP);
+    (next < current).then_some(next)
+}
+
+fn is_dflash_vram_oom(err: &str) -> bool {
+    err.contains("HipError(2)")
+        || err.contains("hipError=2")
+        || err.to_ascii_lowercase().contains("out of memory")
+}
+
+struct DflashRuntimeAlloc {
+    draft_scratch: DflashScratch,
+    hidden_rb: HiddenStateRingBuffer,
+    verify_scratch: VerifyScratch,
+    target_snap: DeltaNetSnapshot,
+    gdn_tape: GdnTape,
+    target_hidden_host: Vec<f32>,
+    ddtree: Option<DdtreeState>,
+}
+
+/// Allocate draft scratch + target-side DFlash GPU state. Does **not** own
+/// draft weights — the caller retries this on VRAM OOM without reloading
+/// the 3+ GB weight tensors.
+#[allow(clippy::too_many_arguments)]
+fn alloc_dflash_runtime(
+    gpu: &mut Gpu,
+    draft_config: &DflashConfig,
+    has_mq: bool,
+    block_size: usize,
+    max_n: usize,
+    staging_max_batch: usize,
+    ctx_capacity: usize,
+    window: Option<usize>,
+    requested_ctx: usize,
+    target_config: &Qwen35Config,
+    target_dn: &DeltaNetState,
+    ddtree_budget: usize,
+    ddtree_topk_param: Option<usize>,
+) -> Result<DflashRuntimeAlloc, String> {
+    macro_rules! or_free {
+        ($e:expr, $ctx:expr $(, $owned:expr)* $(,)?) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    $($owned.free_gpu(gpu);)*
+                    let ctx: &str = $ctx;
+                    return Err(if ctx.is_empty() {
+                        format!("{e}")
+                    } else {
+                        format!("{ctx}: {e}")
+                    });
+                }
+            }
+        };
+    }
+    let draft_scratch = or_free!(
+        match window {
+            Some(w) => DflashScratch::new_windowed(
+                gpu,
+                draft_config,
+                block_size,
+                w,
+                // w_full UNBOUNDED: the last (full-attention) layer's ring spans
+                // the whole supported context, matching the artifact's
+                // `layer_types: [sliding x(n-1), full_attention]` semantics — the
+                // NInfer reference keeps one layer genuinely unbounded. The prior
+                // `requested_ctx.min(4 * w)` made the "full" layer a 4W-window
+                // (8192 rows at W=2048), so past 8K NO layer had full reach.
+                // Ring VRAM scales with requested_ctx (~270 MB at 32K rows,
+                // kvd=1024, f32 — see DflashScratch::new_windowed docs).
+                requested_ctx,
+                requested_ctx,
+                has_mq,
+            ),
+            None => {
+                // `with_mq` allocates the FWHT rotation scratch (mq_x_rot)
+                // that `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights.
+                DflashScratch::new_with_mq(
+                    gpu,
+                    draft_config,
+                    block_size,
+                    ctx_capacity,
+                    has_mq,
+                )
+            }
+        },
+        "",
+    );
+    let hidden_rb = or_free!(
+        HiddenStateRingBuffer::new(
+            gpu,
+            target_config.n_layers,
+            draft_config.num_extract(),
+            target_config.dim,
+            ctx_capacity,
+            staging_max_batch,
+        ),
+        "HiddenStateRingBuffer::new",
+        draft_scratch,
+    );
+    let hidden_k = target_config.dim.next_power_of_two();
+    let verify_scratch = or_free!(
+        VerifyScratch::with_prefill(
+            gpu,
+            max_n,
+            target_config.dim,
+            target_config.vocab_size,
+            hidden_k,
+            target_config,
+        ),
+        "VerifyScratch::with_prefill",
+        hidden_rb,
+        draft_scratch,
+    );
+    let target_snap = or_free!(
+        DeltaNetSnapshot::new_for(gpu, target_dn),
+        "DeltaNetSnapshot::new_for",
+        verify_scratch,
+        hidden_rb,
+        draft_scratch,
+    );
+    let gdn_tape = or_free!(
+        GdnTape::new_for_config(gpu, target_config, max_n),
+        "GdnTape::new_for_config",
+        target_snap,
+        verify_scratch,
+        hidden_rb,
+        draft_scratch,
+    );
+    let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
+    let ddtree = if ddtree_budget > 0 {
+        let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
+        let post_seed_snap = or_free!(
+            DeltaNetSnapshot::new_for(gpu, target_dn),
+            "",
+            gdn_tape,
+            target_snap,
+            verify_scratch,
+            hidden_rb,
+            draft_scratch,
+        );
+        let scratch = or_free!(
+            DdtreeScratch::new(gpu, ddtree_budget),
+            "DdtreeScratch::new",
+            post_seed_snap,
+            gdn_tape,
+            target_snap,
+            verify_scratch,
+            hidden_rb,
+            draft_scratch,
+        );
+        Some(DdtreeState {
+            post_seed_snap,
+            scratch,
+            budget: ddtree_budget,
+            topk,
+        })
+    } else {
+        None
+    };
+    Ok(DflashRuntimeAlloc {
+        draft_scratch,
+        hidden_rb,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        target_hidden_host,
+        ddtree,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,
@@ -263,7 +443,7 @@ pub fn load_dflash_state(
         }
         (w, _) => w,
     };
-    let ctx_capacity = match window {
+    let mut ctx_capacity = match window {
         Some(w) => w,
         None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
             .ok()
@@ -295,6 +475,8 @@ pub fn load_dflash_state(
     // Every step below owns GPU memory the later ones need. A bare `?` drops
     // those without freeing (no `Drop` on the GPU-owning types), so a failed
     // DFlash load stays resident and the AR fallback it announces then OOMs.
+    // `or_free` returns the buffers to the GpuPool; the OOM-retry / loader
+    // paths call `drain_pool` so hipFree actually returns VRAM.
     macro_rules! or_free {
         ($e:expr, $ctx:expr $(, $owned:expr)* $(,)?) => {
             match $e {
@@ -335,40 +517,6 @@ pub fn load_dflash_state(
         ddtree_budget = 0;
     }
     let max_n = (block_size + 1).max(ddtree_budget + 1);
-    // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
-    // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
-    // refactor regressed this to the `with_mq=false` `::new` constructor →
-    // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
-    let draft_scratch = or_free!(
-        match window {
-            Some(w) => DflashScratch::new_windowed(
-                gpu,
-                &draft_config,
-                block_size,
-                w,
-                // w_full UNBOUNDED: the last (full-attention) layer's ring spans
-                // the whole supported context, matching the artifact's
-                // `layer_types: [sliding x(n-1), full_attention]` semantics — the
-                // NInfer reference keeps one layer genuinely unbounded. The prior
-                // `requested_ctx.min(4 * w)` made the "full" layer a 4W-window
-                // (8192 rows at W=2048), so past 8K NO layer had full reach.
-                // Ring VRAM scales with requested_ctx (~270 MB at 32K rows,
-                // kvd=1024, f32 — see DflashScratch::new_windowed docs).
-                requested_ctx,
-                requested_ctx,
-                draft_weights.has_mq,
-            ),
-            None => DflashScratch::new_with_mq(
-                gpu,
-                &draft_config,
-                block_size,
-                ctx_capacity,
-                draft_weights.has_mq,
-            ),
-        },
-        "",
-        draft_weights,
-    );
     let _ = draft_hfq;
     // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
     // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
@@ -379,106 +527,63 @@ pub fn load_dflash_state(
     // copy on any prompt longer than block_size+1 tokens. Size it to the
     // larger of the two so both paths fit.
     let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
-    let hidden_rb = or_free!(
-        HiddenStateRingBuffer::new(
+    loop {
+        match alloc_dflash_runtime(
             gpu,
-            target_config.n_layers,
-            draft_config.num_extract(),
-            target_config.dim,
-            ctx_capacity,
-            staging_max_batch,
-        ),
-        "HiddenStateRingBuffer::new",
-        draft_scratch,
-        draft_weights,
-    );
-    let hidden_k = target_config.dim.next_power_of_two();
-    let verify_scratch = or_free!(
-        VerifyScratch::with_prefill(
-            gpu,
+            &draft_config,
+            draft_weights.has_mq,
+            block_size,
             max_n,
-            target_config.dim,
-            target_config.vocab_size,
-            hidden_k,
+            staging_max_batch,
+            ctx_capacity,
+            window,
+            requested_ctx,
             target_config,
-        ),
-        "VerifyScratch::with_prefill",
-        hidden_rb,
-        draft_scratch,
-        draft_weights,
-    );
-    let target_snap = or_free!(
-        DeltaNetSnapshot::new_for(gpu, target_dn),
-        "DeltaNetSnapshot::new_for",
-        verify_scratch,
-        hidden_rb,
-        draft_scratch,
-        draft_weights,
-    );
-    let gdn_tape = or_free!(
-        GdnTape::new_for_config(gpu, target_config, max_n),
-        "GdnTape::new_for_config",
-        target_snap,
-        verify_scratch,
-        hidden_rb,
-        draft_scratch,
-        draft_weights,
-    );
-    let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
-    // DDTree (budget read once above, used for scratch sizing).
-    let ddtree = if ddtree_budget > 0 {
-        let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
-        let post_seed_snap = or_free!(
-            DeltaNetSnapshot::new_for(gpu, target_dn),
-            "",
-            gdn_tape,
-            target_snap,
-            verify_scratch,
-            hidden_rb,
-            draft_scratch,
-            draft_weights,
-        );
-        let scratch = or_free!(
-            DdtreeScratch::new(gpu, ddtree_budget),
-            "DdtreeScratch::new",
-            post_seed_snap,
-            gdn_tape,
-            target_snap,
-            verify_scratch,
-            hidden_rb,
-            draft_scratch,
-            draft_weights,
-        );
-        Some(DdtreeState {
-            post_seed_snap,
-            scratch,
-            budget: ddtree_budget,
-            topk,
-        })
-    } else {
-        None
-    };
-    Ok(DflashState {
-        draft_config,
-        draft_weights,
-        draft_scratch,
-        hidden_rb,
-        verify_scratch,
-        target_snap,
-        gdn_tape,
-        target_hidden_host,
-        // Windowed mode reports the TARGET's physical capacity: the draft
-        // degrades τ past its window instead of refusing, so the spec
-        // loop's overflow guard and the daemon's capacity fallback track
-        // the true cliff, not the window.
-        ctx_capacity: if window.is_some() {
-            requested_ctx
-        } else {
-            ctx_capacity
-        },
-        block_size,
-        ddtree,
-    })
+            target_dn,
+            ddtree_budget,
+            ddtree_topk_param,
+        ) {
+            Ok(rt) => {
+                return Ok(DflashState {
+                    draft_config,
+                    draft_weights,
+                    draft_scratch: rt.draft_scratch,
+                    hidden_rb: rt.hidden_rb,
+                    verify_scratch: rt.verify_scratch,
+                    target_snap: rt.target_snap,
+                    gdn_tape: rt.gdn_tape,
+                    target_hidden_host: rt.target_hidden_host,
+                    // Windowed mode reports the TARGET's physical capacity: the draft
+                    // degrades τ past its window instead of refusing, so the spec
+                    // loop's overflow guard and the daemon's capacity fallback track
+                    // the true cliff, not the window.
+                    ctx_capacity: if window.is_some() {
+                        requested_ctx
+                    } else {
+                        ctx_capacity
+                    },
+                    block_size,
+                    ddtree: rt.ddtree,
+                });
+            }
+            Err(e) => {
+                gpu.drain_pool();
+                if window.is_none() && is_dflash_vram_oom(&e) {
+                    if let Some(next) = next_legacy_dflash_cap_after_oom(ctx_capacity) {
+                        eprintln!(
+                            "  DFlash draft OOM at {ctx_capacity} rows ({e}); \
+                             retrying Legacy cap {next} rows"
+                        );
+                        ctx_capacity = next;
+                        continue;
+                    }
+                }
+                draft_weights.free_gpu(gpu);
+                gpu.drain_pool();
+                return Err(e);
+            }
+        }
+    }
 }
 
 // ─── DflashSpeculator ───────────────────────────────────────────────────
@@ -1114,5 +1219,31 @@ mod adaptive_block_tests {
             b.observe(1);
         }
         assert_eq!(b.pick(), 8);
+    }
+}
+
+#[cfg(test)]
+mod dflash_oom_backoff_tests {
+    use super::{
+        is_dflash_vram_oom, next_legacy_dflash_cap_after_oom, DEFAULT_DFLASH_CTX_CAP,
+    };
+
+    #[test]
+    fn halves_until_default_floor() {
+        assert_eq!(next_legacy_dflash_cap_after_oom(65536), Some(32768));
+        assert_eq!(next_legacy_dflash_cap_after_oom(32768), Some(16384));
+        assert_eq!(next_legacy_dflash_cap_after_oom(16384), Some(8192));
+        assert_eq!(next_legacy_dflash_cap_after_oom(DEFAULT_DFLASH_CTX_CAP), None);
+        assert_eq!(next_legacy_dflash_cap_after_oom(9000), Some(8192));
+    }
+
+    #[test]
+    fn detects_hip_oom_display() {
+        assert!(is_dflash_vram_oom(
+            "HiddenStateRingBuffer::new: HipError(2): hipMalloc: out of memory"
+        ));
+        assert!(!is_dflash_vram_oom(
+            "draft: failed to parse DflashConfig from HFQ metadata"
+        ));
     }
 }

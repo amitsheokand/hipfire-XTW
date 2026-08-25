@@ -1621,11 +1621,32 @@ impl HiddenStateRingBuffer {
         let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
         let mut layer_bufs = Vec::with_capacity(num_extract);
         let mut staging_bufs = Vec::with_capacity(num_extract);
+        // GpuTensor has no Drop that hipFree's. A mid-loop `?` would leak
+        // already-allocated extract planes (≈1.25 GiB/layer at 64K × 5120 f32)
+        // and the AR fallback would sit on that VRAM plus pooled scratch.
+        let unwind = |gpu: &mut Gpu, layers: Vec<_>, staging: Vec<_>| {
+            for t in layers {
+                let _ = gpu.release_tensor_immediate(t);
+            }
+            for t in staging {
+                let _ = gpu.release_tensor_immediate(t);
+            }
+        };
         for _ in 0..num_extract {
-            layer_bufs
-                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
-            staging_bufs
-                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
+            match gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32) {
+                Ok(t) => layer_bufs.push(t),
+                Err(e) => {
+                    unwind(gpu, layer_bufs, staging_bufs);
+                    return Err(e);
+                }
+            }
+            match gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32) {
+                Ok(t) => staging_bufs.push(t),
+                Err(e) => {
+                    unwind(gpu, layer_bufs, staging_bufs);
+                    return Err(e);
+                }
+            }
         }
         Ok(Self {
             layer_bufs,
