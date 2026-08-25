@@ -17,6 +17,10 @@
 //! speculative decode serializes draft-generate then target-verify).
 
 use crate::carrier::Qwen35Bundle;
+use crate::dflash_verify_pm4::{
+    fingerprint_u64, DflashVerifyBinding, DflashVerifyPm4, DflashVerifyPm4Phase, DflashVerifyRoute,
+    DflashVerifyWindow,
+};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -197,12 +201,50 @@ fn dflash_moe_draft_ffn_graph_eligible(
         && dflash_moe_verify_graph_lmhead_enabled_from_env_value(env_value)
 }
 
+/// Whether `HIPFIRE_VERIFY_GRAPH` admits the HipGraph verify route for this
+/// (arch, target lm_head dtype) pair.
+///
+/// `dc105ea64` newly admitted MQ2/3/4/5/6G256V2 to gfx1100 batched WMMA, and
+/// `verify_graph_ok` shares that eligibility via `prefill_batch_pbs_eligible`.
+/// Graph-off direct and forced-blob direct full-model V2 fixtures pass on
+/// gfx1100, but two graph-on V2 campaigns lost the endpoint. This is a
+/// default-off graph capability quarantine for exact gfx1100 + V2 only;
+/// direct batched WMMA remains on. `HIPFIRE_VERIFY_GRAPH=1` opts back in
+/// diagnostically; `=0` force-offs everywhere; gfx1151/gfx12 and non-V2
+/// gfx1100 stay default-on.
+fn dflash_verify_graph_env_eligible(
+    arch: &str,
+    output_dtype: rdna_compute::DType,
+    env_value: Option<&str>,
+) -> bool {
+    if env_value == Some("0") {
+        return false;
+    }
+    let is_mq_v2 = matches!(
+        output_dtype,
+        rdna_compute::DType::MQ4G256V2
+            | rdna_compute::DType::MQ6G256V2
+            | rdna_compute::DType::MQ5G256V2
+            | rdna_compute::DType::MQ3G256V2
+            | rdna_compute::DType::MQ2G256V2
+    );
+    if arch == "gfx1100" && is_mq_v2 {
+        return env_value == Some("1");
+    }
+    true
+}
+
 fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
     matches!(
         dtype,
         rdna_compute::DType::Q8_0
             | rdna_compute::DType::HFQ4G256
             | rdna_compute::DType::MQ4G256
+            | rdna_compute::DType::MQ4G256V2
+            | rdna_compute::DType::MQ6G256V2
+            | rdna_compute::DType::MQ5G256V2
+            | rdna_compute::DType::MQ3G256V2
+            | rdna_compute::DType::MQ2G256V2
             | rdna_compute::DType::MQ3G256
             | rdna_compute::DType::HFQ6G256
             | rdna_compute::DType::MQ6G256
@@ -249,6 +291,96 @@ fn dflash_enqueue_verify_lm_head(
                 hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
                 &w_out.buf,
                 w_out.gpu_dtype,
+                &rot,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        rdna_compute::DType::MQ4G256V2 => {
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ4 v2 lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.gemm_mq4g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        rdna_compute::DType::MQ6G256V2 => {
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ6V2 lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.gemm_mq6g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        rdna_compute::DType::MQ5G256V2 => {
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ5V2 lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.gemm_mq5g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        rdna_compute::DType::MQ3G256V2 => {
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ3V2 lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.gemm_mq3g256v2_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        rdna_compute::DType::MQ2G256V2 => {
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ2V2 lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.gemm_mq2g256v2_batched_lmhead(
+                &w_out.buf,
                 &rot,
                 &logits_batch,
                 w_out.m,
@@ -349,6 +481,128 @@ fn dflash_download_verify_argmax(
         gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
     }
     Ok(host_idx.into_iter().map(|idx| idx as u32).collect())
+}
+
+/// Fold a DFlash2 candidate-selector proposal into the chain draft buffers.
+///
+/// Greedy: tokens only — no full-vocab D2H. Temperature: each sparse q row
+/// is materialized into a dense `draft_softmaxes` vector (zeros outside the
+/// candidate set) and `draft_probs_at_drafted` is taken from
+/// `selected_probabilities`, so the existing host rejection/residual path
+/// stays mathematically exact. Request top_p/top_k is NOT applied to this q.
+/// `proposal.probabilities` is the flattened normalized selector q over every
+/// top-K candidate row when temperature>0 (not raw unary logits); greedy may
+/// return `None` probabilities.
+fn apply_dflash2_selector_proposal(
+    proposal: dflash::DflashCandidateProposal,
+    vocab: usize,
+    use_temp_sampling: bool,
+    drafted: &mut Vec<u32>,
+    draft_softmaxes: &mut Vec<Vec<f32>>,
+    draft_probs_at_drafted: &mut Vec<f32>,
+) -> HipResult<()> {
+    let rows = proposal.tokens.len();
+    let top_k = proposal.top_k;
+    // Flattened length guards — silently dropping tail masses would make the
+    // sparse residual subtract an incomplete q and corrupt the bonus distribution.
+    if proposal.candidates.len() != rows * top_k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "selector proposal candidates len {} != rows {} * top_k {}",
+                proposal.candidates.len(),
+                rows,
+                top_k
+            ),
+        ));
+    }
+    if use_temp_sampling {
+        let probs = proposal.probabilities.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "selector proposal missing probabilities for temp>0")
+        })?;
+        if probs.len() != rows * top_k {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "selector proposal probabilities len {} != rows {} * top_k {}",
+                    probs.len(),
+                    rows,
+                    top_k
+                ),
+            ));
+        }
+        let sel = proposal.selected_probabilities.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "selector proposal missing selected_probabilities for temp>0",
+            )
+        })?;
+        if sel.len() != rows {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "selector proposal selected_probabilities len {} != rows {}",
+                    sel.len(),
+                    rows
+                ),
+            ));
+        }
+        drafted.extend_from_slice(&proposal.tokens);
+        draft_softmaxes.reserve(rows);
+        draft_probs_at_drafted.reserve(rows);
+        for i in 0..rows {
+            let mut row = vec![0f32; vocab];
+            let off = i * top_k;
+            for j in 0..top_k {
+                let cand = proposal.candidates[off + j] as usize;
+                let q = probs[off + j];
+                if cand < vocab {
+                    row[cand] = q;
+                } else {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("selector candidate id {} out of vocab {}", cand, vocab),
+                    ));
+                }
+            }
+            draft_softmaxes.push(row);
+            draft_probs_at_drafted.push(sel[i]);
+        }
+        Ok(())
+    } else {
+        // Greedy: no q materialization, but still validate candidate shape and
+        // that probabilities is None (or absent); selected may be present as 1.0.
+        if proposal.probabilities.is_some() {
+            // Greedy may return None probabilities per contract; if Some, still
+            // require correct shape but do not materialize.
+            let probs = proposal.probabilities.as_ref().unwrap();
+            if probs.len() != rows * top_k {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "selector proposal greedy probabilities len {} != rows {} * top_k {}",
+                        probs.len(),
+                        rows,
+                        top_k
+                    ),
+                ));
+            }
+        }
+        if let Some(sel) = &proposal.selected_probabilities {
+            if sel.len() != rows {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "selector proposal greedy selected_probabilities len {} != rows {}",
+                        sel.len(),
+                        rows
+                    ),
+                ));
+            }
+        }
+        drafted.extend_from_slice(&proposal.tokens);
+        Ok(())
+    }
 }
 
 /// Task #93 Phase B seed-prediction oracle counters.
@@ -1500,10 +1754,6 @@ pub struct VerifyScratch {
     pub rot: GpuTensor,
     /// Argmax output for greedy path, [max_n] f32 (treated as i32 host-side).
     pub argmax: GpuTensor,
-    /// DFlash 2 selector top-k ids, `[max_n * DFLASH2_GPU_TOPK_CAP]` i32 overlay.
-    pub topk_ids: GpuTensor,
-    /// DFlash 2 selector top-k values, `[max_n * DFLASH2_GPU_TOPK_CAP]` F32.
-    pub topk_vals: GpuTensor,
     /// Persistent per-layer batch scratch for `qwen35::forward_prefill_batch`.
     /// Sized to `max_n`, so `verify_dflash_block` processes each block in a
     /// single chunk without the ~25 hipMalloc/hipFree pairs the in-function
@@ -1531,14 +1781,6 @@ impl VerifyScratch {
             logits: gpu.alloc_tensor(&[max_n * vocab], rdna_compute::DType::F32)?,
             rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
-            topk_ids: gpu.alloc_tensor(
-                &[max_n * dflash::DFLASH2_GPU_TOPK_CAP],
-                rdna_compute::DType::F32,
-            )?,
-            topk_vals: gpu.alloc_tensor(
-                &[max_n * dflash::DFLASH2_GPU_TOPK_CAP],
-                rdna_compute::DType::F32,
-            )?,
             prefill_batch: None,
         })
     }
@@ -1566,8 +1808,6 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.rot);
         let _ = gpu.free_tensor(self.argmax);
-        let _ = gpu.free_tensor(self.topk_ids);
-        let _ = gpu.free_tensor(self.topk_vals);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
@@ -1606,19 +1846,19 @@ impl HiddenStateRingBuffer {
         (start_slot + r.saturating_sub(r_skip)) % self.max_positions
     }
 
-    /// Allocate GPU ring buffer for `num_extract` target layers.
+    /// Allocate GPU ring buffer for explicit extraction layer list.
     ///
-    /// `max_batch` sizes the staging buffers used by the graph-capture path.
-    /// Typical value for DFlash verify is `budget + 1`.
-    pub fn new(
+    /// `extract_layers` must be in ascending order; validation of range is the
+    /// caller's responsibility ( `load_dflash_state` checks against
+    /// `num_target_layers` ).
+    pub fn new_for_layers(
         gpu: &mut Gpu,
-        num_target_layers: usize,
-        num_extract: usize,
+        extract_layers: &[usize],
         hidden_dim: usize,
         max_positions: usize,
         max_batch: usize,
     ) -> HipResult<Self> {
-        let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
+        let num_extract = extract_layers.len();
         let mut layer_bufs = Vec::with_capacity(num_extract);
         let mut staging_bufs = Vec::with_capacity(num_extract);
         // GpuTensor has no Drop that hipFree's. A mid-loop `?` would leak
@@ -1650,7 +1890,7 @@ impl HiddenStateRingBuffer {
         }
         Ok(Self {
             layer_bufs,
-            extract_layers,
+            extract_layers: extract_layers.to_vec(),
             max_positions,
             hidden_dim,
             head: 0,
@@ -1658,6 +1898,22 @@ impl HiddenStateRingBuffer {
             staging_bufs,
             max_batch,
         })
+    }
+
+    /// Allocate GPU ring buffer for `num_extract` target layers.
+    ///
+    /// `max_batch` sizes the staging buffers used by the graph-capture path.
+    /// Typical value for DFlash verify is `budget + 1`.
+    pub fn new(
+        gpu: &mut Gpu,
+        num_target_layers: usize,
+        num_extract: usize,
+        hidden_dim: usize,
+        max_positions: usize,
+        max_batch: usize,
+    ) -> HipResult<Self> {
+        let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
+        Self::new_for_layers(gpu, &extract_layers, hidden_dim, max_positions, max_batch)
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -1981,6 +2237,37 @@ pub(crate) fn apply_host_nucleus(row: &mut [f32], top_p: f32) {
     }
 }
 
+/// Host-side top-k truncation of an ALREADY-normalized softmax row, IN PLACE.
+/// Keeps the `k` highest-probability tokens, zeros the rest, and renormalizes
+/// the kept mass to 1. `k == 0` or `k >= row.len()` is a no-op (identity).
+#[inline]
+pub(crate) fn apply_host_topk(row: &mut [f32], k: usize) {
+    if k == 0 || k >= row.len() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|&a, &b| {
+        row[b]
+            .partial_cmp(&row[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut kept_mass = 0.0f64;
+    for &idx in order.iter().take(k) {
+        kept_mass += row[idx] as f64;
+    }
+    if kept_mass <= 0.0 {
+        return;
+    }
+    let inv = 1.0f64 / kept_mass;
+    for (rank, &idx) in order.iter().enumerate() {
+        if rank < k {
+            row[idx] = (row[idx] as f64 * inv) as f32;
+        } else {
+            row[idx] = 0.0;
+        }
+    }
+}
+
 /// Draw a categorical sample from `probs` given uniform u ∈ [0, 1).
 #[inline]
 pub(crate) fn sample_categorical(probs: &[f32], u: f32) -> u32 {
@@ -2263,6 +2550,7 @@ pub fn verify_dflash_block(
         None,
         verify_scratch,
         false, // chain path always needs argmax
+        None,  // no retained-PM4 route on the generic wrapper
     )
 }
 
@@ -2305,6 +2593,7 @@ pub fn verify_dflash_block_tree(
         Some(tree_verify),
         verify_scratch,
         skip_argmax_d2h,
+        None, // tree verify never takes the retained-PM4 route
     )
 }
 
@@ -2321,6 +2610,10 @@ fn verify_dflash_block_inner(
     // D9: skip the big_n × 4 argmax D2H when the caller will use SWOR walk
     // (which gets accepted indices from the 68-byte walk-result D2H instead).
     skip_argmax_d2h: bool,
+    // Retained-PM4 route for this window, or `None` for the shipping path.
+    // Only `verify_dflash_block_retained` ever passes `Some`, and only for the
+    // fixed B=16 chain verify.
+    mut retained: Option<&mut RetainedCtx<'_>>,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -2368,8 +2661,13 @@ fn verify_dflash_block_inner(
     // hidden_rb staging dest) are read from device buffers whose *contents*
     // change between replays — the captured graph reads the current bytes.
     //
-    // Eligibility is narrow: HFQ4G256 embedding (uploads via pbs.tokens),
-    // no tree_verify (its attn_bias+positions are per-cycle), pbs is Some.
+    // Eligibility is narrow: HFQ4G256/Q8_0 embedding (uploads via pbs.tokens),
+    // tree_ok_for_graph, pbs is Some, and `qwen35::prefill_batch_pbs_eligible`
+    // (shared with the forward / spec_step tape gate). When that shared
+    // predicate is false — e.g. qt44/qt45 on non-gfx12 — skip capture entirely
+    // and take the direct `forward_prefill_batch_with_pbs_opts` route, which
+    // performs the correct per-token fallback instead of erroring inside
+    // `forward_prefill_batch_single_chunk_captured_opts`.
     // `gdn_tape` is safe because verify is single-chunk → tape_offset=0 always
     // → captured node's dst offset is correct across cycles.
     //
@@ -2417,21 +2715,36 @@ fn verify_dflash_block_inner(
     // is no malloc-in-capture and no per-ctx LDS scaling — see the comment in
     // forward_prefill_batch_single_chunk_captured in qwen35.rs. The former
     // `VERIFY_GRAPH_Q8_CTX_LIMIT = 15000` skip (re-introduced by #481, obsolete once
-    // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated.
-    // The flash *grid* still follows live context (not physical_cap) and the
-    // cache recaptures when that tile count grows; baking max_tiles at 32k
-    // was the DFlash graph-on tax (37.2 vs 40.9 nograph).
-    let verify_graph_ok = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH")
-        .ok()
-        .as_deref()
-        != Some("0")
-        && tree_ok_for_graph
-        && matches!(
+    // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
+    // would skip a verify-graph that now replays fine and forfeit the long-context
+    // spec speedup.
+    let moe_router_logits_present = verify_scratch
+        .prefill_batch
+        .as_ref()
+        .map(|pbs| pbs.moe_router_logits_batch.is_some())
+        .unwrap_or(true);
+    let pbs_eligible = qwen35::prefill_batch_pbs_eligible(
+        &target.weights,
+        &target.config,
+        &target.dn_state,
+        b,
+        gpu.arch.as_str(),
+        moe_router_logits_present,
+    );
+    // See `dflash_verify_graph_env_eligible`: gfx1100 + MQ*V2 lm_head is
+    // default-off for HipGraph only (dc105ea64 newly made V2 graph-eligible).
+    let verify_graph_env = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok();
+    let verify_graph_ok = dflash_verify_graph_env_eligible(
+        gpu.arch.as_str(),
+        target.weights.output.gpu_dtype,
+        verify_graph_env.as_deref(),
+    ) && tree_ok_for_graph        && matches!(
             target.weights.embd_format,
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
                 | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
         )
-        && verify_scratch.prefill_batch.is_some();
+        && verify_scratch.prefill_batch.is_some()
+        && pbs_eligible;
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
@@ -2450,7 +2763,31 @@ fn verify_dflash_block_inner(
     };
     let mut graph_includes_lmhead_argmax = false;
 
-    let batch_result = if verify_graph_ok {
+    // Retained-PM4 route. When the caller handed us a live route for this
+    // window it owns the forward outright, and the HipGraph selection below is
+    // skipped so the tape never records a graph launch.
+    let retained_selected = retained
+        .as_ref()
+        .map(|ctx| ctx.selected)
+        .unwrap_or(DflashVerifyRoute::HipAuto);
+    let retained_active = !matches!(retained_selected, DflashVerifyRoute::HipAuto);
+    let batch_result = if retained_active {
+        vg_mode = "retained";
+        let ctx = retained
+            .as_mut()
+            .expect("retained_active implies a retained context");
+        run_retained_verify_forward(
+            gpu,
+            target,
+            draft_tokens,
+            start_pos,
+            hidden_rb,
+            &final_hidden,
+            gdn_tape,
+            verify_scratch,
+            ctx,
+        )
+    } else if verify_graph_ok {
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
         debug_assert!(b <= pbs.max_batch);
         // Pre-capture: pre-upload inputs and ensure a stream exists. memcpy_htod
@@ -2494,7 +2831,12 @@ fn verify_dflash_block_inner(
             // outside any captured region. Capturing a JIT + scratch-malloc
             // hits "hipMalloc not permitted under stream capture" the first
             // time any kernel is compiled inline. One warmup per distinct b.
-            gpu.graphs.verify_mark_warmup_done(b);
+            //
+            // A successful launch sequence is not yet a successful warmup:
+            // launches are asynchronous. Synchronize the active stream before
+            // admitting this B into the capture branch. Otherwise an async
+            // kernel fault can leave `warmed_up` set and make the next call
+            // capture a path whose warmup never completed.
             let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
                 &target.weights,
@@ -2511,13 +2853,19 @@ fn verify_dflash_block_inner(
                 tree_verify,
                 false, // DFlash computes all verify logits from final_hidden below
             );
-            if r.is_ok() {
+            r.and_then(|_| {
+                gpu.hip.stream_synchronize(
+                    gpu.active_stream
+                        .as_ref()
+                        .expect("verify warmup requires an active stream"),
+                )?;
+                gpu.graphs.verify_mark_warmup_done(b);
                 eprintln!(
                     "[verify-graph] warmup for B={} complete — capture next cycle at this B",
                     b
                 );
-            }
-            r
+                Ok(())
+            })
         } else {
             vg_mode = "capture";
             // Capture path: first call at this B after warmup.
@@ -2569,8 +2917,7 @@ fn verify_dflash_block_inner(
                 if capture_lmhead_argmax {
                     gpu.graphs.verify_mark_graph_lmhead_argmax(b);
                     graph_includes_lmhead_argmax = true;
-                }
-                // Under `hipStreamBeginCapture`, kernels + memcpys on the
+                }                // Under `hipStreamBeginCapture`, kernels + memcpys on the
                 // captured stream are RECORDED, not executed. final_hidden
                 // and hidden_rb staging are left stale. Launching the graph
                 // once here makes this cycle's forward actually run so lm_head
@@ -2578,12 +2925,33 @@ fn verify_dflash_block_inner(
                 // HIP version does execute during capture) is washed out by
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
-                gpu.graphs.verify_graph_launch(
-                    &gpu.hip,
-                    gpu.device_id,
-                    gpu.active_stream.as_ref().unwrap(),
-                    b,
-                )?;
+                //
+                // The launch is asynchronous. Complete this one-time first
+                // execution before admitting the graph into the replay cache:
+                // if execution fails, destroy every per-B entry so a retry
+                // cannot enqueue the failed graph (or another graph recorded
+                // against the now-faulted stream state).
+                let first_launch = gpu
+                    .graphs
+                    .verify_graph_launch(
+                        &gpu.hip,
+                        gpu.device_id,
+                        gpu.active_stream.as_ref().unwrap(),
+                        b,
+                    )
+                    .and_then(|_| {
+                        gpu.hip
+                            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+                    });
+                if let Err(err) = first_launch {
+                    gpu.graphs
+                        .verify_graph_destroy_all(&gpu.hip, gpu.device_id);
+                    return Err(err);
+                }
+                if capture_lmhead_argmax {
+                    gpu.graphs.verify_mark_graph_lmhead_argmax(b);
+                    graph_includes_lmhead_argmax = true;
+                }
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
                     b,
@@ -2627,7 +2995,9 @@ fn verify_dflash_block_inner(
     // those rows at the current head and advances head by b. Under the
     // graph path we manually drive this because the non-graph chunk loop
     // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
-    if verify_graph_ok && batch_result.is_ok() {
+    // The retained route runs the same capture-safe single-chunk body as the
+    // graph path, so it owes the same one external staging commit.
+    if (retained_active || verify_graph_ok) && batch_result.is_ok() {
         hidden_rb.commit_staging_to_ring(gpu, b)?;
     }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
@@ -2742,6 +3112,437 @@ fn verify_dflash_block_inner(
         argmax_per_pos,
         logits_per_pos,
     })
+}
+
+/// Retained-PM4 execution context for one DFlash verify window.
+///
+/// Built by [`verify_dflash_block_retained`] and threaded into
+/// [`verify_dflash_block_inner`], which owns the forward. `selected` is the
+/// route [`DflashVerifyPm4::plan_route`] chose for this window;
+/// [`DflashVerifyRoute::HipAuto`] means the retained machinery stands down and
+/// the shipping path runs unchanged.
+struct RetainedCtx<'a> {
+    state: &'a mut DflashVerifyPm4,
+    binding: DflashVerifyBinding,
+    selected: DflashVerifyRoute,
+}
+
+/// Why a recording capture stopped short.
+///
+/// The distinction is the whole safety argument: `Forward` means the model body
+/// itself failed and there is no valid result for this cycle, while the other
+/// three happen after a synchronized successful body and therefore only cost us
+/// the route.
+enum CaptureFailure {
+    Forward(hip_bridge::HipError),
+    Record(String),
+    Contract(String),
+    Prepare(String),
+}
+
+/// How far a successful recording window got.
+///
+/// The first recording only calibrates: a prepared route may retain a scalar
+/// kernarg solely when a second recording at a different position proves the
+/// scalar tracks the position.
+enum CaptureStep {
+    Calibrated(rdna_compute::replay::RecordedKernargSnapshot),
+    Ready {
+        identity: rdna_compute::replay::PreparedReplayIdentity,
+        position_bindings: usize,
+    },
+}
+
+fn retained_hip_error(reason: &str) -> hip_bridge::HipError {
+    hip_bridge::HipError::new(0, reason)
+}
+
+/// Fingerprint every shape, dtype, extraction id, and captured allocation base
+/// the retained tape depends on. Bases and shapes only — never buffer contents,
+/// which change every cycle by design.
+fn dflash_verify_fingerprint(
+    target: &ModelSlot,
+    hidden_rb: &HiddenStateRingBuffer,
+    verify_scratch: &VerifyScratch,
+    gdn_tape: Option<&GdnTape>,
+) -> u64 {
+    let mut values: Vec<u64> = Vec::new();
+    values.push(target.config.dim as u64);
+    values.push(target.config.n_layers as u64);
+    values.push(target.config.vocab_size as u64);
+    values.push(target.weights.output.gpu_dtype as u64);
+    values.push(verify_scratch.max_n as u64);
+    values.push(verify_scratch.dim as u64);
+    values.push(verify_scratch.vocab as u64);
+    values.push(verify_scratch.hidden_k as u64);
+    values.push(verify_scratch.final_hidden.buf.as_ptr() as u64);
+    values.push(verify_scratch.logits.buf.as_ptr() as u64);
+    values.push(verify_scratch.rot.buf.as_ptr() as u64);
+    values.push(verify_scratch.argmax.buf.as_ptr() as u64);
+    if let Some(pbs) = verify_scratch.prefill_batch.as_ref() {
+        values.push(pbs.max_batch as u64);
+        values.push(pbs.x_batch.buf.as_ptr() as u64);
+        values.push(pbs.rope_positions.buf.as_ptr() as u64);
+    }
+    values.push(hidden_rb.max_positions as u64);
+    values.push(hidden_rb.hidden_dim as u64);
+    values.push(hidden_rb.max_batch as u64);
+    for &layer_id in &hidden_rb.extract_layers {
+        values.push(layer_id as u64);
+    }
+    // Only the staging buffers are captured. `layer_bufs` are written by the
+    // head-dependent commit, which stays outside the tape.
+    for staging in &hidden_rb.staging_bufs {
+        values.push(staging.buf.as_ptr() as u64);
+    }
+    for s_matrix in &target.dn_state.s_matrices {
+        values.push(s_matrix.buf.as_ptr() as u64);
+    }
+    if let Some(tape) = gdn_tape {
+        values.push(tape.max_n as u64);
+        values.push(tape.qkv_dim as u64);
+        values.push(tape.v_dim as u64);
+        for buf in tape
+            .qkv_bufs
+            .iter()
+            .chain(tape.alpha_bufs.iter())
+            .chain(tape.beta_bufs.iter())
+        {
+            values.push(buf.buf.as_ptr() as u64);
+        }
+    }
+    fingerprint_u64(&values)
+}
+
+/// Build the admission binding for the current window.
+///
+/// `max_position` is the smaller of the hidden ring capacity and the KV
+/// physical capacity: a window past it re-primes rather than replaying dynamic
+/// geometry that was prepared too small.
+fn build_dflash_verify_binding(
+    b: usize,
+    arch: &str,
+    target: &ModelSlot,
+    hidden_rb: &HiddenStateRingBuffer,
+    verify_scratch: &VerifyScratch,
+    gdn_tape: Option<&GdnTape>,
+) -> DflashVerifyBinding {
+    let fingerprint = dflash_verify_fingerprint(target, hidden_rb, verify_scratch, gdn_tape);
+    // The layout generation moves whenever the KV slab is remapped or resized.
+    // Expected VMM growth may keep the same reserved base, so capacity is
+    // folded in alongside every per-layer allocation base.
+    let kv = &target.kv_cache;
+    let mut layout: Vec<u64> = Vec::with_capacity(2 + kv.k_gpu.len() * 2);
+    layout.push(kv.physical_cap as u64);
+    layout.push(kv.max_seq as u64);
+    for (k, v) in kv.k_gpu.iter().zip(kv.v_gpu.iter()) {
+        layout.push(k.buf.as_ptr() as u64);
+        layout.push(v.buf.as_ptr() as u64);
+    }
+    let layout_generation = fingerprint_u64(&layout);
+    DflashVerifyBinding::new(
+        b,
+        arch,
+        fingerprint,
+        layout_generation,
+        hidden_rb.max_positions.min(kv.physical_cap),
+    )
+}
+
+/// The capture-safe single-chunk body, run directly with no graph and no
+/// recording. Shared by every retained route so the recorded body and the
+/// fallback body are literally the same call.
+#[allow(clippy::too_many_arguments)]
+fn dflash_direct_verify_forward(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    final_hidden: &GpuTensor,
+    gdn_tape: Option<&mut GdnTape>,
+    pbs: &qwen35::PrefillBatchScratch,
+) -> HipResult<()> {
+    qwen35::forward_prefill_batch_single_chunk_captured_opts(
+        gpu,
+        &target.weights,
+        &target.config,
+        draft_tokens,
+        start_pos,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        pbs,
+        Some(hidden_rb),
+        Some(final_hidden),
+        gdn_tape,
+        None,
+        false, // DFlash computes all verify logits from final_hidden
+    )
+}
+
+/// Execute one retained-route verify window and report the outcome to the
+/// route state machine.
+///
+/// Host token/position upload happens here, before any recording, and never
+/// enters the indirect buffer. lm-head, argmax, accept, and the staging commit
+/// all stay with the caller.
+#[allow(clippy::too_many_arguments)]
+fn run_retained_verify_forward(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    final_hidden: &GpuTensor,
+    gdn_tape: Option<&mut GdnTape>,
+    verify_scratch: &VerifyScratch,
+    ctx: &mut RetainedCtx<'_>,
+) -> HipResult<()> {
+    let pbs = verify_scratch.prefill_batch.as_ref().ok_or_else(|| {
+        retained_hip_error("retained DFlash verify requires a persistent PrefillBatchScratch")
+    })?;
+    qwen35::upload_prefill_batch_inputs(gpu, pbs, draft_tokens, start_pos)?;
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
+    match ctx.selected {
+        DflashVerifyRoute::HipAuto => Err(retained_hip_error(
+            "run_retained_verify_forward called for a HipAuto window",
+        )),
+        DflashVerifyRoute::PrimeDirect => {
+            let result = dflash_direct_verify_forward(
+                gpu,
+                target,
+                draft_tokens,
+                start_pos,
+                hidden_rb,
+                final_hidden,
+                gdn_tape,
+                pbs,
+            );
+            if result.is_ok() {
+                ctx.state.note_prime_success(ctx.binding.clone());
+            }
+            result
+        }
+        DflashVerifyRoute::CaptureRecord => {
+            let max_position = ctx.binding.max_position;
+            swap_retained_controller(gpu, ctx.state)?;
+            let began = gpu.replay.begin_capture();
+            if let Err(reason) = began {
+                // Nothing was recorded and nothing ran: restore the ordinary
+                // controller and produce this cycle's result on direct HIP.
+                swap_retained_controller(gpu, ctx.state)?;
+                ctx.state
+                    .poison(format!("DFlash retained begin capture: {reason}"));
+                return dflash_direct_verify_forward(
+                    gpu,
+                    target,
+                    draft_tokens,
+                    start_pos,
+                    hidden_rb,
+                    final_hidden,
+                    gdn_tape,
+                    pbs,
+                );
+            }
+            // A prepared route may only retain a kernarg scalar that provably
+            // tracks the decode position, and one recording cannot prove that.
+            // The first eligible window records a calibration tape; the next one
+            // at a different position differences against it.
+            let earlier = ctx
+                .state
+                .calibration()
+                .map(|(snapshot, at)| (snapshot.clone(), at));
+            let outcome = (|| -> Result<CaptureStep, CaptureFailure> {
+                dflash_direct_verify_forward(
+                    gpu,
+                    target,
+                    draft_tokens,
+                    start_pos,
+                    hidden_rb,
+                    final_hidden,
+                    gdn_tape,
+                    pbs,
+                )
+                .map_err(CaptureFailure::Forward)?;
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(CaptureFailure::Forward)?;
+                gpu.replay.finish_capture().map_err(|reason| {
+                    CaptureFailure::Record(format!("finish capture: {reason}"))
+                })?;
+                let Some((earlier_snapshot, earlier_position)) = earlier else {
+                    return Ok(CaptureStep::Calibrated(
+                        gpu.replay.snapshot_recorded_kernargs(),
+                    ));
+                };
+                if start_pos <= earlier_position {
+                    // Differencing needs a strictly later position; keep the
+                    // fresher recording and wait for generation to advance.
+                    return Ok(CaptureStep::Calibrated(
+                        gpu.replay.snapshot_recorded_kernargs(),
+                    ));
+                }
+                let position_bindings = gpu
+                    .replay
+                    .synthesize_position_bindings(&earlier_snapshot, earlier_position, start_pos)
+                    .map_err(|reason| {
+                        CaptureFailure::Contract(format!("position binding synthesis: {reason}"))
+                    })?;
+                let launches = gpu.replay.recorded_launches().len();
+                gpu.replay
+                    .probe_aql_contracts(gpu.device_id as usize)
+                    .map_err(|reason| {
+                        CaptureFailure::Contract(format!("AQL contract probe: {reason}"))
+                    })?;
+                gpu.replay.set_prepared_max_position(max_position);
+                gpu.replay
+                    .prepare_pm4_prefix_calibrated(gpu.device_id as usize, launches)
+                    .map_err(|reason| CaptureFailure::Prepare(format!("PM4 prepare: {reason}")))?;
+                gpu.replay
+                    .prepared_route_identity()
+                    .map(|identity| CaptureStep::Ready {
+                        identity,
+                        position_bindings,
+                    })
+                    .ok_or_else(|| {
+                        CaptureFailure::Prepare(
+                            "prepared PM4 route reported no identity".to_string(),
+                        )
+                    })
+            })();
+            swap_retained_controller(gpu, ctx.state)?;
+            match outcome {
+                Ok(CaptureStep::Calibrated(snapshot)) => {
+                    ctx.state.note_calibration_capture(snapshot, start_pos);
+                    Ok(())
+                }
+                Ok(CaptureStep::Ready {
+                    identity,
+                    position_bindings,
+                }) => {
+                    ctx.state.note_capture();
+                    ctx.state.note_position_bindings(position_bindings);
+                    ctx.state.note_ready(ctx.binding.clone(), identity);
+                    Ok(())
+                }
+                Err(CaptureFailure::Forward(error)) => {
+                    // The body failed mid-capture: KV/DeltaNet/staging may be
+                    // half-written, so there is nothing to salvage here.
+                    ctx.state
+                        .poison(format!("DFlash retained capture body failed: {error:?}"));
+                    Err(error)
+                }
+                Err(CaptureFailure::Record(reason)) => {
+                    ctx.state.poison(reason);
+                    Ok(())
+                }
+                Err(CaptureFailure::Contract(reason)) => {
+                    ctx.state.note_capture();
+                    ctx.state.note_contract_failure(reason);
+                    Ok(())
+                }
+                Err(CaptureFailure::Prepare(reason)) => {
+                    ctx.state.note_capture();
+                    ctx.state.note_prepare_failure(reason);
+                    Ok(())
+                }
+            }
+        }
+        DflashVerifyRoute::Pm4 => {
+            swap_retained_controller(gpu, ctx.state)?;
+            let replayed = unsafe { gpu.replay.replay_pm4_checked(start_pos) };
+            swap_retained_controller(gpu, ctx.state)?;
+            match replayed {
+                Ok(_) => {
+                    ctx.state.note_replay_success(start_pos);
+                    Ok(())
+                }
+                Err(failure) => {
+                    let quiescence = failure.quiescence;
+                    ctx.state
+                        .note_replay_failure(start_pos, quiescence, failure.error.clone());
+                    Err(retained_hip_error(&format!(
+                        "DFlash retained PM4 replay failed at position {start_pos} \
+                         (quiescence {quiescence:?}): {}",
+                        failure.error
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Swap the dedicated retained controller in or out of `gpu.replay`.
+///
+/// The ordinary-AR controller must never record or replay the DFlash tape, and
+/// the DFlash controller must never own the AR route, so the swap is always
+/// paired around exactly the recorded or replayed body.
+fn swap_retained_controller(gpu: &mut Gpu, state: &mut DflashVerifyPm4) -> HipResult<()> {
+    let controller = state.controller_mut().ok_or_else(|| {
+        retained_hip_error("retained DFlash verify route has no dedicated controller")
+    })?;
+    std::mem::swap(&mut gpu.replay, controller);
+    Ok(())
+}
+
+/// Retained-route entry point for the fixed B=16 DFlash2 chain verify.
+///
+/// Plans the route for this window, then defers to the ordinary
+/// [`verify_dflash_block_inner`] so lm-head, argmax, and the staging commit run
+/// exactly once and in their existing order regardless of which forward ran.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_dflash_block_retained(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    verify_scratch: &VerifyScratch,
+    route: &mut DflashVerifyPm4,
+) -> HipResult<DflashVerifyOutput> {
+    let b = draft_tokens.len();
+    let binding = build_dflash_verify_binding(
+        b,
+        gpu.arch.as_str(),
+        target,
+        hidden_rb,
+        verify_scratch,
+        gdn_tape.as_deref(),
+    );
+    let selected = {
+        let window = DflashVerifyWindow {
+            batch: b,
+            tree: false,
+            want_full_logits,
+            position: start_pos,
+            binding: &binding,
+        };
+        route.plan_route(&window)
+    };
+    let mut ctx = RetainedCtx {
+        state: route,
+        binding,
+        selected,
+    };
+    verify_dflash_block_inner(
+        gpu,
+        target,
+        draft_tokens,
+        start_pos,
+        hidden_rb,
+        gdn_tape,
+        want_full_logits,
+        None,
+        verify_scratch,
+        false,
+        Some(&mut ctx),
+    )
 }
 
 /// Download extracted target hidden states for the most recent B positions
@@ -2923,88 +3724,6 @@ pub fn download_hidden_block(
     Ok(out)
 }
 
-/// DFlash 2 draft tokens from batched lm_head logits.
-///
-/// GPU top-k (k ≤ 16) avoids downloading `[B, vocab]` logits; hidden rows
-/// still come back for the host lattice walk + projection. The three D2H
-/// payloads (ids, values, hidden) enqueue on the active stream and wait once
-/// — same-stream copies still serialize on the copy engine; this collapses
-/// three blocking `hipMemcpy` round-trips into one `hipStreamSynchronize`.
-/// A packed staging buffer is the next experiment if `HIPFIRE_DTOH_DUMP=1`
-/// still shows the selector on the cycle critical path.
-fn dflash2_pick_from_logits_batch(
-    gpu: &mut Gpu,
-    logits_batch: &GpuTensor,
-    draft_scratch: &DflashScratch,
-    verify_scratch: &VerifyScratch,
-    sel: &dflash::Dflash2SelectorWeights,
-    d2: &dflash::Dflash2Config,
-    h: usize,
-    vocab: usize,
-    batch: usize,
-    seed_token: u32,
-) -> HipResult<Vec<u32>> {
-    let hidden_view = draft_scratch.x.sub_offset(h, batch * h);
-    let k = d2.selector_top_k;
-    let cap = verify_scratch.max_n * dflash::DFLASH2_GPU_TOPK_CAP;
-    if (1..=dflash::DFLASH2_GPU_TOPK_CAP).contains(&k) && batch * k <= cap {
-        let n = batch * k;
-        let ids_buf = verify_scratch.topk_ids.sub_offset(0, n);
-        let vals_buf = verify_scratch.topk_vals.sub_offset(0, n);
-        gpu.topk_f32_batched(logits_batch, &ids_buf, &vals_buf, vocab, batch, k)?;
-        let n_hidden = hidden_view.numel();
-        let mut host_ids = vec![0i32; n];
-        let mut host_vals = vec![0.0f32; n];
-        let mut host_hidden = vec![0.0f32; n_hidden];
-        gpu.bind_thread()?;
-        {
-            let ids_bytes: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(host_ids.as_mut_ptr() as *mut u8, n * 4) };
-            let vals_bytes: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(host_vals.as_mut_ptr() as *mut u8, n * 4) };
-            let hidden_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(host_hidden.as_mut_ptr() as *mut u8, n_hidden * 4)
-            };
-            if let Some(stream) = gpu.active_stream.as_ref() {
-                gpu.hip.memcpy_dtoh_async(ids_bytes, &ids_buf.buf, stream)?;
-                gpu.hip
-                    .memcpy_dtoh_async(vals_bytes, &vals_buf.buf, stream)?;
-                gpu.hip
-                    .memcpy_dtoh_async(hidden_bytes, &hidden_view.buf, stream)?;
-                gpu.hip.stream_synchronize(stream)?;
-            } else {
-                gpu.hip.memcpy_dtoh(ids_bytes, &ids_buf.buf)?;
-                gpu.hip.memcpy_dtoh(vals_bytes, &vals_buf.buf)?;
-                gpu.hip.memcpy_dtoh(hidden_bytes, &hidden_view.buf)?;
-            }
-        }
-        let ids: Vec<u32> = host_ids.iter().map(|&x| x as u32).collect();
-        return Ok(dflash::dflash2_greedy_select_from_topk(
-            &ids,
-            &host_vals,
-            &host_hidden,
-            sel,
-            d2,
-            h,
-            vocab,
-            batch,
-            seed_token,
-        ));
-    }
-    let host_logits = gpu.download_f32(logits_batch)?;
-    let host_hidden = gpu.download_f32(&hidden_view)?;
-    Ok(dflash::dflash2_greedy_select(
-        &host_logits,
-        &host_hidden,
-        sel,
-        d2,
-        h,
-        vocab,
-        batch,
-        seed_token,
-    ))
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // DFlash spec step — one speculative decode iteration
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3081,10 +3800,46 @@ pub fn spec_step_dflash(
     // bonus). `None` = uncapped (bench/demo). Clamped **before** hidden/KV/
     // DeltaNet/drafter commit so post-hoc `cap_emit` is defense only.
     max_accept: Option<usize>,
+    // Retained-PM4 verify route owned by the speculator. `None` keeps the
+    // shipping HIP/HipGraph path byte-for-byte.
+    verify_pm4: Option<&mut DflashVerifyPm4>,
 ) -> HipResult<SpecStepResult> {
-    // The batched target verify is tagged `DispatchWorkload::SpeculativeVerify`
-    // where its attention parameters are built. That explicitly keeps the
-    // gfx12 wide-query prefill kernel out of DFlash without global route state.
+    let selector_mode = draft_weights.has_candidate_selector();
+    if selector_mode {
+        if pld_spine.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: PLD spine rewrite is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if ngram_cache.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: ngram-cache rewrite is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if cactus_delta != 0.0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: CACTUS is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if repeat_penalty != 1.0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: repeat penalty is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if hipfire_runtime::config::get()
+            .dflash_ngram_block
+            .unwrap_or(false)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: ngram-block rewriting is not supported with DFlash2 candidate selector",
+            ));
+        }
+    }
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
@@ -3156,11 +3911,10 @@ pub fn spec_step_dflash(
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
-    // Nucleus active only when a non-default top_p was requested. Mirrors the
-    // AR/MTP convention (top_p >= 0.999 ≈ disabled). When inactive the GPU
-    // kernel writes tau_cut=0/Z=1 and the host helpers are identity, so the
-    // sampled path is byte-equivalent to the prior pure-temp behavior.
-    let topp_active = use_temp_sampling && top_p < 0.999;
+    // Truncation active when either top_p non-default OR top_k enabled (vocab-gated).
+    // Host applies top-k before nucleus; GPU uses combined softmax_temp_topp whenever active.
+    let trunc_active = use_temp_sampling && (top_p < 0.999 || (top_k > 0 && top_k < vocab));
+    let topp_active = trunc_active;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
@@ -3354,14 +4108,19 @@ pub fn spec_step_dflash(
         let w_out = &target.weights.output;
         let use_batched_gemm = matches!(
             w_out.gpu_dtype,
-            rdna_compute::DType::HFQ4G256
+            rdna_compute::DType::Q8_0
+                | rdna_compute::DType::HFQ4G256
                 | rdna_compute::DType::MQ4G256
+                | rdna_compute::DType::MQ4G256V2
+                | rdna_compute::DType::MQ6G256V2
+                | rdna_compute::DType::MQ5G256V2
+                | rdna_compute::DType::MQ3G256V2
+                | rdna_compute::DType::MQ2G256V2
                 | rdna_compute::DType::MQ3G256
                 | rdna_compute::DType::HFQ6G256
                 | rdna_compute::DType::MQ6G256,
         );
-        let use_q8_staged = matches!(w_out.gpu_dtype, rdna_compute::DType::Q8_0);
-        if use_batched_gemm || use_q8_staged {
+        if use_batched_gemm {
             // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
             // download just (B-1) × 4 bytes of indices.
             //
@@ -3410,6 +4169,86 @@ pub fn spec_step_dflash(
                         hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
                         &w_out.buf,
                         w_out.gpu_dtype,
+                        &rotated,
+                        &logits_batch,
+                        w_out.m,
+                        w_out.k,
+                        batch,
+                    )?;
+                }
+                rdna_compute::DType::MQ4G256V2 => {
+                    assert!(
+                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                        "verify_scratch.rot undersized for MQ4 v2 draft lm_head"
+                    );
+                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                    gpu.gemm_mq4g256v2_batched_lmhead(
+                        &w_out.buf,
+                        &rotated,
+                        &logits_batch,
+                        w_out.m,
+                        w_out.k,
+                        batch,
+                    )?;
+                }
+                rdna_compute::DType::MQ6G256V2 => {
+                    assert!(
+                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                        "verify_scratch.rot undersized for MQ6V2 draft lm_head"
+                    );
+                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                    gpu.gemm_mq6g256v2_batched_lmhead(
+                        &w_out.buf,
+                        &rotated,
+                        &logits_batch,
+                        w_out.m,
+                        w_out.k,
+                        batch,
+                    )?;
+                }
+                rdna_compute::DType::MQ5G256V2 => {
+                    assert!(
+                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                        "verify_scratch.rot undersized for MQ5V2 draft lm_head"
+                    );
+                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                    gpu.gemm_mq5g256v2_batched_lmhead(
+                        &w_out.buf,
+                        &rotated,
+                        &logits_batch,
+                        w_out.m,
+                        w_out.k,
+                        batch,
+                    )?;
+                }
+                rdna_compute::DType::MQ3G256V2 => {
+                    assert!(
+                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                        "verify_scratch.rot undersized for MQ3V2 draft lm_head"
+                    );
+                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                    gpu.gemm_mq3g256v2_batched_lmhead(
+                        &w_out.buf,
+                        &rotated,
+                        &logits_batch,
+                        w_out.m,
+                        w_out.k,
+                        batch,
+                    )?;
+                }
+                rdna_compute::DType::MQ2G256V2 => {
+                    assert!(
+                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                        "verify_scratch.rot undersized for MQ2V2 draft lm_head"
+                    );
+                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                    gpu.gemm_mq2g256v2_batched_lmhead(
+                        &w_out.buf,
                         &rotated,
                         &logits_batch,
                         w_out.m,
@@ -3471,41 +4310,41 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            if let (Some(d2), Some(sel)) =
-                (draft_cfg.dflash2.as_ref(), draft_weights.selector.as_ref())
-            {
-                // DFlash 2: never independent argmax (same class as vLLM.cpp #1314).
-                let picked = dflash2_pick_from_logits_batch(
+            if selector_mode {
+                // Selector q is proposal-local: seed anchor this cycle, then
+                // sequential tokens. Greedy stays on-device (small top-K D2H
+                // inside propose_candidates_device). Temperature materializes
+                // sparse q into draft_softmaxes and does NOT take the GPU
+                // full-vocab fast-accept path. Request top_p/top_k is not
+                // applied to selector q; target p still uses them at verify.
+                let uniforms = if use_temp_sampling {
+                    Some(
+                        (0..batch)
+                            .map(|_| xorshift_next_unit(rng_state))
+                            .collect::<Vec<f32>>(),
+                    )
+                } else {
+                    None
+                };
+                let proposal = dflash::propose_candidates_device(
                     gpu,
-                    &logits_batch,
+                    draft_weights,
                     draft_scratch,
-                    verify_scratch,
-                    sel,
-                    d2,
-                    h,
-                    vocab,
+                    &hidden_rows,
+                    &logits_batch,
                     batch,
                     seed_token,
+                    temp,
+                    uniforms.as_deref(),
                 )?;
-                if use_temp_sampling {
-                    static D2_TEMP_WARN: std::sync::Once = std::sync::Once::new();
-                    D2_TEMP_WARN.call_once(|| {
-                        eprintln!(
-                            "[dflash2] temperature>0: draft path is still the greedy selector \
-                             (verify sampling unchanged)"
-                        );
-                    });
-                    for &t in &picked {
-                        drafted.push(t);
-                        let mut probs = vec![0f32; vocab];
-                        probs[t as usize] = 1.0;
-                        draft_softmaxes.push(probs);
-                        draft_probs_at_drafted.push(1.0);
-                    }
-                } else {
-                    drafted.extend(picked);
-                }
-            } else if use_temp_sampling && fast_sample_active {
+                apply_dflash2_selector_proposal(
+                    proposal,
+                    vocab,
+                    use_temp_sampling,
+                    &mut drafted,
+                    &mut draft_softmaxes,
+                    &mut draft_probs_at_drafted,
+                )?;            } else if use_temp_sampling && fast_sample_active {
                 // C8 GPU-sample path: softmax stays device-resident; only
                 // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
                 // draft_probs_dev is kept alive in c8_draft_probs_dev until
@@ -3586,9 +4425,11 @@ pub fn spec_step_dflash(
                     let row = &host_logits[i * vocab..(i + 1) * vocab];
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(row, temp, &mut probs);
-                    // Host nucleus on the non-fast temp arm so top_p is honored
-                    // on the whole DFlash temp path (not only under FAST_SAMPLE).
-                    if topp_active {
+                    // Host truncation: top-k before nucleus, matching GPU combined cut.
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut probs, top_k);
+                    }
+                    if top_p < 0.999 {
                         apply_host_nucleus(&mut probs, top_p);
                     }
                     let u = xorshift_next_unit(rng_state);
@@ -3635,65 +4476,62 @@ pub fn spec_step_dflash(
                     drafted.push(idx as u32);
                 }
             }
+        } else if selector_mode {
+            // lm-head fallback: still go through propose_candidates_host so
+            // greedy is not an independent argmax and sampled q stays sparse.
+            let batch = b - 1;
+            let mut host_logits = Vec::with_capacity(batch * vocab);
+            for i in 1..b {
+                let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+                llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
+                let logits = gpu.download_f32(&target.scratch.logits)?;
+                debug_assert_eq!(logits.len(), vocab);
+                host_logits.extend_from_slice(&logits);
+            }
+            let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+            let uniforms = if use_temp_sampling {
+                Some(
+                    (0..batch)
+                        .map(|_| xorshift_next_unit(rng_state))
+                        .collect::<Vec<f32>>(),
+                )
+            } else {
+                None
+            };
+            let proposal = dflash::propose_candidates_host(
+                gpu,
+                draft_weights,
+                draft_scratch,
+                &hidden_rows,
+                &host_logits,
+                batch,
+                seed_token,
+                temp,
+                uniforms.as_deref(),
+            )?;
+            apply_dflash2_selector_proposal(
+                proposal,
+                vocab,
+                use_temp_sampling,
+                &mut drafted,
+                &mut draft_softmaxes,
+                &mut draft_probs_at_drafted,
+            )?;
         } else {
             // Fallback: per-row weight_gemv loop.
-            if let (Some(d2), Some(sel)) =
-                (draft_cfg.dflash2.as_ref(), draft_weights.selector.as_ref())
-            {
-                let batch = b - 1;
-                let mut host_logits = Vec::with_capacity(batch * vocab);
-                for i in 1..b {
-                    let hidden_row = draft_scratch.x.sub_offset(i * h, h);
-                    llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
-                    host_logits.extend(gpu.download_f32(&target.scratch.logits)?);
-                }
-                let hidden_view = draft_scratch.x.sub_offset(h, batch * h);
-                let host_hidden = gpu.download_f32(&hidden_view)?;
-                let picked = dflash::dflash2_greedy_select(
-                    &host_logits,
-                    &host_hidden,
-                    sel,
-                    d2,
-                    h,
-                    vocab,
-                    batch,
-                    seed_token,
-                );
-                drafted.extend(picked);
-            } else {
-                for i in 1..b {
-                    let hidden_row = draft_scratch.x.sub_offset(i * h, h);
-                    llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
-                    let logits = gpu.download_f32(&target.scratch.logits)?;
-                    debug_assert_eq!(logits.len(), vocab);
-                    if use_temp_sampling {
-                        let mut probs = Vec::with_capacity(vocab);
-                        softmax_temp_into(&logits, temp, &mut probs);
-                        if topp_active {
-                            apply_host_nucleus(&mut probs, top_p);
-                        }
-                        let u = xorshift_next_unit(rng_state);
-                        let t = sample_categorical(&probs, u);
-                        draft_probs_at_drafted.push(probs[t as usize]);
-                        drafted.push(t);
-                        draft_softmaxes.push(probs);
-                    } else if host_path_active {
-                        let mut row = logits.clone();
-                        if rp_active {
-                            llama::apply_repeat_penalty(
-                                &mut row,
-                                prev_committed,
-                                repeat_window,
-                                repeat_penalty,
-                            );
-                        }
-                        if ngram_block_active {
-                            llama::apply_ngram_block(&mut row, prev_committed);
-                        }
-                        drafted.push(argmax_u32(&row));
-                    } else {
-                        drafted.push(argmax_u32(&logits));
+            for i in 1..b {
+                let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+                llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
+                let logits = gpu.download_f32(&target.scratch.logits)?;
+                debug_assert_eq!(logits.len(), vocab);
+                if use_temp_sampling {
+                    let mut probs = Vec::with_capacity(vocab);
+                    softmax_temp_into(&logits, temp, &mut probs);
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut probs, top_k);
                     }
+                    if top_p < 0.999 {
+                        apply_host_nucleus(&mut probs, top_p);                    }
                 }
             }
         }
@@ -3776,21 +4614,71 @@ pub fn spec_step_dflash(
         gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
-    let verify_out = verify_dflash_block(
-        gpu,
-        target,
-        &block,
-        position,
-        hidden_rb,
-        gdn_tape_opt.as_deref_mut(),
-        // Full target logits are D2H'd to the host for rejection sampling, RP,
-        // or n-gram block. Under FAST_SAMPLE the rejection sampler reads the
-        // GPU-softmaxed target probs directly from the resident
-        // `verify_scratch.logits` buffer, so the host full-logit download +
-        // host argmax are skipped — that's the target-side half of the cost cut.
-        (use_temp_sampling && !fast_sample_active) || host_path_active,
-        verify_scratch,
-    )?;
+    // Full target logits are D2H'd to the host for rejection sampling, RP, or
+    // n-gram block. Under FAST_SAMPLE the rejection sampler reads the
+    // GPU-softmaxed target probs directly from the resident
+    // `verify_scratch.logits` buffer, so the host full-logit download + host
+    // argmax are skipped — that's the target-side half of the cost cut.
+    let want_full_logits = (use_temp_sampling && !fast_sample_active) || host_path_active;
+    let verify_out = match verify_pm4 {
+        Some(route) => {
+            let replay_failures_before = route.counters().replay_failures;
+            match verify_dflash_block_retained(
+                gpu,
+                target,
+                &block,
+                position,
+                hidden_rb,
+                gdn_tape_opt.as_deref_mut(),
+                want_full_logits,
+                verify_scratch,
+                route,
+            ) {
+                Ok(out) => out,
+                Err(error) => {
+                    // Fail closed when quiescence was never proven: a PM4 body
+                    // may still be executing against KV, DeltaNet state, and
+                    // hidden staging, so restoring or re-running would race it.
+                    if matches!(route.phase(), DflashVerifyPm4Phase::Quarantined { .. }) {
+                        return Err(error);
+                    }
+                    // Not a retained-execution failure — an ordinary model
+                    // error propagates exactly as it does on the HIP path.
+                    if route.counters().replay_failures == replay_failures_before {
+                        return Err(error);
+                    }
+                    // Proven-quiescent replay failure. Rewind the recurrent
+                    // state to the pre-window snapshot and redo the window on
+                    // the ordinary route; KV slots, hidden staging,
+                    // final_hidden, and the GDN tape are all overwritten by the
+                    // retry, and the ring is committed exactly once because the
+                    // failed attempt never committed.
+                    target_snap.restore_to(&mut target.dn_state, gpu)?;
+                    route.note_safe_hip_retry();
+                    verify_dflash_block(
+                        gpu,
+                        target,
+                        &block,
+                        position,
+                        hidden_rb,
+                        gdn_tape_opt.as_deref_mut(),
+                        want_full_logits,
+                        verify_scratch,
+                    )?
+                }
+            }
+        }
+        None => verify_dflash_block(
+            gpu,
+            target,
+            &block,
+            position,
+            hidden_rb,
+            gdn_tape_opt.as_deref_mut(),
+            want_full_logits,
+            verify_scratch,
+        )?,
+    };
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -3822,7 +4710,8 @@ pub fn spec_step_dflash(
         // remaining budget can bind mid-window, force the host path so we can
         // clamp accept_len and re-draw the boundary sample from the target row.
         let budget_binds = matches!(max_accept, Some(m) if m < b - 1);
-        let gpu_accept = fast_sample_active
+        let gpu_accept = !selector_mode
+            && fast_sample_active
             && !budget_binds
             && c8_draft_probs_dev.is_some()
             && c8_draft_tokens_dev.is_some()
@@ -3973,7 +4862,10 @@ pub fn spec_step_dflash(
                         temp,
                         &mut target_probs,
                     );
-                    if topp_active {
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut target_probs, top_k);
+                    }
+                    if top_p < 0.999 {
                         apply_host_nucleus(&mut target_probs, top_p);
                     }
                 }
@@ -4019,16 +4911,16 @@ pub fn spec_step_dflash(
                 if let Some(fast) = &fast_tgt_probs {
                     target_probs.clear();
                     target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
-                    }
                 } else {
                     softmax_temp_into(
                         &tgt_logits[i * vocab..(i + 1) * vocab],
                         temp,
                         &mut target_probs,
                     );
-                    if topp_active {
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut target_probs, top_k);
+                    }
+                    if top_p < 0.999 {
                         apply_host_nucleus(&mut target_probs, top_p);
                     }
                 }
@@ -4505,6 +5397,73 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::MQ4G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq4g256v2_batched_lmhead(
+                &w_out.buf,
+                &rotated,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ6G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq6g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ5G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq5g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ3G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq3g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ2G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq2g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         rdna_compute::DType::MQ3G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
             let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
@@ -4513,10 +5472,6 @@ fn run_dflash_draft_for_logits(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            // MQ3 has no scalar batched gemm (unlike MQ4), so use the
-            // WMMA-residual lm_head wrapper which pre-zeros Y. Same pattern
-            // as the verify path — keeps draft and verify byte-identical
-            // for MQ3 targets.
             let r2 = run_spec_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq3G256BatchedLmhead,
@@ -4571,7 +5526,7 @@ fn run_dflash_draft_for_logits(
         }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ6G256V2/MQ5G256V2/MQ3G256V2/MQ2G256V2/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -4837,6 +5792,73 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::MQ4G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq4g256v2_batched_lmhead(
+                &w_out.buf,
+                &rotated,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ6G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq6g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ5G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq5g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ3G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq3g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
+        rdna_compute::DType::MQ2G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq2g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         rdna_compute::DType::MQ3G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
             let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
@@ -4897,7 +5919,7 @@ fn run_dflash_draft_for_topk_gpu(
         }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ6G256V2/MQ5G256V2/MQ3G256V2/MQ2G256V2/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -5059,6 +6081,12 @@ pub fn spec_step_ddtree(
         tree_topk >= 1 && tree_topk <= vocab,
         "tree_topk must be in [1, vocab]"
     );
+    if draft_weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "DFlash2 candidate selector is chain-only; DDTree independent-marginal verify is disabled",
+        ));
+    }
 
     // ── 1. Run DFlash draft, download raw logits ─────────────────────────
     let draft_logits = run_dflash_draft_for_logits(
@@ -5515,6 +6543,12 @@ pub fn spec_step_ddtree_batched(
         tree_topk >= 1 && tree_topk <= vocab,
         "tree_topk must be in [1, vocab]"
     );
+    if draft_weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "DFlash2 candidate selector is chain-only; DDTree independent-marginal verify is disabled",
+        ));
+    }
 
     // D16: ensure active_stream is set before any work so memset_async and
     // the stream-scoped sync in verify_dflash_block_inner have a non-null
@@ -6571,6 +7605,63 @@ mod tests {
             false,
             false,
             Some("0")
+        ));
+    }
+
+    #[test]
+    fn dflash_verify_graph_env_quarantines_gfx1100_mq_v2() {
+        use rdna_compute::DType;
+
+        // gfx1100 + every V2 width: default-off; =0 force-off; =1 diagnostic opt-in.
+        for dtype in [
+            DType::MQ2G256V2,
+            DType::MQ3G256V2,
+            DType::MQ4G256V2,
+            DType::MQ5G256V2,
+            DType::MQ6G256V2,
+        ] {
+            assert!(!dflash_verify_graph_env_eligible(
+                "gfx1100", dtype, None
+            ));
+            assert!(!dflash_verify_graph_env_eligible(
+                "gfx1100",
+                dtype,
+                Some("0")
+            ));
+            assert!(dflash_verify_graph_env_eligible(
+                "gfx1100",
+                dtype,
+                Some("1")
+            ));
+        }
+
+        // gfx1100 + legacy quant remains default-on.
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1100",
+            DType::MQ3G256,
+            None
+        ));
+
+        // Other arches keep default-on for V2; =0 still force-off.
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1151",
+            DType::MQ3G256V2,
+            None
+        ));
+        assert!(!dflash_verify_graph_env_eligible(
+            "gfx1151",
+            DType::MQ3G256V2,
+            Some("0")
+        ));
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1151",
+            DType::MQ3G256V2,
+            Some("1")
+        ));
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1201",
+            DType::MQ3G256V2,
+            None
         ));
     }
 

@@ -477,11 +477,11 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         "free_qwen35_bundle: pp_scratch_set must be None on single-GPU free"
     );
     let _ = pp_scratch_set;
-    if let Some(head) = qwen35_mtp_head {
-        head.free_gpu(gpu);
-    }
     if let Some(batch) = qwen35_decode_batch {
         let _ = batch.free_gpu(gpu);
+    }
+    if let Some(h) = qwen35_mtp_head {
+        h.free_gpu(gpu);
     }
     // Match unload_model Qwen35 order: kv → scratch → weights → dn → vision.
     let mut first: Option<String> = None;

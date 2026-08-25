@@ -88,11 +88,11 @@ impl ArchModel for Qwen35Bundle {
         // pp>1 bundle that incorrectly reaches here would leak, not
         // double-free, and the assert surfaces the bug.
         let _ = pp_scratch_set;
-        if let Some(head) = qwen35_mtp_head {
-            head.free_gpu(gpu);
-        }
         if let Some(batch) = qwen35_decode_batch {
             let _ = batch.free_gpu(gpu);
+        }
+        if let Some(h) = qwen35_mtp_head {
+            h.free_gpu(gpu);
         }
         let _ = kv_cache.free_gpu(gpu);
         let _ = scratch.free_gpu(gpu);

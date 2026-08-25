@@ -16,24 +16,24 @@
 //! Moved verbatim: identical branch order, identical GPU dispatch, identical
 //! wire strings and `unwrap_or` defaults.
 
-use std::any::Any;
 use crate::common::*;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_qwen35::qwen35;
+use hipfire_arch_qwen35::speculative;
 use hipfire_engine::emit::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::terminal::*;
-use hipfire_loader::{LoadedModel};
+use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{
     currently_in_think, ThinkOutputRouter, ToolOutputRouter, ToolRouteError,
 };
-use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
-use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::emit_text::{ThinkRouteEvent, ToolRouteEvent};
+use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
-use hipfire_arch_qwen35::speculative;
+use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use std::any::Any;
 use std::io::Write;
 use std::time::Instant;
 
@@ -344,7 +344,10 @@ pub struct QwenArCacheAction {
     pub tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
 }
 
-pub fn qwen_ar_cache_action(finish: &QwenArRouteFinish, visible_for_cache: &str) -> QwenArCacheAction {
+pub fn qwen_ar_cache_action(
+    finish: &QwenArRouteFinish,
+    visible_for_cache: &str,
+) -> QwenArCacheAction {
     QwenArCacheAction {
         store: finish.store_cache,
         fingerprint_text: crate::common::normalize_asst_turn_for_fingerprint(visible_for_cache),
@@ -452,11 +455,23 @@ pub struct QwenArSemanticProducer {
 
 impl QwenArSemanticProducer {
     pub fn new(id: impl Into<String>, started_in_think: bool) -> Self {
+        Self::new_with_tool_protocol(id, started_in_think, true)
+    }
+
+    pub fn new_with_tool_protocol(
+        id: impl Into<String>,
+        started_in_think: bool,
+        tool_protocol_enabled: bool,
+    ) -> Self {
         Self {
             id: id.into(),
             filter: EosFilter::new(qwen_ar_eos_filter_config()),
             think_router: ThinkOutputRouter::new(started_in_think),
-            router: ToolOutputRouter::new(),
+            router: if tool_protocol_enabled {
+                ToolOutputRouter::new()
+            } else {
+                ToolOutputRouter::disabled()
+            },
             visible_acc: String::new(),
             raw_committed: Vec::new(),
             raw_commit_positions: Vec::new(),
@@ -721,7 +736,7 @@ pub fn truncate_checkpoints(
 /// Selected once at the top of [`generate`] and is the sole authority for
 /// dispatch branch choice and tools capability. Precedence matches production:
 /// EP → arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots) →
-/// pp>1 → Qwen native MTP → Qwen/LLaMA DFlash/spec → default AR/unknown.
+/// pp>1 → Qwen native MTP → Qwen/LLaMA DFlash/spec (sidecar MTP uses the generic wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationRoute {
     QwenAr,
@@ -829,15 +844,24 @@ pub struct GenerationRouteInputs {
     pub qwen_mtp_head: bool,
     pub qwen_mtp_opt_in: bool,
     pub mtp_sampled_on: bool,
+    pub speculator_is_mtp: bool,
     pub deepseek4_spec_requested: bool,
     pub ngram_can_sample: bool,
     pub temp: f32,
     pub user_explicit_sampling: bool,
     pub min_p: Option<f32>,
+    /// At least one repeat/presence/frequency penalty is non-neutral. Sampled
+    /// DFlash chain verify does not implement these controls and must use AR.
+    pub nonneutral_penalties: bool,
     pub force_ar_chat: bool,
     pub temp_spec_env_off: bool,
     pub fast_sample_on: bool,
     pub supports_temp_swor: bool,
+    /// Speculator applies faithful top_p/top_k on the sampled chain path
+    /// (DFlash2 candidate-selector). When set, chain routing may engage even
+    /// though [`Self::supports_temp_swor`] is also true; DDTree SWOR leaves
+    /// this false and still refuses user-explicit non-temperature controls.
+    pub supports_chain_nucleus_verify: bool,
     pub kv_adaptive: bool,
 }
 
@@ -914,7 +938,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         return GenerationRoute::PipelineParallel;
     }
 
-    // 4. Qwen native MTP (before DFlash).
+    // 4. Qwen native MTP (before DFlash). `mtp_mode=on` / HIPFIRE_QWEN_MTP=1.
     let caps = hipfire_loader::carrier_for(i.arch_id)
         .map(|c| c.caps())
         .unwrap_or_default();
@@ -927,19 +951,32 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     }
 
     // 5. Qwen / LLaMA DFlash/spec (same gates as production generate body).
+    // MTP (speculator.name()=="mtp") shares the generic QwenDflash wrapper.
+    // Sampled MTP honors temp>0 including user-explicit sampling and min_p
+    // when supports_temp_verify; DFlash keeps SWOR vs selector-chain gates.
+    // Selector-chain nucleus may share supports_temp_swor with DDTree SWOR but
+    // still takes the sampled chain route (user-explicit top_p/top_k allowed;
+    // min_p>0 still blocked — DFlash ignores min_p).
     let dflash_min_p_present = i.min_p.map(|p| p > 0.0).unwrap_or(false);
-    let ddtree_swor_route =
-        i.temp > 1e-6 && i.supports_temp_swor && !i.user_explicit_sampling && !i.temp_spec_env_off;
-    let chain_sample_route = i.temp > 1e-6
-        && !i.supports_temp_swor
+    let ddtree_swor_route = !i.speculator_is_mtp
+        && i.temp > 1e-6
+        && i.supports_temp_swor
+        && !i.supports_chain_nucleus_verify
+        && !i.user_explicit_sampling
+        && !i.temp_spec_env_off;
+    let chain_sample_route = !i.speculator_is_mtp
+        && i.temp > 1e-6
+        && (!i.supports_temp_swor || i.supports_chain_nucleus_verify)
         && i.ngram_can_sample
         && i.fast_sample_on
         && !dflash_min_p_present
+        && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
+    let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
     let qwen_dflash_route = caps.is_qwen_dflash()
-        && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
-    let llama_dflash_route = caps.is_llama_dflash()
-        && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
+        && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route || mtp_sample_route);
+    let llama_dflash_route =
+        caps.is_llama_dflash() && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
     if i.has_speculator
         && !i.force_ar_chat
         && (qwen_dflash_route || llama_dflash_route)
@@ -1050,6 +1087,10 @@ pub fn generate(
         .speculator
         .as_ref()
         .is_some_and(|s| s.supports_temp_verify());
+    let supports_chain_nucleus_verify = m
+        .speculator
+        .as_ref()
+        .is_some_and(|s| s.supports_chain_nucleus_verify());
     let route_inputs = GenerationRouteInputs {
         arch_id: m.arch_id,
         ep: m.ep.is_some(),
@@ -1058,15 +1099,20 @@ pub fn generate(
         qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
         qwen_mtp_opt_in: qwen_native_mtp_opt_in(m),
         mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
         temp,
         user_explicit_sampling,
         min_p,
+        nonneutral_penalties: repeat_penalty != 1.0
+            || presence_penalty != 0.0
+            || frequency_penalty != 0.0,
         force_ar_chat: std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0"),
         temp_spec_env_off: std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
         fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
         supports_temp_swor,
+        supports_chain_nucleus_verify,
         kv_adaptive: m.kv_adaptive.is_some(),
     };
     let selected_route = select_generation_route(&route_inputs);
@@ -1089,90 +1135,92 @@ pub fn generate(
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
-        // The loader publishes one of two mutually-exclusive Gemma4 states:
-        // eager dense (ModelState::Gemma4) and lowered/MoE
-        // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
-        // lowered load must fail loudly here rather than silently run eager
-        // against lowered weights.
-        if m.gemma4_lowered_mut().is_some() {
-            emit_error_with_id(
+            // The loader publishes one of two mutually-exclusive Gemma4 states:
+            // eager dense (ModelState::Gemma4) and lowered/MoE
+            // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
+            // lowered load must fail loudly here rather than silently run eager
+            // against lowered weights.
+            if m.gemma4_lowered_mut().is_some() {
+                emit_error_with_id(
                 stdout,
                 id,
                 "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant",
             );
+                return;
+            }
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+                user_explicit_sampling,
+                top_k,
+                min_p,
+                cactus_delta,
+            );
+            let _ = (
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+            );
+            let _ = stop;
+            crate::dense::generate_gemma4(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                max_tokens,
+                max_think_tokens,
+                enable_thinking,
+                tools,
+                messages_history,
+                logprobs_top_k,
+            );
             return;
         }
-        let _ = (
-            budget_alert_at_tok,
-            budget_alert_text,
-            assistant_prefix,
-            pflash_state,
-            pflash_cfg,
-            think_mode,
-            user_explicit_sampling,
-            top_k,
-            min_p,
-            cactus_delta,
-        );
-        let _ = (
-            repeat_penalty,
-            repeat_window,
-            presence_penalty,
-            frequency_penalty,
-        );
-        let _ = stop;
-        crate::dense::generate_gemma4(
-            m,
-            gpu,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            temp,
-            top_p,
-            max_tokens,
-            max_think_tokens,
-            tools,
-            messages_history,
-            logprobs_top_k,
-        );
-        return;
-        }
         Some(hipfire_loader::GenerationEarlyRoute::MuseGlimmer) => {
-        let _ = (
-            budget_alert_at_tok,
-            budget_alert_text,
-            assistant_prefix,
-            pflash_state,
-            pflash_cfg,
-            user_explicit_sampling,
-            cactus_delta,
-        );
-        let _ = (
-            repeat_penalty,
-            repeat_window,
-            presence_penalty,
-            frequency_penalty,
-        );
-        let _ = stop;
-        crate::dense::generate_muse_glimmer(
-            m,
-            gpu,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            temp,
-            top_p,
-            top_k.map(|k| k as usize).unwrap_or(0),
-            min_p,
-            max_tokens,
-            max_think_tokens,
-            think_mode,
-            tools,
-            messages_history,
-        );
-        return;
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                user_explicit_sampling,
+                cactus_delta,
+            );
+            let _ = (
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+            );
+            let _ = stop;
+            crate::dense::generate_muse_glimmer(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                top_k.map(|k| k as usize).unwrap_or(0),
+                min_p,
+                max_tokens,
+                max_think_tokens,
+                think_mode,
+                reasoning_effort,
+                tools,
+                messages_history,
+            );
+            return;
         }
         None => {}
     }
@@ -1276,6 +1324,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1411,6 +1460,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1487,6 +1537,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1563,6 +1614,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1717,7 +1769,8 @@ pub fn generate(
             // did NOT qualify is handled by the selector (falls to AR). When we
             // are on the DFlash arm, still warn once if min_p was requested.
             let minp_requested = min_p.map(|p| p > 0.0).unwrap_or(false);
-            if temp > 1e-6 && minp_requested {
+            let spec_is_mtp = m.speculator.as_ref().is_some_and(|s| s.name() == "mtp");
+            if temp > 1e-6 && minp_requested && !spec_is_mtp {
                 static SPEC_MINP_WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !SPEC_MINP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1760,6 +1813,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1790,12 +1844,21 @@ pub fn generate(
             {
                 let reason = if route_inputs.temp_spec_env_off {
                     "HIPFIRE_DFLASH_TEMP_SPEC=0"
-                } else if route_inputs.supports_temp_swor && user_explicit_sampling {
-                    "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
                 } else if min_p.map(|p| p > 0.0).unwrap_or(false) {
+                    // Prefer min_p over SWOR-only: selector-chain honors top_p/top_k
+                    // but still falls to AR when min_p>0 (DFlash ignores min_p).
                     "request set min_p (sampled DFlash honors top_p/top_k only); AR applies it"
+                } else if route_inputs.nonneutral_penalties {
+                    "request set a non-neutral repeat/presence/frequency penalty; AR applies it"
+                } else if route_inputs.supports_temp_swor
+                    && !route_inputs.supports_chain_nucleus_verify
+                    && user_explicit_sampling
+                {
+                    "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
                 } else if !ngram_can_sample {
                     "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
+                } else if route_inputs.supports_chain_nucleus_verify {
+                    "sampled DFlash chain nucleus not engaged (check HIPFIRE_FAST_SAMPLE / temp-spec gates)"
                 } else {
                     "ddtree SWOR verify not active (needs ddtree_budget>0)"
                 };
@@ -1854,7 +1917,9 @@ pub fn generate(
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Use the canonical reset so newly added recurrent buffers (notably the
         // Q8 error-feedback residual) cannot leak across rollover boundaries.
-        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             if let Err(e) = b.dn_state.reset(gpu) {
                 crate::dense::emit_active_attempt_error(
                     stdout,
@@ -1868,11 +1933,15 @@ pub fn generate(
             }
             b.kv_cache.compact_offset = 0;
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
+        }) {
             b.kv.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+            if let Some(b) = m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();
@@ -2312,7 +2381,8 @@ pub fn generate(
                 history,
                 tools,
                 |msg| {
-                    let normalized = crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
+                    let normalized =
+                        crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
                     let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
                     // Content-only turn: see the dflash sibling above for why `text` is
                     // `msg.content`.
@@ -2579,7 +2649,9 @@ pub fn generate(
             // was silently disabled post-merge; gate on the bundle instead.
             let resume_idx = if ckpt_resume_enabled()
                 && evict_safe
-                && m.state.as_ref().map_or(false, |s| s.as_ref().arch_key() == "qwen35")
+                && m.state
+                    .as_ref()
+                    .map_or(false, |s| s.as_ref().arch_key() == "qwen35")
             {
                 m.prefill_checkpoints
                     .iter()
@@ -2592,8 +2664,13 @@ pub fn generate(
                 // RESTORE only (do NOT zero): roll the bundle's DeltaNet state
                 // back to the checkpoint. Disjoint split: m.state and
                 // m.prefill_checkpoints are different fields of `m`.
-                let ok = if let (Some(b), Some(ck)) = (m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()), m.prefill_checkpoints.get(idx))
-                {
+                let ok = if let (Some(b), Some(ck)) = (
+                    m.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+                    }),
+                    m.prefill_checkpoints.get(idx),
+                ) {
                     ck.1.restore_to(&mut b.dn_state, gpu).is_ok()
                 } else {
                     false
@@ -2629,7 +2706,10 @@ pub fn generate(
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
-                    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+                    if let Some(b) = m.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+                    }) {
                         let dn = &b.dn_state;
                         for s in &dn.s_matrices {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -2644,10 +2724,16 @@ pub fn generate(
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
-                    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+                    if let Some(b) = m.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+                    }) {
                         b.kv_cache.compact_offset = 0;
                     }
-                    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+                    if let Some(b) = m.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_llama::LlamaBundle>()
+                    }) {
                         b.kv.compact_offset = 0;
                     }
                     rendered
@@ -2703,7 +2789,9 @@ pub fn generate(
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
         // because a `&tokenizer` borrow of `m` is live here.
-        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -2718,10 +2806,14 @@ pub fn generate(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             b.kv_cache.compact_offset = 0;
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
+        }) {
             b.kv.compact_offset = 0;
         }
     }
@@ -2739,8 +2831,7 @@ pub fn generate(
             .as_ref()
             .and_then(|s| {
                 let am = s.as_ref();
-                if let Some(b) =
-                    (am as &dyn Any).downcast_ref::<hipfire_arch_llama::LlamaBundle>()
+                if let Some(b) = (am as &dyn Any).downcast_ref::<hipfire_arch_llama::LlamaBundle>()
                 {
                     Some(b.kv.compact_offset)
                 } else if let Some(b) =
@@ -2824,10 +2915,17 @@ pub fn generate(
 
     if hipfire_loader::carrier_for(m.arch_id)
         .map(|c| c.caps().has_deltanet)
-        .unwrap_or(false) {
+        .unwrap_or(false)
+    {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
-        let b = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()).unwrap();
+        let b = m
+            .state
+            .as_mut()
+            .and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            })
+            .unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let scratch = &b.scratch;
@@ -2889,8 +2987,8 @@ pub fn generate(
         // connection (curl `-m` timeout, Pi/opencode response timer
         // fired, etc.); the stdin reader thread sets the abort flag
         // and the chunk loop below picks it up. The no-eviction path
-        // is manually chunked at PREFILL_MAX_BATCH so abort latency
-        // is bounded to one chunk (~5 s on gfx1151 at 50 tps).
+        // is manually chunked at the ordinary prefill outer bound so abort
+        // latency is bounded to one chunk (~5 s on gfx1151 at 50 tps).
         //
         // On abort, DeltaNet's non-reversible state means we can't
         // rewind to the pre-prefill position — full reset (seq_pos=0,
@@ -2916,8 +3014,23 @@ pub fn generate(
                     qwen_ar_eviction_prefill_chunk_limit(m.seq_pos, window, adaptive_staging);
                 let chunk_len = remaining.len().min(chunk_limit);
                 let (chunk, rest) = remaining.split_at(chunk_len);
-                if let Err(e) = qwen35::forward_prefill_batch(
-                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
+                // Outer eviction-window / maybe_evict cadence is unchanged;
+                // only internal temporary PBS/chunks stay at the historical
+                // memory-safe ceiling (PREFILL_MAX_BATCH=256).
+                if let Err(e) = qwen35::forward_prefill_batch_capped(
+                    gpu,
+                    weights,
+                    config,
+                    chunk,
+                    m.seq_pos,
+                    kv,
+                    dn,
+                    scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                    qwen35::PREFILL_MAX_BATCH,
                 ) {
                     let action = qwen_ar_forward_fail_action();
                     if action.reset_uncommitted_state {
@@ -2979,11 +3092,17 @@ pub fn generate(
                 remaining = rest;
             }
         } else {
-            // Manually chunk the no-eviction prefill so the abort
-            // check fires between batches. PREFILL_MAX_BATCH (256)
-            // is the same boundary the kernel uses internally so
-            // chunking here doesn't change the GPU-side work.
-            let chunk_max = qwen35::PREFILL_MAX_BATCH;
+            // Manually chunk the no-eviction prefill so the abort check fires
+            // between batches. Outer chunks must agree with internal chunk /
+            // PBS capacity via `prefill_max_batch` (gfx1201 defaults 384;
+            // gfx11/CDNA stay 256; HIPFIRE_PREFILL_MAX_BATCH>=2 overrides).
+            // Adaptive-KV keeps the hard `PREFILL_MAX_BATCH` (256) cap so the
+            // controller's margin and maybe_downshift boundaries stay exact.
+            let chunk_max = if m.kv_adaptive.is_some() {
+                qwen35::PREFILL_MAX_BATCH
+            } else {
+                qwen35::prefill_max_batch(gpu)
+            };
             let mut start = 0usize;
             while start < new_tokens.len() {
                 if check_abort(id) {
@@ -3311,7 +3430,8 @@ pub fn generate(
         // and structured tool_calls on this AR path. Raw token commit stays
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
         // seq_pos advance before classify).
-        let mut semantic = QwenArSemanticProducer::new(id, started_in_think);
+        let mut semantic =
+            QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
@@ -4079,7 +4199,8 @@ pub fn generate(
         let intended_release =
             finish.finish_reason == "tool_calls" && !finish.wire_tool_calls.is_empty();
         let intended_store = finish.store_cache;
-        let effects = crate::qwen::qwen_client_commit_effects(decision, intended_release, intended_store);
+        let effects =
+            crate::qwen::qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
             let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
             crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
@@ -4152,7 +4273,13 @@ pub fn generate(
     } else {
         // LLaMA path -- multi-turn aware
         let has_eviction = m.eviction.is_some();
-        let b = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()).unwrap();
+        let b = m
+            .state
+            .as_mut()
+            .and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
+            })
+            .unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let scratch = &b.scratch;
@@ -4457,7 +4584,6 @@ pub fn emit_qwen_ar_done(
 pub fn model_retry_reset_eligible(arch_id: u32) -> bool {
     hipfire_runtime::reset_core::is_retry_reset_eligible(reset_core_arch_key(arch_id))
 }
-
 
 /// Map LoadedModel.arch_id to reset_core inventory arch key.
 pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
