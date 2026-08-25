@@ -535,6 +535,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GATE_MODEL` | scripts/gates.sh |
 | `HIPFIRE_GATE_STATE_QUANT` | scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_GATE_UP_BT` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_BT2_DISABLE` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GATE_UP_NOSYNC` | crates/rdna-compute/examples/bench_gate_up_nosync.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GATE_UP_VARIANT` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GATE_WORK_DIR` | scripts/gates.sh |

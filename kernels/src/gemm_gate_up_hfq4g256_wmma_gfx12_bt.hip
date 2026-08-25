@@ -57,6 +57,7 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_gate_up_hfq4g256_wmma_g
             Y[(long long)oc * os + pr] = acc[b][j]; } } } \
 }
 
+GEN_GATE_UP_BT(2)
 GEN_GATE_UP_BT(4)
 GEN_GATE_UP_BT(8)
 GEN_GATE_UP_BT(12)

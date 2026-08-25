@@ -6,8 +6,8 @@
 // B independent acc chains over the batch (N) dim hide WMMA latency;
 // weights+dequant loaded once per K-tile, reused across the B N-tiles.
 // Byte-exact vs gemm_qkv_hfq4g256_wmma_gfx12. Grid: [ceil(total_m/16),
-// ceil(N/(16*B))]. Instantiations bt4/8/12 only — Muse already falsified
-// bt16 (VGPR spill).
+// ceil(N/(16*B))]. Instantiations bt2/4/8/12 — Muse already falsified
+// bt16 (VGPR spill). B=2 is the #611 gfx1100 weight-reuse band (N≥32).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
@@ -57,6 +57,7 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_qkv_hfq4g256_wmma_gfx12
             Y[(long long)oc * os + pr] = acc[b][j]; } } } \
 }
 
+GEN_QKV_BT(2)
 GEN_QKV_BT(4)
 GEN_QKV_BT(8)
 GEN_QKV_BT(12)

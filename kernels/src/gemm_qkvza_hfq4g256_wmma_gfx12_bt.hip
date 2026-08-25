@@ -58,6 +58,7 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_qkvza_hfq4g256_wmma_gfx
             Y[(long long)oc * os + pr] = acc[b][j]; } } } \
 }
 
+GEN_QKVZA_BT(2)
 GEN_QKVZA_BT(4)
 GEN_QKVZA_BT(8)
 GEN_QKVZA_BT(12)

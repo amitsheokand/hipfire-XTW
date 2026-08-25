@@ -64,24 +64,44 @@ const LDSSTAGE_MAX_BATCH: usize = 96;
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 
 /// gfx12 HFQ4 WMMA batch-tile width B. Output tile is 16 rows × (16·B) batch.
-/// Shared by gate_up / residual / qkvza. `HIPFIRE_GATE_UP_BT`: unset/`1` →
-/// adaptive; `0`/`off` → 1-acc; `4`/`8`/`12` force that B (B=16 spills).
+/// Shared by gate_up / residual / qkvza / qkv. `HIPFIRE_GATE_UP_BT`: unset/`1` →
+/// adaptive; `0`/`off` → 1-acc; `2`/`4`/`8`/`12` force that B (B=16 spills).
+/// `HIPFIRE_BT2_DISABLE=1` keeps adaptive B=4/8/12 but forces 1-acc in the
+/// N∈[32,64) band (A/B vs the #611-style B=2 pick).
 ///
 /// Adaptive maps production `PREFILL_MAX_BATCH=256` to B=8 (exact 2 tiles of
-/// 128). B=12 is exact only at N % 192 == 0.
+/// 128). B=2 covers the #611 gfx1100 band (batch ≥ 32, typical pp=32). B=12
+/// is exact only at N % 192 == 0.
 fn gfx12_hfq4_wmma_bt_b(batch_size: usize) -> usize {
     match hipfire_config::developer_var("HIPFIRE_GATE_UP_BT").as_deref() {
         Ok("0") | Ok("off") | Ok("") => 1,
+        Ok("2") => 2,
         Ok("4") => 4,
         Ok("8") => 8,
         Ok("12") => 12,
-        _ => gfx12_hfq4_wmma_bt_b_adaptive(batch_size),
+        _ => {
+            let b = gfx12_hfq4_wmma_bt_b_adaptive(batch_size);
+            if b == 2 && gfx12_bt2_disabled() {
+                1
+            } else {
+                b
+            }
+        }
     }
 }
 
+fn gfx12_bt2_disabled() -> bool {
+    matches!(
+        hipfire_config::developer_var("HIPFIRE_BT2_DISABLE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
 fn gfx12_hfq4_wmma_bt_b_adaptive(batch_size: usize) -> usize {
-    if batch_size < 64 {
+    if batch_size < 32 {
         1
+    } else if batch_size < 64 {
+        2
     } else if batch_size % 192 == 0 {
         12
     } else if batch_size % 128 == 0 {
@@ -103,7 +123,9 @@ mod gfx12_bt_b_tests {
 
     #[test]
     fn production_prefill_256_is_bt8() {
-        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(32), 1);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(31), 1);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(32), 2);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(63), 2);
         assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(64), 4);
         assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(128), 8);
         assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(192), 12);
@@ -8932,6 +8954,10 @@ impl Gpu {
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt4",
                 kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
             ),
+            2 => (
+                "gemm_qkvza_hfq4g256_wmma_gfx12_bt2",
+                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ),
             _ => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12",
                 kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC,
@@ -9340,6 +9366,10 @@ impl Gpu {
             ),
             4 => (
                 "gemm_qkv_hfq4g256_wmma_gfx12_bt4",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ),
+            2 => (
+                "gemm_qkv_hfq4g256_wmma_gfx12_bt2",
                 kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_BT_SRC,
             ),
             _ => (
@@ -10804,6 +10834,10 @@ impl Gpu {
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
             ),
+            2 => (
+                "gemm_gate_up_hfq4g256_wmma_gfx12_bt2",
+                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ),
             _ => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12",
                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC,
@@ -10964,6 +10998,10 @@ impl Gpu {
             ),
             4 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt4",
+                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+            ),
+            2 => (
+                "gemm_hfq4g256_residual_wmma_gfx12_bt2",
                 kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
             ),
             _ => (

@@ -46,6 +46,7 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_hfq4g256_residual_wmma_
         int orow = rs + 8 * kg + j; if (orow < M) Y[(long long)oc * M + orow] += acc[b][j]; } } \
 }
 
+GEN_RESID_BT(2)
 GEN_RESID_BT(4)
 GEN_RESID_BT(8)
 GEN_RESID_BT(12)
