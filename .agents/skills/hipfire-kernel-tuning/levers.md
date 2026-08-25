@@ -236,6 +236,20 @@ RDNA because CDNA won.
   harmed gfx1100 (~14% DFlash class regression; fix narrative `24e4baa9`).
 - Rule: capability ≠ perf allowlist. See `perf-arch-discipline.md`.
 
+### gfx12 PREFILL_MAX_BATCH=192 for exact B=12
+
+- Adaptive BT already maps N=256 → B=8 exact and N=192 → B=12 exact.
+- Same Qwen3.8-27B MQ4 pp2520: 256 → **715.9**, 192 → 723.6 (**+1.1%**).
+- Wash. Do not change the default chunk. Do not re-add Muse B=16.
+
+### gfx12 16×16 i8 HFQ4 MMQ as dense-prefill default
+
+- Kernel exists (`gemm_hfq4g256_residual_mmq.gfx12.hip`) and is numerically
+  fine (`test_hfq4g256_mmq_portable` PASS). `has_mmq` still excludes RDNA4.
+- `HIPFIRE_MMQ=1` opt-in on gfx1201 Qwen3.8-27B MQ4 pp2520: **717.6 → 351.5
+  (−51%)**. Decode held. Splits fused gate+up and is not the gfx11 128×128
+  LDS tile. Revisit only with a fused / larger-tile gfx12 MMQ, not `has_mmq`.
+
 ### MoE grouped dead ends (campaign-specific)
 
 - Indexed `_k8` GEMV decode paths and some `m2` / `i8` grouped variants have

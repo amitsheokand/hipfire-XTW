@@ -56,6 +56,7 @@ fn main() {
         (32, 16, 16, 256, 16), // q has 2 row-tiles
         (32, 32, 32, 512, 32), // multi-tile in every dim
         (48, 16, 16, 256, 16), // tile straddles projection boundary
+        (16, 16, 16, 256, 256), // production N=256 → adaptive BT=8
     ];
 
     for &(q_m, k_m, v_m, k, n) in shapes {

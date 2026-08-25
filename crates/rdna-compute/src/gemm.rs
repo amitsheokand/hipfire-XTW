@@ -63,6 +63,55 @@ const LDSSTAGE_MAX_BATCH: usize = 96;
 /// domain is covered.
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 
+/// gfx12 HFQ4 WMMA batch-tile width B. Output tile is 16 rows × (16·B) batch.
+/// Shared by gate_up / residual / qkvza. `HIPFIRE_GATE_UP_BT`: unset/`1` →
+/// adaptive; `0`/`off` → 1-acc; `4`/`8`/`12` force that B (B=16 spills).
+///
+/// Adaptive maps production `PREFILL_MAX_BATCH=256` to B=8 (exact 2 tiles of
+/// 128). B=12 is exact only at N % 192 == 0.
+fn gfx12_hfq4_wmma_bt_b(batch_size: usize) -> usize {
+    match hipfire_config::developer_var("HIPFIRE_GATE_UP_BT").as_deref() {
+        Ok("0") | Ok("off") | Ok("") => 1,
+        Ok("4") => 4,
+        Ok("8") => 8,
+        Ok("12") => 12,
+        _ => gfx12_hfq4_wmma_bt_b_adaptive(batch_size),
+    }
+}
+
+fn gfx12_hfq4_wmma_bt_b_adaptive(batch_size: usize) -> usize {
+    if batch_size < 64 {
+        1
+    } else if batch_size % 192 == 0 {
+        12
+    } else if batch_size % 128 == 0 {
+        8
+    } else if batch_size % 64 == 0 {
+        4
+    } else if batch_size >= 192 {
+        12
+    } else if batch_size >= 128 {
+        8
+    } else {
+        4
+    }
+}
+
+#[cfg(test)]
+mod gfx12_bt_b_tests {
+    use super::gfx12_hfq4_wmma_bt_b_adaptive;
+
+    #[test]
+    fn production_prefill_256_is_bt8() {
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(32), 1);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(64), 4);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(128), 8);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(192), 12);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(256), 8);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(384), 12);
+    }
+}
+
 impl Gpu {
     /// CDNA3-only: prefill GEMM used by `gemm_hfq4g256` rocBLAS path.
     ///
@@ -8869,28 +8918,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/residual).
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b = gfx12_hfq4_wmma_bt_b(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
@@ -9298,11 +9326,28 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkv_hfq4g256_wmma_gfx12",
-            kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC,
-            "gemm_qkv_hfq4g256_wmma_gfx12",
-        )?;
+        // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with
+        // gate_up/residual/qkvza). FA QKV is 16/64 layers on Qwen3.8.
+        let bt_b = gfx12_hfq4_wmma_bt_b(batch_size);
+        let (kname, ksrc): (&str, &str) = match bt_b {
+            12 => (
+                "gemm_qkv_hfq4g256_wmma_gfx12_bt12",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ),
+            8 => (
+                "gemm_qkv_hfq4g256_wmma_gfx12_bt8",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ),
+            4 => (
+                "gemm_qkv_hfq4g256_wmma_gfx12_bt4",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ),
+            _ => (
+                "gemm_qkv_hfq4g256_wmma_gfx12",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC,
+            ),
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_q.buf.as_ptr();
@@ -9335,17 +9380,16 @@ impl Gpu {
 
         let total_m = q_m + k_m + v_m;
         let row_tiles = (total_m + 15) / 16;
-        let batch_tiles = (batch_size + 15) / 16;
+        let batch_tiles = (batch_size + 16 * bt_b - 1) / (16 * bt_b);
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_wmma_gfx12", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkv_hfq4g256_wmma_gfx12",
+            kname,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -10746,28 +10790,7 @@ impl Gpu {
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
         // vs the 1-acc kernel; +85% at N=192 on gfx1201.
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b = gfx12_hfq4_wmma_bt_b(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
@@ -10929,28 +10952,7 @@ impl Gpu {
             return result;
         }
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b = gfx12_hfq4_wmma_bt_b(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
