@@ -199,6 +199,48 @@ Do not `hipfire config qwen38-27b set` while `qwen3.8:27b` already owns
 that file path — duplicate catalog path. Edit the `qwen38-27b` overlay by
 hand if needed.
 
+## 5/10 re-bench after B=2 port (2026-08-25)
+
+Commit `04eea38d` (B=2 kernels present; decode is batch=1 so B=2 is not
+selected). hipfire `236be20a7b3e1937d927f29d6cea0fd0`, daemon
+`e80b3a19d4c86f0ef6f183267404f1b3`. `--runs 5 --warmups 10 --max-tokens 128
+--backend noslots --workload stateless --kv-mode q8 --kv-backend vmm`,
+`max_seq=262144`, DFlash cap **32768**, graphs on, `HIP_VISIBLE_DEVICES=0`.
+
+| arm | prompt | decode | τ | prefill | TTFT | vram_free | samples decode |
+|-----|--------|--------|---|---------|------|----------:|----------------|
+| AR | relativity `d94d3115` | **36.6** | — | 400.6 | 59.9 | 16640 | `[36.6×5]` |
+| MTP | relativity `d94d3115` | **47.7** | 2.40 | 325.7 | 73.0 | 16640 | `[47.7, 47.6, 47.7, 47.6, 47.7]` |
+| DFlash 2 | merge_sort `51a6c736` | **107.3** | **6.94** | 303.7 | 121.8 | **4396** | `[106.5, 107.3, 107.3, 107.6, 107.4]` |
+
+JSON: `/tmp/r9700-three-mode-bt2/{ar,mtp,dflash}.raw`. vs prior 5/10 on
+`5f4f6bef`: AR −0.3%, MTP +0.2%, DFlash 2 −0.1% (noise). DFlash first
+prefill 14.6 / TTFT 2538 ms is 32k-cap JIT; medians ignore it.
+
+Picks unchanged: quality AR, general/prose MTP, code DFlash 2.
+
+### Hardware utilisation (R9700 = `GPU[0]`, 32624 MiB)
+
+`rocm-smi` every 2s during the three arms + pp32/pp256. GPU[1] is the 2 GiB
+Raphael iGPU.
+
+| signal | value |
+|--------|--------|
+| GPU[0] use | **max 100%, median 100%** (n=80) |
+| GPU[0] sclk | 1452–**3458 MHz** (DPM auto; typically ~2950–3040 in decode) |
+| AR/MTP VRAM | 16640 MiB free (VMM 262k logical, mapped_prefix=1927) |
+| DFlash VRAM | **4396 MiB free** (32k draft cap, max that loads) |
+| pp32 prefill | 509–512 tok/s (B=2) vs **536.4** (1-acc, `HIPFIRE_BT2_DISABLE=1`) |
+| pp256 prefill | **730.1 tok/s** (B=8, matches parked 732) |
+| tg16@32 / @256 | 36.9 / 36.5 tok/s |
+
+**#611 gfx12 default rejected:** weight-reuse B=2 at N=32 is −4.5% vs 1-acc
+on this chip. Kernels stay behind `HIPFIRE_GATE_UP_BT=2`. Adaptive still
+starts B=4 at N=64 and B=8 at production 256.
+
+Warpfront/master (~112 commits, ~20 conflict files) was **not** merged
+before this ranking.
+
 ## Caveat
 
 Greedy MTP only. Quality serve not re-run on these bins (same model md5

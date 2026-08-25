@@ -66,27 +66,27 @@ const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 /// gfx12 HFQ4 WMMA batch-tile width B. Output tile is 16 rows × (16·B) batch.
 /// Shared by gate_up / residual / qkvza / qkv. `HIPFIRE_GATE_UP_BT`: unset/`1` →
 /// adaptive; `0`/`off` → 1-acc; `2`/`4`/`8`/`12` force that B (B=16 spills).
-/// `HIPFIRE_BT2_DISABLE=1` keeps adaptive B=4/8/12 but forces 1-acc in the
-/// N∈[32,64) band (A/B vs the #611-style B=2 pick).
+/// `HIPFIRE_BT2_DISABLE=1` turns a forced `HIPFIRE_GATE_UP_BT=2` back into 1-acc.
 ///
 /// Adaptive maps production `PREFILL_MAX_BATCH=256` to B=8 (exact 2 tiles of
-/// 128). B=2 covers the #611 gfx1100 band (batch ≥ 32, typical pp=32). B=12
-/// is exact only at N % 192 == 0.
+/// 128). B=2 exists (`HIPFIRE_GATE_UP_BT=2`) but is **not** the gfx12 default
+/// below N=64: warm R9700 pp32 was 512 tok/s vs 1-acc 536 (−4.5%), the same
+/// occupancy class #611 rejected for bt4 on gfx1100. B=12 is exact only at
+/// N % 192 == 0.
 fn gfx12_hfq4_wmma_bt_b(batch_size: usize) -> usize {
     match hipfire_config::developer_var("HIPFIRE_GATE_UP_BT").as_deref() {
         Ok("0") | Ok("off") | Ok("") => 1,
-        Ok("2") => 2,
+        Ok("2") => {
+            if gfx12_bt2_disabled() {
+                1
+            } else {
+                2
+            }
+        }
         Ok("4") => 4,
         Ok("8") => 8,
         Ok("12") => 12,
-        _ => {
-            let b = gfx12_hfq4_wmma_bt_b_adaptive(batch_size);
-            if b == 2 && gfx12_bt2_disabled() {
-                1
-            } else {
-                b
-            }
-        }
+        _ => gfx12_hfq4_wmma_bt_b_adaptive(batch_size),
     }
 }
 
@@ -98,10 +98,8 @@ fn gfx12_bt2_disabled() -> bool {
 }
 
 fn gfx12_hfq4_wmma_bt_b_adaptive(batch_size: usize) -> usize {
-    if batch_size < 32 {
+    if batch_size < 64 {
         1
-    } else if batch_size < 64 {
-        2
     } else if batch_size % 192 == 0 {
         12
     } else if batch_size % 128 == 0 {
@@ -124,8 +122,8 @@ mod gfx12_bt_b_tests {
     #[test]
     fn production_prefill_256_is_bt8() {
         assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(31), 1);
-        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(32), 2);
-        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(63), 2);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(32), 1);
+        assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(63), 1);
         assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(64), 4);
         assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(128), 8);
         assert_eq!(gfx12_hfq4_wmma_bt_b_adaptive(192), 12);
