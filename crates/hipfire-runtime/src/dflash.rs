@@ -119,7 +119,17 @@ impl DflashConfig {
     /// Parse from an HFQ file's metadata JSON. Expects the top-level
     /// `dflash` object written by `dflash_convert`.
     pub fn from_hfq(hfq: &HfqFile) -> Option<Self> {
-        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
+        Self::from_metadata_json(&hfq.metadata_json)
+    }
+
+    /// Parse DFlash config from HFQ metadata JSON.
+    ///
+    /// DFlash2 selector/conv knobs are emitted either under
+    /// `dflash.dflash_config` (warpfront convert) or `config.dflash_config`
+    /// (HF-style hipfire-models drafts). Both must be honoured or the
+    /// selector silently fails to load and τ collapses.
+    pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
+        let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
         let df = meta.get("dflash")?;
 
         let n_layers = df.get("num_hidden_layers").and_then(|v| v.as_u64())? as usize;
@@ -218,7 +228,16 @@ impl DflashConfig {
             }
         };
         // Nested dflash_config fields (DFlash2) with legacy flat fallbacks.
-        let dflash_cfg_nested = df.get("dflash_config").and_then(|v| v.as_object());
+        // Warpfront convert writes `dflash.dflash_config`; hipfire-models
+        // DFlash2 drafts nest the same object under `config.dflash_config`.
+        let dflash_cfg_nested = df
+            .get("dflash_config")
+            .and_then(|v| v.as_object())
+            .or_else(|| {
+                meta.get("config")
+                    .and_then(|c| c.get("dflash_config"))
+                    .and_then(|v| v.as_object())
+            });
         let dflash_u64 = |key: &str| {
             dflash_cfg_nested
                 .and_then(|m| m.get(key))
@@ -3032,6 +3051,94 @@ pub fn draft_forward_opts(
     scratch.thlog.mark_proj_cached(l);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod config_parse_tests {
+    use super::DflashConfig;
+
+    #[test]
+    fn reads_selector_from_config_dflash_config() {
+        // Shape of hipfire-models DFlash2 drafts (qwen38-27b-dflash2.hfq):
+        // selector/conv live under config.dflash_config, not dflash.dflash_config.
+        let json = r#"{
+            "architecture": "dflash",
+            "config": {
+                "dflash_config": {
+                    "block_size": 8,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2,
+                    "mask_token_id": 248070,
+                    "selector_rank": 256,
+                    "selector_top_k": 16,
+                    "target_layer_ids": [5, 19, 33, 47, 61]
+                },
+                "use_sliding_window": true,
+                "sliding_window": 2048,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention"
+                ]
+            },
+            "dflash": {
+                "block_size": 8,
+                "mask_token_id": 248070,
+                "target_layer_ids": [5, 19, 33, 47, 61],
+                "num_target_layers": 64,
+                "num_hidden_layers": 5,
+                "hidden_size": 5120,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "intermediate_size": 17408,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10000000.0,
+                "vocab_size": 248320
+            }
+        }"#;
+        let cfg = DflashConfig::from_metadata_json(json).expect("parse");
+        assert_eq!(cfg.selector_rank, Some(256));
+        assert_eq!(cfg.selector_top_k, Some(16));
+        assert_eq!(cfg.conv_group_size, Some(16));
+        assert_eq!(cfg.conv_kernel_size, Some(2));
+        assert_eq!(cfg.runtime_block_size(), 16);
+        assert_eq!(cfg.declared_window, Some(2048));
+        assert!(cfg.all_layers_sliding);
+    }
+
+    #[test]
+    fn reads_selector_from_dflash_dflash_config() {
+        let json = r#"{
+            "dflash": {
+                "block_size": 8,
+                "mask_token_id": 1,
+                "target_layer_ids": [0],
+                "num_target_layers": 1,
+                "num_hidden_layers": 1,
+                "hidden_size": 32,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "intermediate_size": 64,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0,
+                "vocab_size": 16,
+                "dflash_config": {
+                    "selector_rank": 8,
+                    "selector_top_k": 4,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2
+                }
+            }
+        }"#;
+        let cfg = DflashConfig::from_metadata_json(json).expect("parse");
+        assert_eq!(cfg.selector_rank, Some(8));
+        assert_eq!(cfg.selector_top_k, Some(4));
+        assert_eq!(cfg.conv_group_size, Some(16));
+    }
 }
 
 #[cfg(test)]
