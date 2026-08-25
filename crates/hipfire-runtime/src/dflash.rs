@@ -28,7 +28,7 @@
 
 use crate::hfq::{load_awq_scale, HfqFile};
 use crate::llama::WeightTensor;
-use hip_bridge::{Graph, GraphExec, HipResult};
+use hip_bridge::{Graph, GraphExec, HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 
@@ -89,6 +89,154 @@ pub struct DflashConfig {
     pub selector_top_k: Option<usize>,
 }
 
+/// Resolve one DFlash2 u64 across `dflash.dflash_config`, `config.dflash_config`,
+/// and a flat `dflash.{key}` fallback. Conflicting nested values log and prefer
+/// the convert-path object (`dflash.dflash_config`).
+fn resolve_dflash2_u64(
+    df: &serde_json::Value,
+    config: Option<&serde_json::Value>,
+    key: &str,
+) -> Option<u64> {
+    let nested = |obj: Option<&serde_json::Value>| {
+        obj.and_then(|o| o.get("dflash_config"))
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64())
+    };
+    let from_df = nested(Some(df));
+    let from_cfg = nested(config);
+    let flat = df.get(key).and_then(|v| v.as_u64());
+    match (from_df, from_cfg) {
+        (Some(a), Some(b)) if a != b => {
+            eprintln!(
+                "  DFlash metadata conflict on {key}: dflash.dflash_config={a} \
+                 vs config.dflash_config={b} — using dflash.dflash_config"
+            );
+            Some(a)
+        }
+        (Some(a), _) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => flat,
+    }
+}
+
+/// DFlash2 knobs are atomic pairs. Either both absent (legacy) or both set and >0.
+fn require_dflash2_pair(
+    a: Option<usize>,
+    b: Option<usize>,
+    a_name: &str,
+    b_name: &str,
+) -> Result<(Option<usize>, Option<usize>), String> {
+    match (a, b) {
+        (None, None) => Ok((None, None)),
+        (Some(x), Some(y)) => {
+            if x == 0 {
+                return Err(format!("dflash {a_name} must be > 0"));
+            }
+            if y == 0 {
+                return Err(format!("dflash {b_name} must be > 0"));
+            }
+            Ok((Some(x), Some(y)))
+        }
+        (Some(_), None) => Err(format!(
+            "dflash declared {a_name} without {b_name}; DFlash2 knobs are atomic"
+        )),
+        (None, Some(_)) => Err(format!(
+            "dflash declared {b_name} without {a_name}; DFlash2 knobs are atomic"
+        )),
+    }
+}
+
+fn first_present<'a>(names: &[&'a str], present: impl Fn(&str) -> bool) -> Option<&'a str> {
+    names.iter().copied().find(|n| present(n))
+}
+
+const SELECTOR_PROJ_NAMES: &[&str] = &[
+    "candidate_selector.hidden_projection.weight",
+    "selector.hidden_projection.weight",
+    "selector.hidden_proj.weight",
+];
+const SELECTOR_PRED_NAMES: &[&str] = &[
+    "candidate_selector.predecessor_codebook",
+    "selector.predecessor_codebook",
+    "candidate_selector.predecessor_codebook.weight",
+    "selector.predecessor.weight",
+];
+const SELECTOR_SUCC_NAMES: &[&str] = &[
+    "candidate_selector.successor_codebook",
+    "selector.successor_codebook",
+    "candidate_selector.successor_codebook.weight",
+    "selector.successor.weight",
+];
+
+/// Declared selector must present projection + both codebooks, or admission fails.
+fn admit_selector_tensors(present: impl Fn(&str) -> bool) -> Result<(), String> {
+    let proj = first_present(SELECTOR_PROJ_NAMES, &present);
+    let pred = first_present(SELECTOR_PRED_NAMES, &present);
+    let succ = first_present(SELECTOR_SUCC_NAMES, &present);
+    match (proj, pred, succ) {
+        (Some(_), Some(_), Some(_)) => Ok(()),
+        _ => Err(format!(
+            "dflash selector declared but incomplete (proj={} pred={} succ={}); \
+             refusing silent greedy fallback",
+            proj.is_some(),
+            pred.is_some(),
+            succ.is_some()
+        )),
+    }
+}
+
+fn admit_conv_pair(
+    base_names: &[&str],
+    proj_names: &[&str],
+    present: impl Fn(&str) -> bool,
+    what: &str,
+) -> Result<(), String> {
+    let base = first_present(base_names, &present);
+    let proj = first_present(proj_names, &present);
+    match (base, proj) {
+        (Some(_), Some(_)) => Ok(()),
+        (None, None) => Err(format!(
+            "dflash {what} declared (conv_kernel_size) but tensors missing"
+        )),
+        (Some(b), None) => Err(format!(
+            "dflash {what} incomplete: {b} without kernel_projection"
+        )),
+        (None, Some(p)) => Err(format!(
+            "dflash {what} incomplete: {p} without base_kernel"
+        )),
+    }
+}
+
+fn load_required_conv_pair(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    base_names: &[&str],
+    proj_names: &[&str],
+    base_elems: usize,
+    proj_m: usize,
+    hidden: usize,
+    what: &str,
+) -> HipResult<(GpuTensor, WeightTensor)> {
+    let present = |n: &str| hfq.tensor_data(n).is_some();
+    admit_conv_pair(base_names, proj_names, present, what).map_err(|e| HipError::new(0, &e))?;
+    let base = first_present(base_names, |n| hfq.tensor_data(n).is_some()).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!("dflash {what} base_kernel missing after admit"),
+        )
+    })?;
+    let proj = first_present(proj_names, |n| hfq.tensor_data(n).is_some()).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!("dflash {what} kernel_projection missing after admit"),
+        )
+    })?;
+    Ok((
+        hfq_tensor_f32(hfq, gpu, base, vec![base_elems])?,
+        hfq_weight(hfq, gpu, proj, proj_m, hidden)?,
+    ))
+}
+
 impl DflashConfig {
     /// Returns the number of target hidden layers concatenated into fc input.
     pub fn num_extract(&self) -> usize {
@@ -103,11 +251,10 @@ impl DflashConfig {
         self.n_heads * self.head_dim
     }
 
-    /// Runtime proposal width. DFlash2's selector and dynamic convolutions are
-    /// length-generic even though the published checkpoint declares B=8.
-    /// B=16 removes the B=8 acceptance ceiling and wins on both the canonical
-    /// merge-sort and prose fixtures on gfx1201; legacy DFlash retains its
-    /// artifact-declared width.
+    /// Declared proposal width from metadata. DFlash2 artifacts that name a
+    /// selector intend B=16 even when the checkpoint writes B=8; the load
+    /// path must still confirm the selector actually loaded before using this
+    /// (`DflashWeights::runtime_block_size`).
     pub fn runtime_block_size(&self) -> usize {
         if self.selector_rank.is_some() && self.block_size == 8 {
             16
@@ -118,7 +265,7 @@ impl DflashConfig {
 
     /// Parse from an HFQ file's metadata JSON. Expects the top-level
     /// `dflash` object written by `dflash_convert`.
-    pub fn from_hfq(hfq: &HfqFile) -> Option<Self> {
+    pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
         Self::from_metadata_json(&hfq.metadata_json)
     }
 
@@ -126,22 +273,32 @@ impl DflashConfig {
     ///
     /// DFlash2 selector/conv knobs are emitted either under
     /// `dflash.dflash_config` (warpfront convert) or `config.dflash_config`
-    /// (HF-style hipfire-models drafts). Both must be honoured or the
-    /// selector silently fails to load and τ collapses.
-    pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
-        let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
-        let df = meta.get("dflash")?;
+    /// (HF-style hipfire-models drafts). Fields are merged per key; a
+    /// conflict logs and prefers `dflash.dflash_config`. Incomplete DFlash2
+    /// pairs (rank without top_k, kernel without group) fail parse rather
+    /// than silently dropping the selector.
+    pub fn from_metadata_json(metadata_json: &str) -> Result<Self, String> {
+        let meta: serde_json::Value = serde_json::from_str(metadata_json)
+            .map_err(|e| format!("dflash: metadata JSON: {e}"))?;
+        let df = meta
+            .get("dflash")
+            .ok_or_else(|| "dflash: missing top-level 'dflash' object".to_string())?;
 
-        let n_layers = df.get("num_hidden_layers").and_then(|v| v.as_u64())? as usize;
-        let hidden = df.get("hidden_size").and_then(|v| v.as_u64())? as usize;
-        let intermediate = df.get("intermediate_size").and_then(|v| v.as_u64())? as usize;
-        let n_heads = df.get("num_attention_heads").and_then(|v| v.as_u64())? as usize;
-        let n_kv_heads = df.get("num_key_value_heads").and_then(|v| v.as_u64())? as usize;
+        let req_u64 = |key: &str| -> Result<u64, String> {
+            df.get(key)
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("dflash: missing or invalid '{key}'"))
+        };
+        let n_layers = req_u64("num_hidden_layers")? as usize;
+        let hidden = req_u64("hidden_size")? as usize;
+        let intermediate = req_u64("intermediate_size")? as usize;
+        let n_heads = req_u64("num_attention_heads")? as usize;
+        let n_kv_heads = req_u64("num_key_value_heads")? as usize;
         let head_dim = df
             .get("head_dim")
             .and_then(|v| v.as_u64())
             .unwrap_or((hidden / n_heads) as u64) as usize;
-        let vocab_size = df.get("vocab_size").and_then(|v| v.as_u64())? as usize;
+        let vocab_size = req_u64("vocab_size")? as usize;
         let norm_eps = df
             .get("rms_norm_eps")
             .and_then(|v| v.as_f64())
@@ -150,15 +307,16 @@ impl DflashConfig {
             .get("rope_theta")
             .and_then(|v| v.as_f64())
             .unwrap_or(10_000_000.0) as f32;
-        let block_size = df.get("block_size").and_then(|v| v.as_u64())? as usize;
-        let mask_token_id = df.get("mask_token_id").and_then(|v| v.as_u64())? as u32;
+        let block_size = req_u64("block_size")? as usize;
+        let mask_token_id = req_u64("mask_token_id")? as u32;
         let target_layer_ids: Vec<usize> = df
-            .get("target_layer_ids")?
-            .as_array()?
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "dflash: missing or invalid 'target_layer_ids'".to_string())?
             .iter()
             .filter_map(|v| v.as_u64().map(|x| x as usize))
             .collect();
-        let num_target_layers = df.get("num_target_layers").and_then(|v| v.as_u64())? as usize;
+        let num_target_layers = req_u64("num_target_layers")? as usize;
         // The window fields live in the sibling `config` object (HF-style),
         // not in the `dflash` block, so they are read separately. DFlash2
         // nests the same knobs under `dflash.dflash_config` as well; we probe
@@ -227,30 +385,36 @@ impl DflashConfig {
                 }
             }
         };
-        // Nested dflash_config fields (DFlash2) with legacy flat fallbacks.
+        // Nested dflash_config fields (DFlash2) with per-key merge.
         // Warpfront convert writes `dflash.dflash_config`; hipfire-models
-        // DFlash2 drafts nest the same object under `config.dflash_config`.
-        let dflash_cfg_nested = df
-            .get("dflash_config")
-            .and_then(|v| v.as_object())
-            .or_else(|| {
-                meta.get("config")
-                    .and_then(|c| c.get("dflash_config"))
-                    .and_then(|v| v.as_object())
-            });
-        let dflash_u64 = |key: &str| {
-            dflash_cfg_nested
-                .and_then(|m| m.get(key))
-                .or_else(|| df.get(key))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-        };
-        let conv_group_size = dflash_u64("conv_group_size");
-        let conv_kernel_size = dflash_u64("conv_kernel_size");
-        let selector_rank = dflash_u64("selector_rank");
-        let selector_top_k = dflash_u64("selector_top_k");
+        // DFlash2 drafts nest the same knobs under `config.dflash_config`.
+        let cfg_obj = meta.get("config");
+        let conv_group_size = resolve_dflash2_u64(df, cfg_obj, "conv_group_size").map(|v| v as usize);
+        let conv_kernel_size =
+            resolve_dflash2_u64(df, cfg_obj, "conv_kernel_size").map(|v| v as usize);
+        let selector_rank = resolve_dflash2_u64(df, cfg_obj, "selector_rank").map(|v| v as usize);
+        let selector_top_k = resolve_dflash2_u64(df, cfg_obj, "selector_top_k").map(|v| v as usize);
+        let (conv_group_size, conv_kernel_size) = require_dflash2_pair(
+            conv_group_size,
+            conv_kernel_size,
+            "conv_group_size",
+            "conv_kernel_size",
+        )?;
+        let (selector_rank, selector_top_k) = require_dflash2_pair(
+            selector_rank,
+            selector_top_k,
+            "selector_rank",
+            "selector_top_k",
+        )?;
+        if let Some(g) = conv_group_size {
+            if hidden % g != 0 {
+                return Err(format!(
+                    "dflash conv_group_size={g} does not divide hidden={hidden}"
+                ));
+            }
+        }
 
-        Some(DflashConfig {
+        Ok(DflashConfig {
             n_layers,
             hidden,
             intermediate,
@@ -643,6 +807,17 @@ impl DflashWeights {
             && self.predecessor_codebook.is_some()
             && self.successor_codebook.is_some()
     }
+
+    /// Runtime proposal width from *loaded* selector capability, not metadata
+    /// alone. B=16 only when the selector actually admitted.
+    pub fn runtime_block_size(&self, cfg: &DflashConfig) -> usize {
+        if self.has_candidate_selector() && cfg.block_size == 8 {
+            16
+        } else {
+            cfg.block_size
+        }
+    }
+
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
         let fc = hfq_weight(
             hfq,
@@ -662,83 +837,44 @@ impl DflashWeights {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = format!("layers.{i}");
-            // Attempt DFlash2 conv weights; absent on legacy drafts.
-            let attn_conv_base = if cfg.conv_kernel_size.is_some() {
-                // base_kernel [2, K, H] -> 2*K*H
-                let name = format!("{p}.self_attn.attention_conv.base_kernel");
-                // also try alternate naming `attn_conv` if upstream uses that
-                let alt = format!("{p}.attention_conv.base_kernel");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    // shape 2*K*H
-                    Some(hfq_tensor_f32(
-                        hfq,
-                        gpu,
-                        &key,
-                        vec![2 * conv_k * cfg.hidden],
-                    )?)
-                } else {
-                    None
-                }
+            let conv_required = cfg.conv_kernel_size.is_some();
+            let (attn_conv_base, attn_conv_proj) = if conv_required {
+                let base_a = format!("{p}.self_attn.attention_conv.base_kernel");
+                let base_b = format!("{p}.attention_conv.base_kernel");
+                let proj_a = format!("{p}.self_attn.attention_conv.kernel_projection.weight");
+                let proj_b = format!("{p}.attention_conv.kernel_projection.weight");
+                let (base, proj) = load_required_conv_pair(
+                    hfq,
+                    gpu,
+                    &[base_a.as_str(), base_b.as_str()],
+                    &[proj_a.as_str(), proj_b.as_str()],
+                    2 * conv_k * cfg.hidden,
+                    proj_m,
+                    cfg.hidden,
+                    &format!("layer {i} attention_conv"),
+                )?;
+                (Some(base), Some(proj))
             } else {
-                None
+                (None, None)
             };
-            let attn_conv_proj = if cfg.conv_kernel_size.is_some() {
-                let name = format!("{p}.self_attn.attention_conv.kernel_projection.weight");
-                let alt = format!("{p}.attention_conv.kernel_projection.weight");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
-                } else {
-                    None
-                }
+            let (mlp_conv_base, mlp_conv_proj) = if conv_required {
+                let base_a = format!("{p}.mlp.mlp_conv.base_kernel");
+                let base_b = format!("{p}.mlp_conv.base_kernel");
+                let proj_a = format!("{p}.mlp.mlp_conv.kernel_projection.weight");
+                let proj_b = format!("{p}.mlp_conv.kernel_projection.weight");
+                let (base, proj) = load_required_conv_pair(
+                    hfq,
+                    gpu,
+                    &[base_a.as_str(), base_b.as_str()],
+                    &[proj_a.as_str(), proj_b.as_str()],
+                    2 * conv_k * cfg.hidden,
+                    proj_m,
+                    cfg.hidden,
+                    &format!("layer {i} mlp_conv"),
+                )?;
+                (Some(base), Some(proj))
             } else {
-                None
-            };
-            let mlp_conv_base = if cfg.conv_kernel_size.is_some() {
-                let name = format!("{p}.mlp.mlp_conv.base_kernel");
-                let alt = format!("{p}.mlp_conv.base_kernel");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_tensor_f32(
-                        hfq,
-                        gpu,
-                        &key,
-                        vec![2 * conv_k * cfg.hidden],
-                    )?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let mlp_conv_proj = if cfg.conv_kernel_size.is_some() {
-                let name = format!("{p}.mlp.mlp_conv.kernel_projection.weight");
-                let alt = format!("{p}.mlp_conv.kernel_projection.weight");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
-                } else {
-                    None
-                }
-            } else {
-                None
+                (None, None)
             };
             let layer = DflashLayerWeights {
                 attn_norm: hfq_tensor_f32(
@@ -822,98 +958,89 @@ impl DflashWeights {
             layers.push(layer);
         }
 
-        // Selector: hidden_projection [rank, hidden] + two codebooks [vocab, rank] host-side
-        // Exact HFQ names are `candidate_selector.hidden_projection.weight`,
-        // `candidate_selector.predecessor_codebook`, `candidate_selector.successor_codebook`.
-        // Optional fallback `.weight` suffix is tolerated but not required.
-        let selector_hidden_proj = if cfg.selector_rank.is_some() {
-            let rank = cfg.selector_rank.unwrap();
-            let candidates = [
-                "candidate_selector.hidden_projection.weight",
-                "selector.hidden_projection.weight",
-                "selector.hidden_proj.weight",
-            ];
-            let mut found = None;
-            for n in candidates {
-                if hfq.tensor_data(n).is_some() {
-                    found = Some(hfq_weight(hfq, gpu, n, rank, cfg.hidden)?);
-                    break;
-                }
-            }
-            found
-        } else {
-            None
-        };
-        let load_codebook = |names: &[&str],
-                             vocab: usize,
-                             rank: usize|
-         -> Option<SelectorCodebook> {
-            for n in names {
-                if let Some((info, data)) = hfq.tensor_data(n) {
-                    let expected = vocab * rank;
-                    match info.quant_type {
-                        1 => {
-                            assert_eq!(data.len(), expected * 2, "codebook {n} F16 size mismatch");
-                            let mut v = Vec::with_capacity(expected);
-                            for chunk in data.chunks_exact(2) {
-                                v.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        // Selector: hidden_projection [rank, hidden] + two codebooks [vocab, rank] host-side.
+        // Declared selector_rank requires the full set; missing tensors fail
+        // the draft rather than silently dropping to greedy B=16.
+        let selector_hidden_proj;
+        let predecessor_codebook;
+        let successor_codebook;
+        let selector_rank_opt;
+        let selector_top_k_opt;
+        if let Some(rank) = cfg.selector_rank {
+            let present = |n: &str| hfq.tensor_data(n).is_some();
+            admit_selector_tensors(&present).map_err(|e| HipError::new(0, &e))?;
+            let proj_name = first_present(SELECTOR_PROJ_NAMES, &present).ok_or_else(|| {
+                HipError::new(0, "dflash selector projection missing after admit")
+            })?;
+            selector_hidden_proj = Some(hfq_weight(hfq, gpu, proj_name, rank, cfg.hidden)?);
+            let load_codebook = |names: &[&str],
+                                 vocab: usize,
+                                 rank: usize|
+             -> Option<SelectorCodebook> {
+                for n in names {
+                    if let Some((info, data)) = hfq.tensor_data(n) {
+                        let expected = vocab * rank;
+                        match info.quant_type {
+                            1 => {
+                                assert_eq!(
+                                    data.len(),
+                                    expected * 2,
+                                    "codebook {n} F16 size mismatch"
+                                );
+                                let mut v = Vec::with_capacity(expected);
+                                for chunk in data.chunks_exact(2) {
+                                    v.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                                }
+                                return Some(SelectorCodebook {
+                                    vocab,
+                                    rank,
+                                    f16_data: Some(v),
+                                    f32_data: None,
+                                });
                             }
-                            return Some(SelectorCodebook {
-                                vocab,
-                                rank,
-                                f16_data: Some(v),
-                                f32_data: None,
-                            });
-                        }
-                        2 => {
-                            assert_eq!(data.len(), expected * 4, "codebook {n} F32 size mismatch");
-                            let mut v = Vec::with_capacity(expected);
-                            for chunk in data.chunks_exact(4) {
-                                v.push(f32::from_le_bytes([
-                                    chunk[0], chunk[1], chunk[2], chunk[3],
-                                ]));
+                            2 => {
+                                assert_eq!(
+                                    data.len(),
+                                    expected * 4,
+                                    "codebook {n} F32 size mismatch"
+                                );
+                                let mut v = Vec::with_capacity(expected);
+                                for chunk in data.chunks_exact(4) {
+                                    v.push(f32::from_le_bytes([
+                                        chunk[0], chunk[1], chunk[2], chunk[3],
+                                    ]));
+                                }
+                                return Some(SelectorCodebook {
+                                    vocab,
+                                    rank,
+                                    f16_data: None,
+                                    f32_data: Some(v),
+                                });
                             }
-                            return Some(SelectorCodebook {
-                                vocab,
-                                rank,
-                                f16_data: None,
-                                f32_data: Some(v),
-                            });
+                            q => panic!("selector codebook {n} unsupported quant_type {q}"),
                         }
-                        q => panic!("selector codebook {n} unsupported quant_type {q}"),
                     }
                 }
-            }
-            None
-        };
-        let (predecessor_codebook, successor_codebook, selector_rank_opt, selector_top_k_opt) =
-            if cfg.selector_rank.is_some() {
-                let rank = cfg.selector_rank.unwrap();
-                let vocab = cfg.vocab_size;
-                let pred = load_codebook(
-                    &[
-                        "candidate_selector.predecessor_codebook",
-                        "selector.predecessor_codebook",
-                        "candidate_selector.predecessor_codebook.weight",
-                        "selector.predecessor.weight",
-                    ],
-                    vocab,
-                    rank,
-                );
-                let succ = load_codebook(
-                    &[
-                        "candidate_selector.successor_codebook",
-                        "selector.successor_codebook",
-                        "candidate_selector.successor_codebook.weight",
-                        "selector.successor.weight",
-                    ],
-                    vocab,
-                    rank,
-                );
-                (pred, succ, cfg.selector_rank, cfg.selector_top_k)
-            } else {
-                (None, None, None, None)
+                None
             };
+            let vocab = cfg.vocab_size;
+            predecessor_codebook = load_codebook(SELECTOR_PRED_NAMES, vocab, rank);
+            successor_codebook = load_codebook(SELECTOR_SUCC_NAMES, vocab, rank);
+            if predecessor_codebook.is_none() || successor_codebook.is_none() {
+                return Err(HipError::new(
+                    0,
+                    "dflash selector declared but a codebook failed to decode",
+                ));
+            }
+            selector_rank_opt = cfg.selector_rank;
+            selector_top_k_opt = cfg.selector_top_k;
+        } else {
+            selector_hidden_proj = None;
+            predecessor_codebook = None;
+            successor_codebook = None;
+            selector_rank_opt = None;
+            selector_top_k_opt = None;
+        }
 
         let has_mq = std::iter::once(&fc)
             .chain(layers.iter().flat_map(|l| {
@@ -3138,6 +3265,220 @@ mod config_parse_tests {
         assert_eq!(cfg.selector_rank, Some(8));
         assert_eq!(cfg.selector_top_k, Some(4));
         assert_eq!(cfg.conv_group_size, Some(16));
+    }
+
+    const MINIMAL_DFLASH: &str = r#"
+        "block_size": 8,
+        "mask_token_id": 1,
+        "target_layer_ids": [0],
+        "num_target_layers": 1,
+        "num_hidden_layers": 1,
+        "hidden_size": 32,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "intermediate_size": 64,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "vocab_size": 16
+    "#;
+
+    #[test]
+    fn merges_complementary_keys_across_nested_objects() {
+        let json = format!(
+            r#"{{
+            "config": {{
+                "dflash_config": {{
+                    "selector_top_k": 16,
+                    "conv_kernel_size": 2
+                }}
+            }},
+            "dflash": {{
+                {MINIMAL_DFLASH},
+                "dflash_config": {{
+                    "selector_rank": 256,
+                    "conv_group_size": 16
+                }}
+            }}
+        }}"#
+        );
+        let cfg = DflashConfig::from_metadata_json(&json).expect("parse");
+        assert_eq!(cfg.selector_rank, Some(256));
+        assert_eq!(cfg.selector_top_k, Some(16));
+        assert_eq!(cfg.conv_group_size, Some(16));
+        assert_eq!(cfg.conv_kernel_size, Some(2));
+    }
+
+    #[test]
+    fn prefers_dflash_dflash_config_on_conflict() {
+        let json = format!(
+            r#"{{
+            "config": {{
+                "dflash_config": {{
+                    "selector_rank": 256,
+                    "selector_top_k": 16,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2
+                }}
+            }},
+            "dflash": {{
+                {MINIMAL_DFLASH},
+                "dflash_config": {{
+                    "selector_rank": 8,
+                    "selector_top_k": 4,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2
+                }}
+            }}
+        }}"#
+        );
+        let cfg = DflashConfig::from_metadata_json(&json).expect("parse");
+        assert_eq!(cfg.selector_rank, Some(8));
+        assert_eq!(cfg.selector_top_k, Some(4));
+    }
+
+    #[test]
+    fn rejects_selector_rank_without_top_k() {
+        let json = format!(
+            r#"{{
+            "dflash": {{
+                {MINIMAL_DFLASH},
+                "dflash_config": {{ "selector_rank": 256 }}
+            }}
+        }}"#
+        );
+        let err = DflashConfig::from_metadata_json(&json).unwrap_err();
+        assert!(
+            err.contains("selector_rank") && err.contains("selector_top_k"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_selector_rank() {
+        let json = format!(
+            r#"{{
+            "dflash": {{
+                {MINIMAL_DFLASH},
+                "dflash_config": {{
+                    "selector_rank": 0,
+                    "selector_top_k": 16
+                }}
+            }}
+        }}"#
+        );
+        let err = DflashConfig::from_metadata_json(&json).unwrap_err();
+        assert!(err.contains("selector_rank") && err.contains("> 0"), "{err}");
+    }
+
+    #[test]
+    fn rejects_conv_group_that_does_not_divide_hidden() {
+        let json = format!(
+            r#"{{
+            "dflash": {{
+                {MINIMAL_DFLASH},
+                "dflash_config": {{
+                    "conv_group_size": 15,
+                    "conv_kernel_size": 2
+                }}
+            }}
+        }}"#
+        );
+        let err = DflashConfig::from_metadata_json(&json).unwrap_err();
+        assert!(err.contains("does not divide hidden"), "{err}");
+    }
+
+    #[test]
+    fn admit_selector_requires_proj_and_both_codebooks() {
+        let all = |n: &str| {
+            n.contains("hidden_projection")
+                || n.contains("predecessor_codebook")
+                || n.contains("successor_codebook")
+        };
+        super::admit_selector_tensors(all).expect("complete set");
+        let missing_pred = |n: &str| {
+            n.contains("hidden_projection") || n.contains("successor_codebook")
+        };
+        let err = super::admit_selector_tensors(missing_pred).unwrap_err();
+        assert!(err.contains("incomplete"), "{err}");
+        assert!(err.contains("pred=false"), "{err}");
+    }
+
+    #[test]
+    fn admit_conv_pair_rejects_base_without_proj() {
+        let names_base = ["layers.0.self_attn.attention_conv.base_kernel"];
+        let names_proj = ["layers.0.self_attn.attention_conv.kernel_projection.weight"];
+        let present = |n: &str| n.ends_with("base_kernel");
+        let err = super::admit_conv_pair(&names_base, &names_proj, present, "layer 0 attention_conv")
+            .unwrap_err();
+        assert!(err.contains("without kernel_projection"), "{err}");
+    }
+
+    #[test]
+    fn production_qwen38_dflash2_metadata_and_tensors_admit() {
+        let path = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join(".hipfire/models/qwen38-27b-dflash2.hfq");
+        if !path.is_file() {
+            eprintln!(
+                "skip: production draft {} not on disk",
+                path.display()
+            );
+            return;
+        }
+        let hfq = crate::hfq::HfqFile::open(&path).expect("open production DFlash2 draft");
+        let cfg = DflashConfig::from_hfq(&hfq).expect("parse production DFlash2 draft");
+        assert_eq!(cfg.n_layers, 5);
+        assert_eq!(cfg.hidden, 5120);
+        assert_eq!(cfg.block_size, 8);
+        assert_eq!(cfg.selector_rank, Some(256));
+        assert_eq!(cfg.selector_top_k, Some(16));
+        assert_eq!(cfg.conv_group_size, Some(16));
+        assert_eq!(cfg.conv_kernel_size, Some(2));
+        assert_eq!(cfg.runtime_block_size(), 16);
+        assert_eq!(cfg.declared_window, Some(2048));
+        assert!(cfg.all_layers_sliding);
+
+        let names: std::collections::HashSet<&str> =
+            hfq.tensors().iter().map(|t| t.name.as_str()).collect();
+        let present = |n: &str| names.contains(n);
+        super::admit_selector_tensors(&present).expect("production selector tensors");
+        for i in 0..cfg.n_layers {
+            let p = format!("layers.{i}");
+            let attn_base = [
+                format!("{p}.self_attn.attention_conv.base_kernel"),
+                format!("{p}.attention_conv.base_kernel"),
+            ];
+            let attn_proj = [
+                format!("{p}.self_attn.attention_conv.kernel_projection.weight"),
+                format!("{p}.attention_conv.kernel_projection.weight"),
+            ];
+            let mlp_base = [
+                format!("{p}.mlp.mlp_conv.base_kernel"),
+                format!("{p}.mlp_conv.base_kernel"),
+            ];
+            let mlp_proj = [
+                format!("{p}.mlp.mlp_conv.kernel_projection.weight"),
+                format!("{p}.mlp_conv.kernel_projection.weight"),
+            ];
+            let attn_base_refs: Vec<&str> = attn_base.iter().map(String::as_str).collect();
+            let attn_proj_refs: Vec<&str> = attn_proj.iter().map(String::as_str).collect();
+            let mlp_base_refs: Vec<&str> = mlp_base.iter().map(String::as_str).collect();
+            let mlp_proj_refs: Vec<&str> = mlp_proj.iter().map(String::as_str).collect();
+            super::admit_conv_pair(
+                &attn_base_refs,
+                &attn_proj_refs,
+                &present,
+                &format!("layer {i} attention_conv"),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            super::admit_conv_pair(
+                &mlp_base_refs,
+                &mlp_proj_refs,
+                &present,
+                &format!("layer {i} mlp_conv"),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
     }
 }
 

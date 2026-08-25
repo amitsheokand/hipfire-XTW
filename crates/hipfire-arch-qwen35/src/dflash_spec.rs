@@ -426,8 +426,8 @@ pub fn load_dflash_state(
     // DEFAULT window (below), so the artifact must be parsed before the
     // windowed-vs-Legacy decision.
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
-    let draft_config = DflashConfig::from_hfq(&draft_hfq)
-        .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    let draft_config = DflashConfig::from_metadata_json(&draft_hfq.metadata_json)
+        .map_err(|e| format!("draft: {e}"))?;
 
     // Windowed draft context:
     //   - Legacy DFlash (n−1 sliding + last full): layers 0..n−2 attend over
@@ -535,7 +535,7 @@ pub fn load_dflash_state(
         };
     }
     let draft_weights = or_free!(DflashWeights::load(gpu, &draft_hfq, &draft_config), "");
-    let block_size = draft_config.runtime_block_size();
+    let block_size = draft_weights.runtime_block_size(&draft_config);
     if block_size != draft_config.block_size {
         eprintln!(
             "  DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",

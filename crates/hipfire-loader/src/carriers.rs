@@ -912,13 +912,7 @@ impl Carrier for LlamaCarrier {
                     // Parse DflashConfig to validate the cross-attention concat invariant
                     // (review finding L4): the drafter's hidden must equal the target dim.
                     let draft_cfg = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
-                        .ok_or_else(|| {
-                            format!(
-                                "DFlash draft '{}' has arch_id=20 but missing or malformed \
-                                 'dflash' metadata block",
-                                dp
-                            )
-                        })?;
+                        .map_err(|e| format!("DFlash draft '{dp}': {e}"))?;
                     if bundle.config.dim != draft_cfg.hidden {
                         return Err(format!(
                             "DFlash draft '{}' hidden={} != target dim={} \

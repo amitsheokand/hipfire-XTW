@@ -1042,10 +1042,9 @@ pub fn build_generic_dflash_speculator(
     ctx_capacity: usize,
 ) -> Result<Box<dyn Speculator>, String> {
     let draft_hfq = HfqFile::open(Path::new(draft_hfq_path)).map_err(|e| format!("{e}"))?;
-    let config = DflashConfig::from_hfq(&draft_hfq)
-        .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    let config = DflashConfig::from_metadata_json(&draft_hfq.metadata_json)?;
     let weights = DflashWeights::load(gpu, &draft_hfq, &config).map_err(|e| format!("{e}"))?;
-    let block_size = config.block_size;
+    let block_size = weights.runtime_block_size(&config);
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.
     // new_with_mq only for an MQ-quantized draft.
     let scratch = if weights.has_mq {

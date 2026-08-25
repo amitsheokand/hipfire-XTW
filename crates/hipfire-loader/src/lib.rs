@@ -1682,8 +1682,22 @@ fn finish_qwen35_load(
         ) {
             Ok(s) => {
                 eprintln!(
-                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size
+                    "  DFlash draft loaded: {} (layers={}, hidden={}, declared_B={} runtime_B={} selector={} conv={})",
+                    dp,
+                    s.draft_config.n_layers,
+                    s.draft_config.hidden,
+                    s.draft_config.block_size,
+                    s.block_size,
+                    if s.draft_weights.has_candidate_selector() {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    if s.draft_config.conv_kernel_size.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    },
                 );
                 Some(s)
             }
