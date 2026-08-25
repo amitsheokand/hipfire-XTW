@@ -241,6 +241,16 @@ RDNA because CDNA won.
 - Adaptive BT already maps N=256 → B=8 exact and N=192 → B=12 exact.
 - Same Qwen3.8-27B MQ4 pp2520: 256 → **715.9**, 192 → 723.6 (**+1.1%**).
 - Wash. Do not change the default chunk. Do not re-add Muse B=16.
+- Extra: qkvza/qkv **bt12 spill** (256 VGPR, 21 spill, 480 B scratch). gate_up
+  bt12 is spill-free at 248 VGPR. Another reason 192 cannot win e2e.
+
+### gfx12 gate_up BT `gcn-iterative-ilp`
+
+- Production bt8 is **139 VGPR / 0 spill / ~11 waves** (RDNA4 1536 VGPR file).
+  Occupancy is not the binder. Muse affine residual already lost at N=256.
+- `HIPFIRE_COMPILER_FLAGS: -mllvm -misched=gcn-iterative-ilp` on
+  `gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip`: waits 865→839, pp2520 **732.1→732.8**.
+  Wash. Reverted. Do not ship the flag.
 
 ### gfx12 16×16 i8 HFQ4 MMQ as dense-prefill default
 
