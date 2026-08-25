@@ -203,7 +203,11 @@ impl ArchCaps {
     }
 
     pub fn should_use_mmq(&self, batch_size: usize) -> bool {
-        if !self.has_mmq {
+        // `has_mmq` is gfx906 ∪ RDNA3. gfx12 still ships
+        // `gemm_hfq4g256_residual_mmq.gfx12.hip` (16×16 i8 WMMA) but default
+        // dense prefill stays on fused fp16 WMMA until that route is measured.
+        // HIPFIRE_MMQ=1 is the opt-in; do not fold RDNA4 into `has_mmq` here.
+        if !self.has_mmq && !(self.is_rdna4 && self.flags.mmq_override == Some(true)) {
             return false;
         }
         match self.flags.mmq_override {
@@ -442,6 +446,7 @@ impl ArchCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::FeatureFlags;
     use std::sync::Arc;
 
     fn default_flags() -> Arc<FeatureFlags> {
@@ -699,7 +704,7 @@ mod tests {
     fn mmq_cutoff_behavior_preserving_post_split() {
         // The dGPU/iGPU split keeps the gfx11 cutoff at 128 on BOTH arms, and
         // gfx1103 (orphan) stays at 128 too. gfx1100 + gfx1151 stay identical.
-        // (rdna4 lacks has_mmq so it short-circuits to false — not tested here.)
+        // (rdna4 lacks has_mmq so the default short-circuits to false.)
         for arch in &["gfx1100", "gfx1151", "gfx1150", "gfx1152", "gfx1103"] {
             let caps = make_caps(arch);
             assert!(
@@ -707,6 +712,24 @@ mod tests {
                 "{arch} should not use mmq below 128"
             );
             assert!(caps.should_use_mmq(128), "{arch} should use mmq at 128");
+        }
+        for arch in &["gfx1200", "gfx1201"] {
+            let caps = make_caps(arch);
+            assert!(
+                !caps.has_mmq(),
+                "{arch} must not gain has_mmq via this opt-in"
+            );
+            assert!(
+                !caps.should_use_mmq(256),
+                "{arch} default prefill stays fused fp16 WMMA"
+            );
+            let mut flags = FeatureFlags::for_test(arch);
+            flags.mmq_override = Some(true);
+            let forced = ArchCaps::new(arch, Arc::new(flags));
+            assert!(
+                forced.should_use_mmq(1),
+                "{arch} HIPFIRE_MMQ=1 must reach the gfx12 MMQ kernel"
+            );
         }
     }
 }
