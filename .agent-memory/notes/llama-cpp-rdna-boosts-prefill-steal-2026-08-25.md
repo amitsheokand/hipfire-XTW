@@ -29,5 +29,7 @@ and is a real +11% vs legacy LDS/tiled. It was invisible to `HIPFIRE_PROFILE`
 until `attention_q8_0_flash_prefill_wmma` got `begin_timer` (same omission class
 as gfx12 Q8 GEMM in `docs/lessons_learned/gfx12_prefill_wmma_2026_05_19.md`).
 Timed pp2520: FA **6.9%**, GDN 4.8%, gate_up+residual+qkvza WMMA **~80%**.
-Closing the remaining gap vs llama.cpp pp is GEMM tile/occupancy, not FA and
-not ubatch. Do not flip FA default off.
+The GEMM tile/occupancy hunt is **closed** (see
+`gfx12-mq4-prefill-gemm-hunt-closed-2026-08-25`). Best hipfire pp2520 after
+FA QKV BT is **732**. Do not flip FA default off. Do not re-open B-width,
+chunk 192, MMQ, ubatch 2048, or `gcn-iterative-ilp` on gate_up BT.

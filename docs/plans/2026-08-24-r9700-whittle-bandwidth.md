@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| State | **step 4 measured** (32k FA-tile tax fixed 2026-08-25; pager not indicated) |
+| State | **closed on this box** (step 4 measured 2026-08-25; pager not indicated; dense MQ4 prefill GEMM tile hunt closed) |
 | Date | 2026-08-24 |
 | Hardware | Radeon AI PRO R9700 (`gfx1201`), 32 GB GDDR6, decode DRAM roofline ~631 GB/s |
 | Dense floor | Qwen3.8-27B MQ4 (selected 2026-08-24; not an admission) |
