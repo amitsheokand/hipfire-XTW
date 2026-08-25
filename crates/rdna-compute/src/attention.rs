@@ -157,11 +157,7 @@ fn q8_flash_keep_max_tile_grid(gpu: &Gpu) -> bool {
 }
 
 #[inline]
-fn replay_stable_tile_count(
-    actual_tiles: usize,
-    max_tiles: usize,
-    keep_max_tiles: bool,
-) -> usize {
+fn replay_stable_tile_count(actual_tiles: usize, max_tiles: usize, keep_max_tiles: bool) -> usize {
     if keep_max_tiles {
         max_tiles.max(1)
     } else {
@@ -2762,7 +2758,16 @@ impl Gpu {
         } else {
             batch_size.div_ceil(br) as u32
         };
-        self.launch_maybe_blob(
+        let bytes =
+            crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
+                * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_flash_prefill",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
             "attention_q8_0_flash_prefill",
             [grid_x, n_heads as u32, 1],
             [NTHREADS as u32, 1, 1],
@@ -2786,7 +2791,9 @@ impl Gpu {
                 b.push_ptr(tile_qbase_ptr);
                 b
             },
-        )
+        );
+        crate::profile::end_timer(&self.hip, timer)?;
+        result
     }
 
     /// WMMA (matrix-core) variant of `attention_q8_0_flash_prefill`.
@@ -3000,7 +3007,16 @@ impl Gpu {
         } else {
             batch_size.div_ceil(M_TILE) as u32
         };
-        self.launch_maybe_blob(
+        let bytes =
+            crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, batch_size)
+                * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_flash_prefill_wmma",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
             "attention_q8_0_flash_prefill_wmma",
             [grid_x, n_heads as u32, 1],
             [32, 1, 1],
@@ -3024,7 +3040,9 @@ impl Gpu {
                 b.push_ptr(tile_qbase_ptr);
                 b
             },
-        )
+        );
+        crate::profile::end_timer(&self.hip, timer)?;
+        result
     }
 
     /// Muse Glimmer-owned sliding-window Q8 WMMA flash prefill (gfx11 + gfx12).
