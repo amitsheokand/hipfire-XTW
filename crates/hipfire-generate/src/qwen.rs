@@ -1833,20 +1833,18 @@ pub fn generate_dflash(
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
-    // qwen35 enforces tool-call grammar POST-acceptance inside the emitter
-    // (`Qwen35Emit::observe`); the emitter now extracts its own `ToolSchema`
-    // list from the raw tool JSON inside `make_spec_emitter`. This wrapper only
-    // honors the `HIPFIRE_QWEN35_GRAMMAR=0` kill-switch by withholding `tools`
-    // (⇒ empty schema ⇒ grammar inactive).
-    let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
+    // qwen35 can enforce Hermes-JSON tool-call grammar POST-acceptance inside
+    // the emitter (`Qwen35Emit::observe`). That constrained decode is OFF for
+    // XML-native Qwen3.5/3.8 (`qwen35_grammar_on` is false unless carnice or
+    // HIPFIRE_QWEN35_GRAMMAR). Withholding `tools` used to disable the protocol
+    // router as well, so DFlash leaked `<tool_call><function=…>` as assistant
+    // text with finish_reason=stop (Pi never executed the tool). Always pass
+    // request tools for routing; grammar is the separate `tool_grammar` flag.
+    let tool_grammar = hipfire_runtime::prompt_frame::qwen35_grammar_on(
         std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
         &m.model_path,
     );
-    let emit_tools: Option<Vec<serde_json::Value>> = if grammar_enabled {
-        tools.map(|t| t.to_vec())
-    } else {
-        None
-    };
+    let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
 
     // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
     // the arch-generic `generate_spec`. This wrapper owns the qwen35/llama-specific
@@ -1899,6 +1897,7 @@ pub fn generate_dflash(
         SpecEmitRequest {
             im_end: im_end_token,
             tools: emit_tools,
+            tool_grammar,
             stop: stop.to_vec(),
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
@@ -2662,6 +2661,7 @@ pub fn generate_spec(
         eos: slot.eos_token(),
         im_end: emit_req.im_end,
         tools: emit_req.tools.as_deref(),
+        tool_grammar: emit_req.tool_grammar,
         stop: emit_req.stop,
         max_think: emit_req.max_think,
         max_tokens,
