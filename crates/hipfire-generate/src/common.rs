@@ -1220,8 +1220,11 @@ pub fn fail_closed_epilogue_after_sync(
 /// + the slot's eos + the tokenizer and calls `carrier.make_spec_emitter`.
 pub struct SpecEmitRequest {
     pub im_end: Option<u32>,
-    /// Raw tool definitions (OpenAI-shape JSON); `None`/empty ⇒ no tool grammar.
+    /// Raw tool definitions (OpenAI-shape JSON); `None` ⇒ tool protocol off.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Constrained tool-call grammar. Independent of [`Self::tools`]: XML-native
+    /// Qwen still needs `tools` for routing when this is false.
+    pub tool_grammar: bool,
     pub stop: Vec<String>,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,

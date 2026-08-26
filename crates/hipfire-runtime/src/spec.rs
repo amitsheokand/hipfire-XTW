@@ -1381,10 +1381,15 @@ pub struct SpecEmitCtx<'a> {
     pub eos: u32,
     /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
     pub im_end: Option<u32>,
-    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
-    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
-    /// tool-call grammar.
+    /// Raw tool definitions from the request (OpenAI-shape JSON). `Some`
+    /// enables the tool-protocol router (Qwen XML / Hermes JSON → structured
+    /// `tool_calls`). Constrained grammar decode is a separate flag
+    /// ([`Self::tool_grammar`]); XML-native Qwen3.5/3.8 must still route when
+    /// grammar is off, or the XML leaks as assistant text with `finish=stop`.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Constrained tool-call grammar (Hermes JSON for Qwen; DSML for ds4).
+    /// Off for XML-native Qwen cards unless `HIPFIRE_QWEN35_GRAMMAR` opts in.
+    pub tool_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).

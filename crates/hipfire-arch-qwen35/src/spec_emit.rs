@@ -121,7 +121,10 @@ impl<'a> Qwen35Emit<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let grammar_active = !tool_schemas.is_empty();
+        // Grammar is Hermes-JSON constrained decode (carnice / explicit env).
+        // Protocol routing must stay on whenever the request declared tools,
+        // including XML-native Qwen3.8 (grammar defaults off).
+        let grammar_active = ctx.tool_grammar && !tool_schemas.is_empty();
         let open_think_prefix = matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink);
         Box::new(Self {
             tokenizer: ctx.tokenizer,
@@ -613,6 +616,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: Some(&[]),
+            tool_grammar: false,
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,
@@ -707,6 +711,68 @@ mod tests {
         let calls = held_calls(&finish);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn valid_qwen_xml_call_held_on_finish() {
+        let body = concat!(
+            "Sure.\n<tool_call>\n<function=bash>\n<parameter=command>\n",
+            "git status --short\n</parameter>\n</function>\n</tool_call>",
+        );
+        let (stream, finish, _) = drive_text(body);
+        assert_eq!(tokens_text(&stream), "Sure.\n");
+        assert!(!tokens_text(&stream).contains("<tool_call>"));
+        assert_eq!(finish.finish_reason, "tool_calls");
+        let calls = held_calls(&finish);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+    }
+
+    #[test]
+    fn xml_native_tools_route_when_grammar_off() {
+        // Production Qwen3.8: grammar defaults off, but Pi still sends `tools`.
+        // Protocol routing must stay on or finish_reason stays `stop` and the
+        // XML leaks into assistant text.
+        let tok = test_tokenizer();
+        let tools = [serde_json::json!({
+            "type": "function",
+            "function": { "name": "bash", "parameters": { "required": ["command"] } }
+        })];
+        let body = concat!(
+            "<tool_call>\n<function=bash>\n<parameter=command>\n",
+            "git status --short\n</parameter>\n</function>\n</tool_call>",
+        );
+        let ids = tok.encode(body);
+        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: Some(&tools),
+            tool_grammar: false,
+            stop: Vec::new(),
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+        let mut first = true;
+        for id in &ids {
+            let outcome = if first {
+                first = false;
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            if outcome.stop.is_some() {
+                break;
+            }
+        }
+        let finish = emit.finish();
+        assert_eq!(finish.finish_reason, "tool_calls");
+        let calls = held_calls(&finish);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
     }
 
     #[test]
@@ -837,6 +903,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            tool_grammar: false,
             stop: vec![first_text.clone()],
             max_think: 0,
             max_tokens: 256,
@@ -865,6 +932,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            tool_grammar: false,
             stop: vec!["STOP".to_string()],
             max_think: 0,
             max_tokens: 256,
