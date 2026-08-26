@@ -3602,8 +3602,9 @@ pub fn attach_mtp_window_timings(
 ///
 /// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
 /// drafts via the Qwen MTP head ([`hipfire_arch_qwen35::mtp_spec`]) instead of
-/// the diffusion drafter. The proven-durable config (27B-3.6 genre sweep, all
-/// genres ≥1.15× AR, lossless): K=3, p_min=0.4, compressed-serial.
+/// the diffusion drafter. Production defaults: K=3 (config `mtp_k`),
+/// arch-derived `p_min` from `MtpSpecState::new` (0.6 on gfx1100/1101/1102,
+/// 0.0 elsewhere so gfx12 keeps the greedy device-token chain), compressed-serial.
 ///
 /// Call sequence (mirrors `mtp_only_demo`):
 ///   1. cold-reset trunk DeltaNet/KV (v1 is single-turn — no LCP cache),
@@ -3686,13 +3687,18 @@ pub fn generate_qwen35_mtp(
     // ── Resolve the proven-durable MTP config + ngram-mod env controls ─
     // Ordinary MTP draft depth (proposal-buffer / with_k budget). Kept as
     // `mtp_k` so a larger verify capacity never inflates native MTP depth.
-    // p_min defaults to 0.4. Both env-overridable so the GPU-validation thread
-    // can sweep. `set_p_min(0.4)` is applied below unconditionally (the
-    // MtpSpecState::new default p_min is arch-derived; we pin the proven value
-    // for the serve path and let HIPFIRE_MTP_P_MIN win).
-    let mtp_k: usize = Some(hipfire_runtime::config::get().mtp_k)
-        .filter(|k| (1..=8).contains(k))
-        .unwrap_or(3);
+    // Draft-chain p_min lives on `MtpSpecState::new` (HIPFIRE_MTP_P_MIN, else
+    // 0.6 on gfx1100/1101/1102, 0.0 elsewhere). Do not pin 0.4 here: p_min>0
+    // disables the greedy device-token chain and the old serve pin made gfx12
+    // MTP slower than AR despite τ≈1.85.
+    let mtp_k: usize = {
+        let k = if (1..=8).contains(&m.mtp_k) {
+            m.mtp_k
+        } else {
+            hipfire_runtime::config::get().mtp_k
+        };
+        k.clamp(1, 8)
+    };
     // Upstream-style long-gated ngram-mod: opt-in only for greedy non-thinking
     // requests. The request contract uses `max_think_tokens == 1` as the
     // explicit no-thinking sentinel; zero means uncapped thinking.
@@ -3751,11 +3757,6 @@ pub fn generate_qwen35_mtp(
         None
     };
     let mtp_ngram = ngram_mod_pool.is_some();
-    let p_min: f32 = std::env::var("HIPFIRE_MTP_P_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|p: &f32| (0.0..=1.0).contains(p))
-        .unwrap_or(0.4);
 
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
@@ -4140,12 +4141,9 @@ pub fn generate_qwen35_mtp(
     }
     if temp > 1e-6 {
         // Sampled MTP. temp/top_p/top_k AND the sampling min_p are honored (folded
-        // into the GPU nucleus tau). The draft-chain p_min now ALSO composes with
-        // sampling via DraftMode::SampledPMin (sampled draft + early chain-cutoff
-        // on the head's raw top prob — lossless, the tau lever for sampled MTP), so
-        // we feed the resolved p_min through instead of clearing it. p_min<=0
-        // (HIPFIRE_MTP_P_MIN=0) → plain DraftMode::Sampled (no chain pruning).
-        state.set_p_min(p_min);
+        // into the GPU nucleus tau). Draft-chain p_min stays the constructor
+        // default (HIPFIRE_MTP_P_MIN / arch). SampledPMin composes when that
+        // default is >0; HIPFIRE_MTP_P_MIN=0 → plain DraftMode::Sampled.
         // set_sampling asserts top_p in (0,1]; a request top_p of 0.0 means
         // "disabled", so clamp it to 1.0 (the no-nucleus sentinel).
         let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
@@ -4158,8 +4156,6 @@ pub fn generate_qwen35_mtp(
             },
             42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
         );
-    } else {
-        state.set_p_min(p_min); // greedy MTP confidence cutoff
     }
 
     let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new

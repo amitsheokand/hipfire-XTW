@@ -64,7 +64,8 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
-    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor};
+    rotate_x_mq_for, weight_gemv, weight_gemv_prerotated, EmbeddingFormat, WeightTensor,
+};
 use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
@@ -1142,6 +1143,26 @@ fn weight_tensor_from_raw(
                 awq_scale: None,
             })
         }
+        44 => {
+            // MQ4G256V2 (qt44) — same 136 B/group stride as qt13, dual-f16
+            // header. The published Ornith 1.5 sidecar is this type. Do NOT
+            // map it to MQ4G256: the qt13 kernels read bytes [0..8) as one
+            // f32 scale + f32 zero.
+            assert!(
+                k % 256 == 0,
+                ".mtp tensor '{name}' is MQ4G256V2 with K={k} not divisible by 256"
+            );
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         3 => {
             // Q8_F16 (group_size=32, 34 bytes/group) — same byte layout as
             // GGML Q8_0; existing gemv_q8_0 dispatch works directly.
@@ -1192,7 +1213,7 @@ fn weight_tensor_from_raw(
         }
         other => panic!(
             ".mtp tensor '{name}': unsupported quant_type={other} \
-             (mtp_extract emits MQ4G256=13, Q8_F16=3, F16=1, F32=2)"
+             (supported: MQ4G256=13, MQ4G256V2=44, Q8_F16=3, F16=1, F32=2)"
         ),
     }
 }
@@ -1732,6 +1753,34 @@ fn mtp_moe_ffn_decode(
             ffn.shared_expert.down.m,
             ffn.shared_expert.down.k,
         )?;
+    } else if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256V2 {
+        // qt44 has no fused sigmoid-scaled residual twin. Keep the rotate
+        // fused with silu*up, then a v2 GEMV + scalar residual — not the
+        // generic weight_gemv else-branch (extra rotate + no fused silu).
+        gpu.ensure_mq_signs()?;
+        gpu.sigmoid_f32(scalar_buf)?;
+        let x_rot_alias = GpuTensor {
+            buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            dtype: DType::F32,
+        };
+        fused_silu_mul_rotate_mq_for(
+            gpu,
+            &ffn.shared_expert.down,
+            &shared_gate,
+            &shared_up,
+            &x_rot_alias,
+            smi,
+        )?;
+        // x_rot_alias is already FWHT-rotated; weight_gemv would rotate again.
+        weight_gemv_prerotated(
+            gpu,
+            &ffn.shared_expert.down,
+            &x_rot_alias,
+            Some(&x_rot_alias),
+            ffn_out,
+        )?;
+        gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, ffn_out, scalar_buf)?;
     } else {
         gpu.sigmoid_f32(scalar_buf)?;
         let shared_hid = ffn_hidden.sub_offset(0, smi);
@@ -1741,40 +1790,64 @@ fn mtp_moe_ffn_decode(
     }
 
     let e0 = ffn.experts.first().expect("MoE MTP has no routed experts");
-    assert_eq!(
+    let qt44 = e0.gate_up.gpu_dtype == DType::MQ4G256V2 && e0.down.gpu_dtype == DType::MQ4G256V2;
+    let qt13 = e0.gate_up.gpu_dtype == DType::MQ4G256 && e0.down.gpu_dtype == DType::MQ4G256;
+    assert!(
+        qt44 || qt13,
+        "MoE MTP routed experts require uniform MQ4G256 or MQ4G256V2, got gate_up={:?} down={:?}",
         e0.gate_up.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed gate_up currently requires MQ4G256"
-    );
-    assert_eq!(
-        e0.down.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed down currently requires MQ4G256"
+        e0.down.gpu_dtype
     );
     rotate_x_mq_for(gpu, &e0.gate_up, x_norm, x_rot, dim)?;
-    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-        &ffn.expert_gate_up_ptrs,
-        topk_indices,
-        x_rot,
-        gate_batch,
-        up_batch,
-        2 * mi,
-        e0.gate_up.k,
-        k_top,
-    )?;
+    if qt44 {
+        // qt44 indexed GEMVs. Same 136 B stride as qt13, different header.
+        gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
+            &ffn.expert_gate_up_ptrs,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            2 * mi,
+            e0.gate_up.k,
+        )?;
+    } else {
+        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+            &ffn.expert_gate_up_ptrs,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            2 * mi,
+            e0.gate_up.k,
+            k_top,
+        )?;
+    }
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
     )?;
-    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-        &ffn.expert_down_ptrs,
-        topk_indices,
-        rot_batch,
-        down_expanded,
-        e0.down.m,
-        e0.down.k,
-        k_top,
-        1,
-    )?;
+    if qt44 {
+        gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            topk_indices,
+            rot_batch,
+            down_expanded,
+            e0.down.m,
+            e0.down.k,
+            k_top,
+            1,
+        )?;
+    } else {
+        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            topk_indices,
+            rot_batch,
+            down_expanded,
+            e0.down.m,
+            e0.down.k,
+            k_top,
+            1,
+        )?;
+    }
     gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, x_residual, e0.down.m, k_top, 1)?;
 
     Ok(())
@@ -1907,6 +1980,25 @@ pub fn mtp_head_apply_lm_head_batched(
                 n,
             )?;
             gpu.gemm_hfq4g256_batched_lmhead(
+                &lm_head_weights.buf,
+                &rot_view,
+                &logits_view,
+                lm_head_weights.m,
+                lm_head_weights.k,
+                n,
+            )?;
+        }
+        DType::MQ4G256V2 => {
+            let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                lm_head_weights,
+                tmp_batched,
+                &rot_view,
+                lm_head_weights.k,
+                n,
+            )?;
+            gpu.gemm_mq4g256v2_batched_lmhead(
                 &lm_head_weights.buf,
                 &rot_view,
                 &logits_view,
@@ -2126,6 +2218,11 @@ fn weight_gemm_batched(
             let rot = rotated_x_scratch.expect("MQ4 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
             gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
+        }
+        DType::MQ4G256V2 => {
+            let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
+            llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
+            gpu.gemm_mq4g256v2(&w.buf, rot, y_batched, w.m, w.k, n)
         }
         DType::F32 => {
             // Fallback: per-row gemv (slow but correct). MTP head loaded via
