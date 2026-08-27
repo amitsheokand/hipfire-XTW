@@ -1,0 +1,2 @@
+# Isolated HIPFIRE_HOME from serve_harness (JIT cache, pids, model links)
+harness-home-*/

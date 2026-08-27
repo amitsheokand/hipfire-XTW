@@ -1,0 +1,110 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/amitsheokand/.hipfire/models/qwen38-27b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 12578,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 32558,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "speculation": "dflash",
+  "decode_tok_s": {
+    "median": 153.7,
+    "mean": 142.83999999999997,
+    "min": 99.1,
+    "max": 154.1,
+    "stdev": 21.870857322016438
+  },
+  "prefill_tok_s": {
+    "median": 479.3,
+    "mean": 477.76000000000005,
+    "min": 471.6,
+    "max": 479.9,
+    "stdev": 3.128961489056701
+  },
+  "wall_tok_s": {
+    "median": 116.2,
+    "mean": 109.32000000000001,
+    "min": 81.8,
+    "max": 116.4,
+    "stdev": 13.760581383066636
+  },
+  "ttft_ms": {
+    "median": 269.2,
+    "mean": 270.02000000000004,
+    "min": 268.8,
+    "max": 273.5,
+    "stdev": 1.7679366504487681
+  },
+  "tau": {
+    "median": 9.58,
+    "mean": 9.58,
+    "min": 9.58,
+    "max": 9.58,
+    "stdev": 0.0
+  },
+  "samples": {
+    "decode": [
+      99.1,
+      153.5,
+      154.1,
+      153.7,
+      153.8
+    ],
+    "prefill": [
+      471.6,
+      478.3,
+      479.7,
+      479.9,
+      479.3
+    ],
+    "wall": [
+      81.8,
+      116.0,
+      116.4,
+      116.2,
+      116.2
+    ],
+    "ttft_ms": [
+      273.5,
+      269.7,
+      268.9,
+      268.8,
+      269.2
+    ],
+    "tau": [
+      9.58,
+      9.58,
+      9.58,
+      9.58,
+      9.58
+    ]
+  }
+}

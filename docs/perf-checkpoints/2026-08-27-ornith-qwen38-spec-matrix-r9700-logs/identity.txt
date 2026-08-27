@@ -1,0 +1,14 @@
+f40796d841ea722f5b220423eeaae0c08f9cf0a9
+## tmp/ornith-pr610...origin/tmp/ornith-pr610
+?? .commandcode/
+?? docs/perf-checkpoints/2026-08-27-ornith-qwen38-spec-matrix-r9700-logs/
+551c229b3c06874dcfa10fa2f9b0158e  target/release/hipfire
+ac20666040e01f998afe4e516509f38b  target/release/daemon
+d94d3115a3001f08a654d91461d6bdc4  -
+37c5aad9f9efe93b5c47f27256bdf149  benchmarks/prompts/humaneval_3_below_zero.txt
+1d32df5f12c414d3e34c7b35b6611e6c  benchmarks/prompts/bare_factual.txt
+8f347584806e86a5cd7751a5491a2122  /home/amitsheokand/.hipfire/models/ornith-1.5-35b-a3b.mq4
+0cf41c5a36430c3570c509643db102b5  /home/amitsheokand/.hipfire/models/ornith-1.5-35b-a3b.mtp
+129909ad0fed21dcf72b5b9225e85604  /home/amitsheokand/.hipfire/models/qwen38-27b.mq4
+4073099a71b57c15e90b9df4723378df  /home/amitsheokand/.hipfire/models/qwen38-27b.mtp
+cdf5dd280cb8a33455579b7e82ef0a58  /home/amitsheokand/.hipfire/models/qwen38-27b-dflash2.hfq

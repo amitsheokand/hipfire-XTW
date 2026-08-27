@@ -1,0 +1,16 @@
+harness ornith-ar-battery exit=2
+harness ornith-mtp-battery exit=2
+harness AR=2 MTP=2
+WARN: harness failed; continuing to timed matrix (record in checkpoint)
+bench ornith-ar-default exit=0
+bench ornith-mtp-default exit=0
+bench ornith-ar-humaneval exit=0
+bench ornith-mtp-humaneval exit=0
+bench qwen38-ar-default exit=0
+bench qwen38-mtp-default exit=0
+bench qwen38-dflash-default exit=0
+bench qwen38-ar-humaneval exit=0
+bench qwen38-mtp-humaneval exit=0
+bench qwen38-dflash-humaneval exit=0
+=== matrix complete 2026-08-27T16:31:06+05:30 ===
+DONE

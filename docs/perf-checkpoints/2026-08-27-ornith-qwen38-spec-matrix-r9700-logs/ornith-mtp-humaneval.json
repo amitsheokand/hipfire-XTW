@@ -1,0 +1,112 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/amitsheokand/.hipfire/models/ornith-1.5-35b-a3b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5_moe",
+    "dim": 2048,
+    "layers": 40,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 6072,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5_moe",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 32558,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "speculation": "mtp",
+  "decode_tok_s": {
+    "median": 140.7,
+    "mean": 140.7,
+    "min": 140.6,
+    "max": 140.8,
+    "stdev": 0.06324555320337298
+  },
+  "prefill_tok_s": {
+    "median": 1276.4,
+    "mean": 1273.9600000000003,
+    "min": 1266.5,
+    "max": 1277.6,
+    "stdev": 4.048011857690144
+  },
+  "wall_tok_s": {
+    "median": 126.6,
+    "mean": 126.62,
+    "min": 126.5,
+    "max": 126.7,
+    "stdev": 0.07483314773548065
+  },
+  "ttft_ms": {
+    "median": 100.0,
+    "mean": 100.4,
+    "min": 100.0,
+    "max": 101.0,
+    "stdev": 0.4898979485566356
+  },
+  "tau": {
+    "median": 2.54,
+    "mean": 2.54,
+    "min": 2.54,
+    "max": 2.54,
+    "stdev": 0.0
+  },
+  "samples": {
+    "decode": [
+      140.6,
+      140.8,
+      140.7,
+      140.7,
+      140.7
+    ],
+    "prefill": [
+      1266.5,
+      1277.6,
+      1272.9,
+      1276.4,
+      1276.4
+    ],
+    "wall": [
+      126.5,
+      126.7,
+      126.6,
+      126.7,
+      126.6
+    ],
+    "ttft_ms": [
+      101.0,
+      100.0,
+      101.0,
+      100.0,
+      100.0
+    ],
+    "tau": [
+      2.54,
+      2.54,
+      2.54,
+      2.54,
+      2.54
+    ]
+  }
+}

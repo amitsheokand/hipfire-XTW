@@ -1,0 +1,100 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/amitsheokand/.hipfire/models/ornith-1.5-35b-a3b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5_moe",
+    "dim": 2048,
+    "layers": 40,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 6644,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5_moe",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 32558,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "speculation": "off",
+  "decode_tok_s": {
+    "median": 119.8,
+    "mean": 119.34,
+    "min": 117.4,
+    "max": 120.2,
+    "stdev": 1.0307278981380072
+  },
+  "prefill_tok_s": {
+    "median": 2169.9,
+    "mean": 1748.56,
+    "min": 42.2,
+    "max": 2183.8,
+    "stdev": 853.2049990477083
+  },
+  "wall_tok_s": {
+    "median": 113.5,
+    "mean": 97.0,
+    "min": 30.9,
+    "max": 113.8,
+    "stdev": 33.0512934693939
+  },
+  "ttft_ms": {
+    "median": 59.4,
+    "mean": 658.6400000000001,
+    "min": 59.1,
+    "max": 3055.9,
+    "stdev": 1198.6300123057158
+  },
+  "tau": null,
+  "samples": {
+    "decode": [
+      117.4,
+      119.2,
+      119.8,
+      120.1,
+      120.2
+    ],
+    "prefill": [
+      42.2,
+      2183.8,
+      2180.7,
+      2166.2,
+      2169.9
+    ],
+    "wall": [
+      30.9,
+      113.0,
+      113.5,
+      113.8,
+      113.8
+    ],
+    "ttft_ms": [
+      3055.9,
+      59.1,
+      59.2,
+      59.6,
+      59.4
+    ],
+    "tau": []
+  }
+}
