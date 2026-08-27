@@ -577,6 +577,10 @@ async fn handle_request(
             if let Err(error) = gate_chat_completions_tools(&body_val) {
                 return openai_error(&error.to_string(), 400);
             }
+            if let Err(error) = complete::preflight_request(&shared, &body_val) {
+                let message = error.to_string();
+                return openai_error(&message, request_error_status(&message));
+            }
 
             let is_stream = body_val.get("stream").and_then(|v| v.as_bool()) == Some(true);
             let response = if is_stream {
@@ -791,6 +795,8 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         404
     } else if lower.contains("kv budget")
         || lower.contains("max_tokens")
+        || lower.contains("max_seq")
+        || lower.contains("speculation")
         || lower.contains("invalid")
         || lower.contains("required")
         || lower.contains("endpoint adapter")

@@ -2608,7 +2608,7 @@ pub(crate) fn load_params(
 ///
 /// Call only once final `dflash_mode` is known. Config-off must not carry a draft;
 /// a later CLI selector (e.g. `run --spec dflash`) can opt back in here.
-fn project_dflash_draft(params: &mut serde_json::Value, draft: Option<&str>) {
+pub(crate) fn project_dflash_draft(params: &mut serde_json::Value, draft: Option<&str>) {
     if params["dflash_mode"].as_str() == Some("off") {
         if let Some(obj) = params.as_object_mut() {
             obj.remove("draft");
@@ -2623,7 +2623,7 @@ fn project_dflash_draft(params: &mut serde_json::Value, draft: Option<&str>) {
 }
 
 /// Optional draft path from resolved `developer.dflash_draft` (legacy HIPFIRE_DFLASH_DRAFT).
-fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) -> Option<&str> {
+pub(crate) fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) -> Option<&str> {
     match resolved
         .get("developer.dflash_draft")
         .map(|item| &item.value)
@@ -2633,7 +2633,7 @@ fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) -> Option<&
     }
 }
 
-fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
+pub(crate) fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
     match selector {
         "off" => {
             params["dflash_mode"] = serde_json::json!("off");
@@ -8181,6 +8181,7 @@ mod tests {
                     current_reasoning_efforts: Vec::new(),
                     continuous_batch_capable: false,
                     current_max_seq: 0,
+                    current_speculation: None,
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,
