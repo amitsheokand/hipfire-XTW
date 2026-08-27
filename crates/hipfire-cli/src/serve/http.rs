@@ -170,6 +170,11 @@ pub(crate) fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Res
                 request.respond(openai_error(&error.to_string(), 400))?;
                 return Ok(());
             }
+            if let Err(error) = complete::preflight_request(&shared, &body) {
+                let message = error.to_string();
+                request.respond(openai_error(&message, request_error_status(&message)))?;
+                return Ok(());
+            }
             if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
                 respond_streaming(request, shared, body, guard)?;
             } else {
@@ -187,6 +192,8 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         404
     } else if lower.contains("kv budget")
         || lower.contains("max_tokens")
+        || lower.contains("max_seq")
+        || lower.contains("speculation")
         || lower.contains("invalid")
         || lower.contains("required")
         || lower.contains("endpoint adapter")

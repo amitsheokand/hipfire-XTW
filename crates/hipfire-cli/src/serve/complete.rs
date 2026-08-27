@@ -1518,6 +1518,81 @@ pub(crate) fn fold_complete_request_stream(
     }
 }
 
+const SPECULATION_SELECTORS: &[&str] = &["off", "dflash", "mtp", "ngram", "dspark", "auto"];
+
+pub(crate) fn request_speculation(body: &serde_json::Value) -> Result<Option<&str>> {
+    let Some(raw) = body.get("speculation").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    if SPECULATION_SELECTORS.contains(&raw) {
+        return Ok(Some(raw));
+    }
+    bail!("unknown speculation selector '{raw}'");
+}
+
+pub(crate) fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
+    let mut chars = 0u64;
+    if let Some(prompt) = body.get("prompt").and_then(serde_json::Value::as_str) {
+        chars = chars.saturating_add(prompt.chars().count() as u64);
+    }
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            match message.get("content") {
+                Some(serde_json::Value::String(text)) => {
+                    chars = chars.saturating_add(text.chars().count() as u64);
+                }
+                Some(serde_json::Value::Array(parts)) => {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                            chars = chars.saturating_add(text.chars().count() as u64);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    chars.div_ceil(2).max(1)
+}
+
+pub(crate) fn required_context_tokens(prompt_tokens: u64, max_tokens: u64) -> u64 {
+    prompt_tokens.saturating_add(max_tokens).saturating_add(1)
+}
+
+/// Load/bump the resident model and refuse before generation if the request
+/// cannot fit `prompt + max_tokens` in `max_seq`. Call this before SSE headers.
+pub(crate) fn preflight_request(shared: &ServeShared, body: &serde_json::Value) -> Result<()> {
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("model is required"))?;
+    let speculation = request_speculation(body)?;
+    let mut runtime = shared
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let resolved = runtime.ensure_model(model, &shared.meta, None, speculation)?;
+    let max_tokens = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("max_tokens must be between 1 and 393216");
+    }
+    let required = required_context_tokens(estimate_prompt_tokens(body), max_tokens);
+    if runtime.current_max_seq < required {
+        runtime.ensure_model(model, &shared.meta, Some(required), speculation)?;
+    }
+    if runtime.current_max_seq < required {
+        bail!(
+            "prompt + max_tokens ({required}) exceed loaded max_seq ({})",
+            runtime.current_max_seq
+        );
+    }
+    Ok(())
+}
+
 /// One correlated generation attempt under the shared serve runtime lock.
 ///
 /// `identity` is the public completion identity (stable across retries);
@@ -1571,7 +1646,8 @@ pub(crate) fn complete_request_attempt(
         // Attempt id is allocated by the retry driver before any cold reset /
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
-        let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+        let speculation = request_speculation(body)?;
+        let resolved = runtime.ensure_model(&model, &shared.meta, None, speculation)?;
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
                 if force_reset {
@@ -1585,6 +1661,7 @@ pub(crate) fn complete_request_attempt(
                     runtime.current_reasoning_efforts = Vec::new();
                     runtime.continuous_batch_capable = false;
                     runtime.current_max_seq = 0;
+                    runtime.current_speculation = None;
                     runtime.cache_capable = false;
                 }
                 return Err(error.into());
@@ -1598,9 +1675,16 @@ pub(crate) fn complete_request_attempt(
         if max_tokens == 0 || max_tokens > 393_216 {
             bail!("max_tokens must be between 1 and 393216");
         }
-        let required_max_seq = max_tokens.saturating_add(1024);
+        let required_max_seq =
+            required_context_tokens(estimate_prompt_tokens(body), max_tokens);
         if runtime.current_max_seq < required_max_seq {
-            runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+            runtime.ensure_model(&model, &shared.meta, Some(required_max_seq), speculation)?;
+        }
+        if runtime.current_max_seq < required_max_seq {
+            bail!(
+                "prompt + max_tokens ({required_max_seq}) exceed loaded max_seq ({})",
+                runtime.current_max_seq
+            );
         }
         let include_reasoning_content = runtime.current_arch.as_deref() == Some("muse_glimmer");
         let mut normalized_messages =
@@ -2792,6 +2876,29 @@ mod tests {
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn request_speculation_accepts_known_selectors() {
+        assert_eq!(
+            request_speculation(&serde_json::json!({"speculation": "mtp"})).unwrap(),
+            Some("mtp")
+        );
+        assert!(request_speculation(&serde_json::json!({})).unwrap().is_none());
+        assert!(request_speculation(&serde_json::json!({"speculation": "nope"})).is_err());
+    }
+
+    #[test]
+    fn required_context_includes_prompt_not_just_max_tokens_plus_1024() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "x".repeat(24_000)}],
+            "max_tokens": 32768
+        });
+        let prompt = estimate_prompt_tokens(&body);
+        let required = required_context_tokens(prompt, 32768);
+        assert!(prompt >= 12_000, "estimate {prompt}");
+        assert!(required > 32768 + 1024, "required {required} must exceed the old max_tokens+1024 bump");
+        assert_eq!(required, prompt + 32768 + 1);
+    }
 
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()

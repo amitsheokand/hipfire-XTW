@@ -9,8 +9,9 @@
 //! shared across HTTP workers so transport changes stay isolated.
 
 use crate::{
-    config_bool, config_f64, config_i64, config_string, config_u64, find_daemon, find_model_path,
-    http_get_json, list_local_models, load_params, probe_host, pull_command, resolved_for_model,
+    apply_speculation_selector, config_bool, config_f64, config_i64, config_string, config_u64,
+    developer_dflash_draft, find_daemon, find_model_path, http_get_json, list_local_models,
+    load_params, probe_host, project_dflash_draft, pull_command, resolved_for_model,
     resolved_global, ListArgs, Paths, PullArgs, ServeArgs, StopArgs,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -87,6 +88,7 @@ pub(crate) struct ServeRuntime {
     pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
+    pub(crate) current_speculation: Option<String>,
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_backend_override: Option<String>,
@@ -758,6 +760,7 @@ pub(crate) fn serve_foreground(
             current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
             current_max_seq: 0,
+            current_speculation: None,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
@@ -826,7 +829,7 @@ pub(crate) fn serve_foreground(
                 .runtime
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .ensure_model(&default_model, &shared.meta, None);
+                .ensure_model(&default_model, &shared.meta, None, None);
             {
                 let mut meta = shared
                     .meta
@@ -872,6 +875,7 @@ pub(crate) fn serve_foreground(
                         runtime.current_reasoning_effort_native = false;
                         runtime.current_reasoning_efforts = Vec::new();
                         runtime.current_max_seq = 0;
+                        runtime.current_speculation = None;
                         runtime.cache_capable = false;
                     }
                     result
@@ -962,6 +966,7 @@ impl ServeRuntime {
         model: &str,
         meta: &Mutex<ServeMeta>,
         minimum_max_seq: Option<u64>,
+        speculation: Option<&str>,
     ) -> Result<hipfire_config::ResolvedConfig> {
         let (tag, entry) = self
             .registry
@@ -981,11 +986,16 @@ impl ServeRuntime {
         }
         let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
-        let must_reload = self.current_path.as_ref() != Some(&path)
+        let spec_changed = speculation.is_some_and(|selector| {
+            self.current_speculation.as_deref() != Some(selector)
+        });
+        let path_changed = self.current_path.as_ref() != Some(&path);
+        let must_reload = path_changed
+            || spec_changed
             || minimum_max_seq.is_some_and(|minimum| self.current_max_seq < minimum);
         if must_reload {
             let max_tokens = minimum_max_seq
-                .map(|minimum| minimum.saturating_sub(1024))
+                .map(|minimum| minimum.saturating_sub(1))
                 .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
             let mut params = load_params(
                 &resolved,
@@ -995,12 +1005,40 @@ impl ServeRuntime {
                 self.kv_override.as_deref(),
                 self.kv_backend_override.as_deref(),
             )?;
+            if let Some(minimum) = minimum_max_seq {
+                if params["max_seq"].as_u64().unwrap_or(0) < minimum {
+                    params["max_seq"] = serde_json::json!(minimum);
+                }
+            }
+            if let Some(selector) = speculation {
+                apply_speculation_selector(&mut params, selector)?;
+                project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
+            }
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }
             params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
-            if minimum_max_seq.is_some() {
+            let applied_speculation = speculation
+                .map(str::to_owned)
+                .or_else(|| {
+                    params["speculation"]
+                        .as_str()
+                        .map(str::to_owned)
+                });
+            if path_changed && self.current_path.is_some() {
+                eprintln!(
+                    "[hipfire] swapping resident weights to {} (speculation={})",
+                    path.display(),
+                    applied_speculation.as_deref().unwrap_or("config")
+                );
+            } else if spec_changed {
+                eprintln!(
+                    "[hipfire] reloading {} with speculation={}",
+                    path.display(),
+                    applied_speculation.as_deref().unwrap_or("config")
+                );
+            } else if minimum_max_seq.is_some() {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
             let loaded = self.engine.load(&path, params)?;
@@ -1040,6 +1078,7 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
+            self.current_speculation = applied_speculation;
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .current_model = Some(tag.unwrap_or_else(|| model.to_owned()));
