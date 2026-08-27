@@ -1139,17 +1139,20 @@ impl ServeRuntime {
                 self.multi_slot_ctx
             );
         }
-        let spec_changed = speculation.is_some_and(|selector| {
-            self.current_speculation.as_deref() != Some(selector)
-        });
+        if let Some(minimum) = minimum_max_seq {
+            if self.current_max_seq != 0 && self.current_max_seq < minimum {
+                bail!(
+                    "prompt + max_tokens ({minimum}) exceed loaded max_seq ({})",
+                    self.current_max_seq
+                );
+            }
+        }
+        let spec_changed = speculation
+            .is_some_and(|selector| self.current_speculation.as_deref() != Some(selector));
         let path_changed = self.current_path.as_ref() != Some(&path);
-        let must_reload = path_changed
-            || spec_changed
-            || minimum_max_seq.is_some_and(|minimum| self.current_max_seq < minimum);
+        let must_reload = path_changed || spec_changed;
         if must_reload {
-            let max_tokens = minimum_max_seq
-                .map(|minimum| minimum.saturating_sub(1))
-                .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+            let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
             let mut params = load_params(
                 &resolved,
                 entry,
@@ -1159,8 +1162,9 @@ impl ServeRuntime {
                 self.kv_backend_override.as_deref(),
             )?;
             if let Some(minimum) = minimum_max_seq {
-                if params["max_seq"].as_u64().unwrap_or(0) < minimum {
-                    params["max_seq"] = serde_json::json!(minimum);
+                let configured = params["max_seq"].as_u64().unwrap_or(0);
+                if configured < minimum {
+                    bail!("prompt + max_tokens ({minimum}) exceed loaded max_seq ({configured})");
                 }
             }
             if let Some(selector) = speculation {
@@ -1187,11 +1191,7 @@ impl ServeRuntime {
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
             let applied_speculation = speculation
                 .map(str::to_owned)
-                .or_else(|| {
-                    params["speculation"]
-                        .as_str()
-                        .map(str::to_owned)
-                });
+                .or_else(|| params["speculation"].as_str().map(str::to_owned));
             if path_changed && self.current_path.is_some() {
                 eprintln!(
                     "[hipfire] swapping resident weights to {} (speculation={})",
@@ -1204,8 +1204,6 @@ impl ServeRuntime {
                     path.display(),
                     applied_speculation.as_deref().unwrap_or("config")
                 );
-            } else if minimum_max_seq.is_some() {
-                eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
             let loaded = self.engine.load(&path, params)?;
             if !self.multi_slot_enabled && should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp)
