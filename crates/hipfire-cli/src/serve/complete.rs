@@ -1559,8 +1559,9 @@ pub(crate) fn required_context_tokens(prompt_tokens: u64, max_tokens: u64) -> u6
     prompt_tokens.saturating_add(max_tokens).saturating_add(1)
 }
 
-/// Load/bump the resident model and refuse before generation if the request
-/// cannot fit `prompt + max_tokens` in `max_seq`. Call this before SSE headers.
+/// Load the resident model and refuse before generation if the request cannot
+/// fit `prompt + max_tokens` in the configured `max_seq`. Never bump `max_seq`.
+/// Call this before SSE headers.
 pub(crate) fn preflight_request(shared: &ServeShared, body: &serde_json::Value) -> Result<()> {
     let model = body
         .get("model")
@@ -1581,9 +1582,6 @@ pub(crate) fn preflight_request(shared: &ServeShared, body: &serde_json::Value) 
         bail!("max_tokens must be between 1 and 393216");
     }
     let required = required_context_tokens(estimate_prompt_tokens(body), max_tokens);
-    if runtime.current_max_seq < required {
-        runtime.ensure_model(model, &shared.meta, Some(required), speculation)?;
-    }
     if runtime.current_max_seq < required {
         bail!(
             "prompt + max_tokens ({required}) exceed loaded max_seq ({})",
@@ -1675,11 +1673,7 @@ pub(crate) fn complete_request_attempt(
         if max_tokens == 0 || max_tokens > 393_216 {
             bail!("max_tokens must be between 1 and 393216");
         }
-        let required_max_seq =
-            required_context_tokens(estimate_prompt_tokens(body), max_tokens);
-        if runtime.current_max_seq < required_max_seq {
-            runtime.ensure_model(&model, &shared.meta, Some(required_max_seq), speculation)?;
-        }
+        let required_max_seq = required_context_tokens(estimate_prompt_tokens(body), max_tokens);
         if runtime.current_max_seq < required_max_seq {
             bail!(
                 "prompt + max_tokens ({required_max_seq}) exceed loaded max_seq ({})",
@@ -2883,7 +2877,9 @@ mod tests {
             request_speculation(&serde_json::json!({"speculation": "mtp"})).unwrap(),
             Some("mtp")
         );
-        assert!(request_speculation(&serde_json::json!({})).unwrap().is_none());
+        assert!(request_speculation(&serde_json::json!({}))
+            .unwrap()
+            .is_none());
         assert!(request_speculation(&serde_json::json!({"speculation": "nope"})).is_err());
     }
 
@@ -2896,8 +2892,25 @@ mod tests {
         let prompt = estimate_prompt_tokens(&body);
         let required = required_context_tokens(prompt, 32768);
         assert!(prompt >= 12_000, "estimate {prompt}");
-        assert!(required > 32768 + 1024, "required {required} must exceed the old max_tokens+1024 bump");
+        assert!(
+            required > 32768 + 1024,
+            "required {required} must exceed the old max_tokens+1024 bump"
+        );
         assert_eq!(required, prompt + 32768 + 1);
+    }
+
+    #[test]
+    fn oversize_prompt_is_http_413_not_400() {
+        assert_eq!(
+            crate::serve::http::request_error_status(
+                "prompt + max_tokens (73057) exceed loaded max_seq (65536)"
+            ),
+            413
+        );
+        assert_eq!(
+            crate::serve::http::request_error_status("max_tokens must be between 1 and 393216"),
+            400
+        );
     }
 
     fn test_paths(label: &str) -> Paths {

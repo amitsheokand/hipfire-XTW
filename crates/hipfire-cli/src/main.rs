@@ -1525,9 +1525,7 @@ fn registry_tag_for_filename(registry: &RegistryV1, name: &str) -> Option<String
     let mut hits: Vec<_> = registry
         .models
         .iter()
-        .filter_map(|(tag, model)| {
-            (strip_model_seps(&model.file) == needle).then(|| tag.clone())
-        })
+        .filter_map(|(tag, model)| (strip_model_seps(&model.file) == needle).then(|| tag.clone()))
         .collect();
     hits.sort();
     hits.into_iter().next()
@@ -2602,7 +2600,10 @@ pub(crate) fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) 
     }
 }
 
-pub(crate) fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
+pub(crate) fn apply_speculation_selector(
+    params: &mut serde_json::Value,
+    selector: &str,
+) -> Result<()> {
     match selector {
         "off" => {
             params["dflash_mode"] = serde_json::json!("off");
@@ -2650,6 +2651,20 @@ pub(crate) struct ReasoningResolution {
     pub cap_source: String,
     pub contract: ReasoningContract,
     pub warnings: Vec<String>,
+}
+
+/// Map a dropped `reasoning_effort` string onto the same token caps as
+/// `thinking_budget` (low=512, medium=2048, high=8192, xhigh=24576, max=32768).
+/// `auto` / unknown / disable words yield `None`.
+pub(crate) fn think_tokens_for_effort_preset(effort: &str) -> Option<u64> {
+    match effort {
+        "low" | "minimal" => Some(512),
+        "medium" | "med" => Some(2048),
+        "high" => Some(8192),
+        "xhigh" => Some(24576),
+        "max" => Some(32768),
+        _ => None,
+    }
 }
 
 pub(crate) fn apply_http_reasoning_request(
@@ -3136,6 +3151,24 @@ pub(crate) fn apply_http_reasoning_request(
         effective_cap = None;
         cap_source = "none".to_string();
     }
+    if effective_cap.is_none() && !is_effort_native {
+        let effort_for_cap = effort_raw.or_else(|| {
+            if config_effort_is_explicit && config_effort != "auto" {
+                Some(config_effort.as_str())
+            } else {
+                None
+            }
+        });
+        if let Some(effort) = effort_for_cap {
+            if let Some(mapped) = think_tokens_for_effort_preset(effort) {
+                effective_cap = Some(mapped);
+                cap_source = "mapped:reasoning_effort".to_string();
+                push_warn(format!(
+                    "reasoning_effort '{effort}' is not native; mapped to max_think_tokens={mapped}"
+                ));
+            }
+        }
+    }
     if let Some(value) = effective_cap {
         request["max_think_tokens"] = serde_json::json!(value);
     }
@@ -3143,13 +3176,14 @@ pub(crate) fn apply_http_reasoning_request(
     match contract {
         ReasoningContract::QwenJinja => {
             if !effort_native {
-                if has_explicit_effort {
+                let mapped = cap_source == "mapped:reasoning_effort";
+                if has_explicit_effort && !mapped {
                     push_warn(format!(
                         "reasoning_effort '{}' dropped: template does not natively support effort (Qwen3.6); use thinking_budget or max_think_tokens for cap",
                         effort_raw.unwrap()
                     ));
                 }
-                if config_effort_is_explicit && config_effort != "auto" {
+                if config_effort_is_explicit && config_effort != "auto" && !mapped {
                     push_warn(format!(
                         "reasoning.effort '{}' dropped: template does not natively support effort",
                         config_effort
@@ -8979,7 +9013,7 @@ mod tests {
         assert_eq!(res.effective_cap, Some(2048));
         assert_eq!(res.cap_source, "explicit:body:reasoning.max_tokens");
 
-        // Qwen non-native still drops effort
+        // Qwen non-native maps effort onto a think-token cap
         let mut req2 = serde_json::json!({});
         let res2 = apply_http_reasoning_request(
             &serde_json::json!({ "reasoning_effort": "low" }),
@@ -8991,10 +9025,13 @@ mod tests {
         )
         .unwrap();
         assert!(req2.get("reasoning_effort").is_none());
+        assert_eq!(req2["max_think_tokens"], 512);
+        assert_eq!(res2.effective_cap, Some(512));
+        assert_eq!(res2.cap_source, "mapped:reasoning_effort");
         assert!(res2
             .warnings
             .iter()
-            .any(|w| w.contains("does not natively support effort")));
+            .any(|w| w.contains("mapped to max_think_tokens")));
 
         // DeepSeek effort mapping intact
         let mut req3 = serde_json::json!({});
