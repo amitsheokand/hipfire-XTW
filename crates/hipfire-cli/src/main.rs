@@ -1506,6 +1506,37 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+fn strip_model_seps(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '-' | '.' | '_'))
+        .collect()
+}
+
+fn registry_tag_for_filename(registry: &RegistryV1, name: &str) -> Option<String> {
+    if let Some(tag) = registry
+        .models
+        .iter()
+        .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()))
+    {
+        return Some(tag);
+    }
+    let needle = strip_model_seps(name);
+    if needle.is_empty() {
+        return None;
+    }
+    let mut hits: Vec<_> = registry
+        .models
+        .iter()
+        .filter_map(|(tag, model)| {
+            (strip_model_seps(&model.file) == needle).then(|| tag.clone())
+        })
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
 pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
     let mut candidates = local_model_paths(paths)?;
     if let Ok(catalog) = load_catalog(&paths.config) {
@@ -1534,10 +1565,7 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
         if !is_model_file(&name) {
             continue;
         }
-        let registry_tag = registry
-            .models
-            .iter()
-            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()));
+        let registry_tag = registry_tag_for_filename(registry, &name);
         models.push(LocalModel {
             name,
             path: canonical,
@@ -6160,6 +6188,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn local_listing_matches_registry_tag_ignoring_separators() {
+        let paths = test_paths("listing-seps");
+        let file = paths.models.join("qwen38-27b.mq4");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let models = list_local_models(&paths, &registry).unwrap();
+        let found = models
+            .iter()
+            .find(|model| model.name == "qwen38-27b.mq4")
+            .expect("listed local file");
+        assert_eq!(found.registry_tag.as_deref(), Some("qwen3.8:27b"));
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
