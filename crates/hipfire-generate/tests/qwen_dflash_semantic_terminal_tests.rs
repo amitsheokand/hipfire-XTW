@@ -319,6 +319,8 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(hipfire_generate::qwen::qwen_dflash_apply_cache_action(
             |_, _| panic!("must not insert"),
             &action,
+            &test_tokenizer(),
+            "",
             vec![1, 2]
         )
         .is_none());
@@ -1233,11 +1235,14 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(!action.fingerprint_text.contains("<think>"));
         assert!(action.fingerprint_text.contains("visible"));
         let mut stored = None;
+        let tok = test_tokenizer();
         let fp = hipfire_generate::qwen::qwen_dflash_apply_cache_action(
-            |f, seq| {
-                stored = Some((f, seq));
+            |f, turn| {
+                stored = Some((f, hipfire_generate::common::flatten_qwen_cached_turn_tokens(&turn)));
             },
             &action,
+            &tok,
+            "",
             vec![10, 20, 30],
         );
         assert!(fp.is_some());
@@ -3168,7 +3173,13 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         let mut action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         action.store = effects.store_cache && action.store;
         let mut stored = false;
-        let _ = hipfire_generate::qwen::qwen_dflash_apply_cache_action(|_fp, _seq| stored = true, &action, vec![1, 2, 3]);
+        let _ = hipfire_generate::qwen::qwen_dflash_apply_cache_action(
+            |_fp, _turn| stored = true,
+            &action,
+            &test_tokenizer(),
+            "",
+            vec![1, 2, 3],
+        );
         assert!(!stored);
 
         let ep = hipfire_generate::common::RollbackEpilogue {

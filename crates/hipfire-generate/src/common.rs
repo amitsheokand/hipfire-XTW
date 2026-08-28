@@ -13,6 +13,9 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_loader::{AsstTurnCache, LoadedModel};
+use hipfire_runtime::prompt_frame::{
+    CachedAssistantBody, CachedAssistantToolBody, CachedAssistantTurn, ToolCall,
+};
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::spec::{ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason};
 use hipfire_engine::emit::*;
@@ -164,6 +167,198 @@ pub fn strip_think_for_fingerprint(s: &str) -> String {
 pub fn normalize_asst_turn_for_fingerprint(s: &str) -> String {
     let stripped = strip_think_for_fingerprint(s);
     hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned()
+}
+
+const THINK_CLOSE_MARKER: &str = "</think>";
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
+/// Split emitted assistant body tokens at the think-close boundary (when present).
+/// Returns `(reasoning_prefix, remainder)` where `reasoning_prefix` includes the
+/// close marker and any trailing whitespace the model emitted before answer prose.
+pub fn split_qwen_think_body_tokens(
+    body: &[u32],
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+) -> (Option<Vec<u32>>, Vec<u32>) {
+    if body.is_empty() {
+        return (None, Vec::new());
+    }
+    let decoded = tokenizer.decode(body);
+    let close_idx = decoded.find(THINK_CLOSE_MARKER);
+    if close_idx.is_none() {
+        return (None, body.to_vec());
+    }
+    let close_end = close_idx.unwrap() + THINK_CLOSE_MARKER.len();
+    let mut tail_start = close_end;
+    while tail_start < decoded.len() {
+        let c = decoded[tail_start];
+        if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+            tail_start += 1;
+        } else {
+            break;
+        }
+    }
+    let prefix_decoded = &decoded[..tail_start];
+    let prefix_ids = tokenizer.encode(prefix_decoded);
+    if prefix_ids.len() <= body.len() && body[..prefix_ids.len()] == prefix_ids[..] {
+        let reasoning = body[..prefix_ids.len()].to_vec();
+        let remainder = body[prefix_ids.len()..].to_vec();
+        return (Some(reasoning), remainder);
+    }
+    (None, body.to_vec())
+}
+
+/// Extract per-tool verbatim bodies from the post-reasoning remainder of an
+/// assistant emission. Each body is the full `<tool_call>…</tool_call>` block so
+/// jinja splice can substitute the envelope interior byte-exactly.
+pub fn split_qwen_tool_body_tokens(
+    remainder: &[u32],
+    tool_calls: &[ToolCall],
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+) -> Vec<CachedAssistantToolBody> {
+    if tool_calls.is_empty() {
+        return Vec::new();
+    }
+    let decoded = tokenizer.decode(remainder);
+    let mut bodies = Vec::with_capacity(tool_calls.len());
+    let mut search_from = 0usize;
+    for tc in tool_calls {
+        let rel_open = decoded[search_from..].find(TOOL_CALL_OPEN);
+        if rel_open.is_none() {
+            break;
+        }
+        let open = search_from + rel_open.unwrap();
+        let rel_close = decoded[open..].find(TOOL_CALL_CLOSE);
+        if rel_close.is_none() {
+            break;
+        }
+        let close_end = open + rel_close.unwrap() + TOOL_CALL_CLOSE.len();
+        let block_decoded = &decoded[open..close_end];
+        let block_ids = tokenizer.encode(block_decoded);
+        if block_ids.is_empty() {
+            break;
+        }
+        bodies.push(CachedAssistantToolBody {
+            recipient: tc.name.clone(),
+            token_ids: block_ids,
+        });
+        search_from = close_end;
+    }
+    if bodies.len() != tool_calls.len() {
+        // Single-tool fallback: the whole remainder is one envelope block.
+        if tool_calls.len() == 1 {
+            return vec![CachedAssistantToolBody {
+                recipient: tool_calls[0].name.clone(),
+                token_ids: remainder.to_vec(),
+            }];
+        }
+        return Vec::new();
+    }
+    bodies
+}
+
+/// Flatten a per-channel cached turn back into the scaffold `build_cached_history`
+/// splice shape (`[reasoning?] ++ tools ++ content`).
+pub fn flatten_qwen_cached_turn_tokens(turn: &CachedAssistantTurn) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Some(r) = &turn.reasoning {
+        out.extend_from_slice(&r.token_ids);
+    }
+    for t in &turn.tools {
+        out.extend_from_slice(&t.token_ids);
+    }
+    if let Some(c) = &turn.content {
+        out.extend_from_slice(&c.token_ids);
+    }
+    out
+}
+
+/// Apply the generation primer to the first populated channel for jinja replay.
+pub fn qwen_jinja_replay_cached_turn(turn: &CachedAssistantTurn, primer: &[u32]) -> CachedAssistantTurn {
+    let mut replay = turn.clone();
+    if let Some(r) = &mut replay.reasoning {
+        let mut v = primer.to_vec();
+        v.extend_from_slice(&r.token_ids);
+        r.token_ids = v;
+        return replay;
+    }
+    if let Some(c) = &mut replay.content {
+        let mut v = primer.to_vec();
+        v.extend_from_slice(&c.token_ids);
+        c.token_ids = v;
+        return replay;
+    }
+    if let Some(t) = replay.tools.first_mut() {
+        let mut v = primer.to_vec();
+        v.extend_from_slice(&t.token_ids);
+        t.token_ids = v;
+    }
+    replay
+}
+
+/// Build a channel-aware `CachedAssistantTurn` for Qwen prefix-cache store.
+/// `body_token_ids` is the verbatim generated assistant body (no ChatML surround).
+pub fn qwen_build_cached_assistant_turn(
+    body_token_ids: Vec<u32>,
+    reasoning_text: &str,
+    visible_text: &str,
+    tool_calls: &[ToolCall],
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+) -> CachedAssistantTurn {
+    let (reasoning_ids, remainder) = split_qwen_think_body_tokens(&body_token_ids, tokenizer);
+    let reasoning = if reasoning_text.is_empty() {
+        None
+    } else {
+        let ids = reasoning_ids
+            .unwrap_or_else(|| tokenizer.encode(reasoning_text));
+        Some(CachedAssistantBody {
+            token_ids: ids,
+            text: reasoning_text.clone(),
+        })
+    };
+    if !tool_calls.is_empty() {
+        let tools = split_qwen_tool_body_tokens(&remainder, tool_calls, tokenizer);
+        if tools.len() == tool_calls.len() {
+            return CachedAssistantTurn {
+                reasoning,
+                tools,
+                content: None,
+            };
+        }
+        // Fallback: one envelope block for a single tool call.
+        if tool_calls.len() == 1 {
+            return CachedAssistantTurn {
+                reasoning,
+                tools: vec![CachedAssistantToolBody {
+                    recipient: tool_calls[0].name.clone(),
+                    token_ids: remainder,
+                }],
+                content: None,
+            };
+        }
+    }
+    CachedAssistantTurn {
+        reasoning,
+        tools: Vec::new(),
+        content: Some(CachedAssistantBody {
+            token_ids: remainder,
+            text: visible_text.clone(),
+        }),
+    }
+}
+
+/// Lookup helper: fingerprint hit → replay turn with primer on the first channel.
+pub fn qwen_lookup_cached_assistant_turn(
+    cache: &AsstTurnCache,
+    fp: u64,
+    primer: &[u32],
+) -> Option<CachedAssistantTurn> {
+    cache.get(&fp).and_then(|turn| {
+        if turn.reasoning.is_none() && turn.tools.is_empty() && turn.content.is_none() {
+            return None;
+        }
+        Some(qwen_jinja_replay_cached_turn(turn, primer))
+    })
 }
 
 /// Cancel terminal after production fail-closed rollback attestation.

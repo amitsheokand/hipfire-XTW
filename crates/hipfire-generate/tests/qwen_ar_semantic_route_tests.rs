@@ -21,6 +21,29 @@ use hipfire_generate::common::*;
     use hipfire_generate::{common::emit_spec_cancel_after_rollback, qwen::qwen_client_commit_effects, qwen::QwenClientCommitEffects};
     use std::collections::HashMap;
 
+    fn ar_route_test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
+        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
+            r#"{"model":{"type":"GPT2","vocab_size":1000},"added_tokens":[]}"#,
+        )
+        .expect("tok")
+    }
+
+    fn apply_ar_cache_test(
+        sink: &mut HashMap<u64, Vec<u32>>,
+        action: &QwenArCacheAction,
+        seq: Vec<u32>,
+        reasoning: &str,
+    ) -> Option<u64> {
+        let tok = ar_route_test_tokenizer();
+        qwen_ar_apply_cache_action(
+            |k, turn| sink.insert(k, flatten_qwen_cached_turn_tokens(&turn)),
+            action,
+            &tok,
+            reasoning,
+            seq,
+        )
+    }
+
     /// Drive the real shared producer (same object production uses).
     /// Each chunk is raw-committed as a synthetic token before classify.
     fn drive_ar_semantic_path(
@@ -579,13 +602,7 @@ use hipfire_generate::common::*;
         let mut sink = HashMap::new();
         let action = qwen_ar_cache_action(&fin, &visible);
         assert!(action.store);
-        let fp = qwen_ar_apply_cache_action(
-            |k, v| {
-                sink.insert(k, v);
-            },
-            &action,
-            vec![7, 8, 9],
-        );
+        let fp = apply_ar_cache_test(&mut sink, &action, vec![7, 8, 9], "");
         assert!(fp.is_some());
         assert_eq!(sink.get(&fp.unwrap()).unwrap(), &vec![7, 8, 9]);
 
@@ -725,14 +742,7 @@ use hipfire_generate::common::*;
         let action = qwen_ar_cache_action(&fin, &visible);
         assert!(!action.store);
         let mut sink = HashMap::new();
-        assert!(qwen_ar_apply_cache_action(
-            |k, v| {
-                sink.insert(k, v);
-            },
-            &action,
-            vec![1],
-        )
-        .is_none());
+        assert!(apply_ar_cache_test(&mut sink, &action, vec![1], "").is_none());
         assert!(sink.is_empty());
     }
 
@@ -768,13 +778,7 @@ use hipfire_generate::common::*;
         let mut sink = HashMap::new();
         let action = qwen_ar_cache_action(&fin, &visible);
         assert!(action.store);
-        let fp = qwen_ar_apply_cache_action(
-            |k, v| {
-                sink.insert(k, v);
-            },
-            &action,
-            vec![42],
-        )
+        let fp = apply_ar_cache_test(&mut sink, &action, vec![42], "")
         .expect("store");
         assert_eq!(sink.get(&fp).unwrap(), &vec![42]);
     }
@@ -992,13 +996,7 @@ use hipfire_generate::common::*;
         let fin = fin.expect("stop");
         let action = qwen_ar_cache_action(&fin, &visible);
         let mut sink = HashMap::new();
-        let fp = qwen_ar_apply_cache_action(
-            |k, v| {
-                sink.insert(k, v);
-            },
-            &action,
-            vec![1, 2, 3],
-        )
+        let fp = apply_ar_cache_test(&mut sink, &action, vec![1, 2, 3], "")
         .expect("store");
         assert_eq!(sink.len(), 1);
         assert_eq!(sink[&fp], vec![1, 2, 3]);
@@ -1007,14 +1005,7 @@ use hipfire_generate::common::*;
         let fin_len = fin_len.expect("length");
         let action_len = qwen_ar_cache_action(&fin_len, "Hello world");
         assert!(!action_len.store);
-        assert!(qwen_ar_apply_cache_action(
-            |k, v| {
-                sink.insert(k, v);
-            },
-            &action_len,
-            vec![9],
-        )
-        .is_none());
+        assert!(apply_ar_cache_test(&mut sink, &action_len, vec![9], "").is_none());
         assert_eq!(sink.len(), 1, "length must not mutate sink");
     }
 
@@ -1288,13 +1279,7 @@ use hipfire_generate::common::*;
         let mut cache = HashMap::new();
         let action = qwen_ar_cache_action(&fin, &visible);
         assert!(action.store);
-        let fp = qwen_ar_apply_cache_action(
-            |k, v| {
-                cache.insert(k, v);
-            },
-            &action,
-            vec![1, 2, 3],
-        );
+        let fp = apply_ar_cache_test(&mut cache, &action, vec![1, 2, 3], "");
         assert!(fp.is_some());
         assert_eq!(cache.len(), 1);
         let mut pending = qwen_ar_done_value(
@@ -1364,14 +1349,7 @@ use hipfire_generate::common::*;
         let mut cache = HashMap::new();
         let mut action = qwen_ar_cache_action(&fin, &visible);
         action.store = effects.store_cache && action.store;
-        assert!(qwen_ar_apply_cache_action(
-            |k, v| {
-                cache.insert(k, v);
-            },
-            &action,
-            vec![9, 9]
-        )
-        .is_none());
+        assert!(apply_ar_cache_test(&mut cache, &action, vec![9, 9], "").is_none());
         assert!(cache.is_empty());
 
         // Attested cancel terminal only (no GPU rollback in unit test).
