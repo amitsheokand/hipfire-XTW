@@ -191,11 +191,9 @@ pub fn split_qwen_think_body_tokens(
     let close_end = close_idx.unwrap() + THINK_CLOSE_MARKER.len();
     let mut tail_start = close_end;
     while tail_start < decoded.len() {
-        let c = decoded[tail_start];
-        if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
-            tail_start += 1;
-        } else {
-            break;
+        match decoded.as_bytes()[tail_start] {
+            b' ' | b'\n' | b'\t' | b'\r' => tail_start += 1,
+            _ => break,
         }
     }
     let prefix_decoded = &decoded[..tail_start];
@@ -305,15 +303,22 @@ pub fn qwen_build_cached_assistant_turn(
     tool_calls: &[ToolCall],
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
 ) -> CachedAssistantTurn {
-    let (reasoning_ids, remainder) = split_qwen_think_body_tokens(&body_token_ids, tokenizer);
+    // Empty reasoning text means a content/tool-only store: keep the body
+    // intact. Splitting on `</think>` here would drop a think-shaped prefix
+    // from `remainder` and then discard it because the reasoning channel is
+    // unset (synthetic test seqs and prose that happens to contain the marker).
+    let (reasoning_ids, remainder) = if reasoning_text.is_empty() {
+        (None, body_token_ids)
+    } else {
+        split_qwen_think_body_tokens(&body_token_ids, tokenizer)
+    };
     let reasoning = if reasoning_text.is_empty() {
         None
     } else {
-        let ids = reasoning_ids
-            .unwrap_or_else(|| tokenizer.encode(reasoning_text));
+        let ids = reasoning_ids.unwrap_or_else(|| tokenizer.encode(reasoning_text));
         Some(CachedAssistantBody {
             token_ids: ids,
-            text: reasoning_text.clone(),
+            text: reasoning_text.to_string(),
         })
     };
     if !tool_calls.is_empty() {
@@ -342,14 +347,14 @@ pub fn qwen_build_cached_assistant_turn(
         tools: Vec::new(),
         content: Some(CachedAssistantBody {
             token_ids: remainder,
-            text: visible_text.clone(),
+            text: visible_text.to_string(),
         }),
     }
 }
 
 /// Lookup helper: fingerprint hit → replay turn with primer on the first channel.
 pub fn qwen_lookup_cached_assistant_turn(
-    cache: &AsstTurnCache,
+    cache: &mut AsstTurnCache,
     fp: u64,
     primer: &[u32],
 ) -> Option<CachedAssistantTurn> {
