@@ -33,20 +33,22 @@ pub(crate) fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Res
         .to_owned();
     match (request.method(), path.as_str()) {
         (&Method::Get, "/health") => {
+            let (daemon_status, status_code) = crate::serve::daemon_health(&shared);
             let meta = shared
                 .meta
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             request.respond(json_response(
                 serde_json::json!({
-                    "status": "ok",
+                    "status": if daemon_status == "ok" { "ok" } else { "degraded" },
+                    "daemon": daemon_status,
                     "model": meta.current_model,
                     "loading_model": meta.loading_model,
                     "pid": std::process::id(),
                     "token": meta.instance_token,
                     "native": true,
                 }),
-                200,
+                status_code,
             ))?;
         }
         (&Method::Get, "/stats") => {

@@ -81,6 +81,13 @@ pub(crate) struct ServeRuntime {
     pub(crate) engine: Engine,
     pub(crate) paths: Paths,
     pub(crate) registry: RegistryV1,
+    pub(crate) daemon_path: PathBuf,
+    pub(crate) process_config: hipfire_config::ProcessConfig,
+    /// False after `ClientError::Closed`; cleared on successful respawn.
+    pub(crate) daemon_alive: bool,
+    /// Loaded from the resident model's HFQ metadata for preflight token counting.
+    pub(crate) tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
+    pub(crate) chat_template: Option<String>,
     pub(crate) current_path: Option<PathBuf>,
     pub(crate) current_arch: Option<String>,
     pub(crate) current_reasoning_contract: saddle_core::caps::ReasoningContract,
@@ -753,6 +760,11 @@ pub(crate) fn serve_foreground(
             engine,
             paths: paths.clone(),
             registry: registry.clone(),
+            daemon_path: daemon.clone(),
+            process_config: process_config.clone(),
+            daemon_alive: true,
+            tokenizer: None,
+            chat_template: None,
             current_path: None,
             current_arch: None,
             current_reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
@@ -877,6 +889,8 @@ pub(crate) fn serve_foreground(
                         runtime.current_max_seq = 0;
                         runtime.current_speculation = None;
                         runtime.cache_capable = false;
+                        runtime.tokenizer = None;
+                        runtime.chat_template = None;
                     }
                     result
                 } else {
@@ -960,7 +974,73 @@ pub(crate) fn prewarm_qwen_mq4r_decode(engine: &mut Engine) -> Result<()> {
     }
 }
 
+pub(crate) fn record_daemon_closed(shared: &ServeShared) {
+    shared
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .note_daemon_closed();
+}
+
+pub(crate) fn daemon_health(shared: &ServeShared) -> (&'static str, u16) {
+    let mut runtime = shared
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !runtime.daemon_alive {
+        return ("down", 503);
+    }
+    if runtime.engine.ping().is_ok() {
+        ("ok", 200)
+    } else {
+        runtime.note_daemon_closed();
+        ("down", 503)
+    }
+}
+
 impl ServeRuntime {
+    /// Drop cached model identity so the next request full-reloads after daemon death.
+    pub(crate) fn poison_model_state(&mut self) {
+        self.current_path = None;
+        self.current_arch = None;
+        self.current_reasoning_contract = saddle_core::caps::ReasoningContract::Unsupported;
+        self.current_reasoning_effort_native = false;
+        self.current_reasoning_efforts = Vec::new();
+        self.continuous_batch_capable = false;
+        self.current_max_seq = 0;
+        self.current_speculation = None;
+        self.cache_capable = false;
+        self.tokenizer = None;
+        self.chat_template = None;
+    }
+
+    /// Record daemon death and poison resident model metadata.
+    pub(crate) fn note_daemon_closed(&mut self) {
+        self.daemon_alive = false;
+        self.poison_model_state();
+    }
+
+    /// Respawn the daemon when the prior process exited. No-op while alive.
+    pub(crate) fn ensure_daemon(&mut self) -> Result<()> {
+        if self.daemon_alive {
+            return Ok(());
+        }
+        let engine = Engine::spawn_configured(
+            &self.daemon_path,
+            &BTreeMap::new(),
+            &self.process_config,
+        )?;
+        engine.ping()?;
+        self.engine = engine;
+        self.daemon_alive = true;
+        Ok(())
+    }
+
+    /// Probe liveness without mutating state (for `/health`).
+    pub(crate) fn daemon_ping_ok(&self) -> bool {
+        self.daemon_alive && self.engine.ping().is_ok()
+    }
+
     pub(crate) fn ensure_model(
         &mut self,
         model: &str,
@@ -1042,6 +1122,18 @@ impl ServeRuntime {
             let loaded = self.engine.load(&path, params)?;
             if should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp) {
                 prewarm_qwen_mq4r_decode(&mut self.engine)?;
+            }
+            match hipfire_runtime::hfq::HfqFile::open(&path) {
+                Ok(hfq) => {
+                    self.tokenizer =
+                        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                            .ok();
+                    self.chat_template = hfq.chat_template();
+                }
+                Err(_) => {
+                    self.tokenizer = None;
+                    self.chat_template = None;
+                }
             }
             self.cache_capable = loaded
                 .get("cache_capable")
@@ -1860,5 +1952,104 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(empty_efforts.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_daemon_respawns_after_close() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = test_paths("daemon-respawn");
+        fs::create_dir_all(&paths.root).unwrap();
+        let daemon = paths.root.join("fake-daemon.py");
+        fs::write(&daemon, include_str!("fake_daemon.py")).unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config).unwrap();
+        engine.ping().unwrap();
+        let mut runtime = ServeRuntime {
+            engine,
+            paths: paths.clone(),
+            registry: hipfire_registry::bundled().unwrap(),
+            daemon_path: daemon.clone(),
+            process_config,
+            daemon_alive: true,
+            tokenizer: None,
+            chat_template: None,
+            current_path: Some(paths.models.join("fixture.hfq")),
+            current_arch: Some("qwen35".into()),
+            current_reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            current_reasoning_effort_native: false,
+            current_reasoning_efforts: Vec::new(),
+            continuous_batch_capable: false,
+            current_max_seq: 4096,
+            current_speculation: None,
+            cache_capable: false,
+            kv_override: None,
+            kv_backend_override: None,
+            tp: None,
+            continuous_batch_size: 1,
+        };
+        runtime.note_daemon_closed();
+        assert!(!runtime.daemon_alive);
+        assert!(runtime.current_path.is_none());
+        runtime.ensure_daemon().expect("respawn fake daemon");
+        assert!(runtime.daemon_alive);
+        runtime.engine.ping().expect("respawned daemon answers ping");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_health_reports_down_when_marked_dead() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = test_paths("daemon-health");
+        fs::create_dir_all(&paths.root).unwrap();
+        let daemon = paths.root.join("fake-daemon.py");
+        fs::write(&daemon, include_str!("fake_daemon.py")).unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config).unwrap();
+        let shared = Arc::new(ServeShared {
+            metrics: metrics::Metrics::default(),
+            slot_engine: None,
+            runtime: Mutex::new(ServeRuntime {
+                engine,
+                paths: paths.clone(),
+                registry: hipfire_registry::bundled().unwrap(),
+                daemon_path: daemon,
+                process_config,
+                daemon_alive: false,
+                tokenizer: None,
+                chat_template: None,
+                current_path: None,
+                current_arch: None,
+                current_reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+                current_reasoning_effort_native: false,
+                current_reasoning_efforts: Vec::new(),
+                continuous_batch_capable: false,
+                current_max_seq: 0,
+                current_speculation: None,
+                cache_capable: false,
+                kv_override: None,
+                kv_backend_override: None,
+                tp: None,
+                continuous_batch_size: 1,
+            }),
+            meta: Mutex::new(idle_test_meta()),
+            max_request_bytes: 1024,
+            admission: Arc::new(Admission::new(1, Duration::from_secs(1))),
+            idle_timeout: Duration::from_secs(0),
+            retry_enabled: false,
+            retry_backoff: Duration::from_millis(0),
+            backoff_hook: Mutex::new(None),
+        });
+        let (status, code) = daemon_health(&shared);
+        assert_eq!(status, "down");
+        assert_eq!(code, 503);
     }
 }
