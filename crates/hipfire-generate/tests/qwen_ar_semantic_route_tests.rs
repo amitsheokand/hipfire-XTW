@@ -23,7 +23,7 @@ use hipfire_generate::common::*;
 
     fn ar_route_test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
         hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
-            r#"{"model":{"type":"GPT2","vocab_size":1000},"added_tokens":[]}"#,
+            r#"{"model":{"type":"BPE","vocab":{"x":0},"merges":[]},"added_tokens":[]}"#,
         )
         .expect("tok")
     }
@@ -36,7 +36,9 @@ use hipfire_generate::common::*;
     ) -> Option<u64> {
         let tok = ar_route_test_tokenizer();
         qwen_ar_apply_cache_action(
-            |k, turn| sink.insert(k, flatten_qwen_cached_turn_tokens(&turn)),
+            |k, turn| {
+                sink.insert(k, flatten_qwen_cached_turn_tokens(&turn));
+            },
             action,
             &tok,
             reasoning,

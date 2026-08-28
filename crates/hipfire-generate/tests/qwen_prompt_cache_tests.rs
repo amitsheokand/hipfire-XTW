@@ -6,29 +6,53 @@
 
 use hipfire_generate::common::{
     asst_turn_fingerprint, flatten_qwen_cached_turn_tokens, qwen_build_cached_assistant_turn,
-    qwen_lookup_cached_assistant_turn, split_qwen_think_body_tokens, split_qwen_tool_body_tokens,
+    qwen_lookup_cached_assistant_turn, split_qwen_think_body_tokens,
 };
 use hipfire_generate::qwen::plan_from_rendered;
 use hipfire_loader::AsstTurnCache;
 use hipfire_runtime::prompt_frame::{
-    build_cached_history_jinja, CachedAssistantBody, CachedAssistantToolBody, CachedAssistantTurn,
-    JinjaChatFrame, Message, Role, ToolCall,
+    build_cached_history_jinja, CachedAssistantBody, CachedAssistantTurn, JinjaChatFrame, Message,
+    Role, ToolCall,
 };
 use hipfire_runtime::tokenizer::Tokenizer;
 use serde_json::json;
 
-fn byte_to_gpt2_char(b: u8) -> char {
-    if b == b' ' {
-        'Ġ'
-    } else if (33..=126).contains(&b) {
-        char::from(b)
-    } else {
-        char::from(b)
+fn json_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
     }
+    out
 }
 
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+fn byte_to_gpt2_char(b: u8) -> char {
+    let mut bs: Vec<u32> = Vec::new();
+    bs.extend((b'!' as u32)..=(b'~' as u32));
+    bs.extend((0xA1u32)..=(0xACu32));
+    bs.extend((0xAEu32)..=(0xFFu32));
+    let mut cs: Vec<u32> = bs.clone();
+    let mut n: u32 = 0;
+    for byte in 0u32..=255u32 {
+        if !bs.contains(&byte) {
+            bs.push(byte);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+    for (bb, cc) in bs.into_iter().zip(cs.into_iter()) {
+        if bb == b as u32 {
+            return char::from_u32(cc).unwrap();
+        }
+    }
+    char::from_u32(b as u32).unwrap()
 }
 
 fn test_tokenizer() -> Tokenizer {
@@ -38,6 +62,7 @@ fn test_tokenizer() -> Tokenizer {
     entries.push(r#""<think>": 2"#.to_string());
     entries.push(r#""</think>": 3"#.to_string());
     entries.push(r#""\n": 7"#.to_string());
+    entries.push(r#""Ġ": 8"#.to_string());
     for b in 0u32..=255u32 {
         let ch = byte_to_gpt2_char(b as u8);
         let escaped = json_escape(&ch.to_string());
@@ -170,7 +195,7 @@ fn jinja_splice_hits_with_reasoning_content_and_tool_turn() {
         }
         let normalized = "";
         let fp = asst_turn_fingerprint(normalized, &msg.tool_calls);
-        qwen_lookup_cached_assistant_turn(&cache, fp, &primer)
+        qwen_lookup_cached_assistant_turn(&mut cache, fp, &primer)
     })
     .expect("jinja splice");
 
@@ -199,7 +224,7 @@ fn lookup_replay_prepends_primer_to_reasoning_channel() {
     cache.insert(fp, turn);
 
     let primer = tok.encode("<think>\n");
-    let replay = qwen_lookup_cached_assistant_turn(&cache, fp, &primer).expect("hit");
+    let replay = qwen_lookup_cached_assistant_turn(&mut cache, fp, &primer).expect("hit");
     let mut expected = primer.clone();
     expected.extend_from_slice(&tok.encode("r"));
     assert_eq!(replay.reasoning.as_ref().unwrap().token_ids, expected);

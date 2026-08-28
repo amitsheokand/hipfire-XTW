@@ -4221,6 +4221,7 @@ pub fn generate(
         // Open think → validation terminal (no cache) via finish().
         // finish() shares the same drain + classify path as unit tests.
         let hit_length_cap = generated >= max_tokens;
+        let reasoning_for_cache = semantic.reasoning_acc.clone();
         let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
             Ok(pair) => pair,
             Err(err) => {
@@ -4340,7 +4341,7 @@ pub fn generate(
                 },
                 &cache_action,
                 tokenizer,
-                &semantic.reasoning_acc,
+                &reasoning_for_cache,
                 cached_seq,
             );
         }
