@@ -10,7 +10,9 @@
 //! transformations that convert daemon events into OpenAI responses.
 
 use crate::serve::http::request_id;
-use crate::serve::{Admission, AdmissionGuard, ServeMeta, ServeShared};
+use crate::serve::{
+    record_daemon_closed, Admission, AdmissionGuard, ServeMeta, ServeRuntime, ServeShared,
+};
 use crate::{
     apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
     insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp, Paths,
@@ -1575,29 +1577,169 @@ pub(crate) fn request_speculation(body: &serde_json::Value) -> Result<Option<&st
     bail!("unknown speculation selector '{raw}'");
 }
 
-pub(crate) fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
-    let mut chars = 0u64;
+pub(crate) fn is_daemon_closed_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ClientError>()
+        .is_some_and(ClientError::is_closed)
+}
+
+fn record_closed_if_present(shared: &ServeShared, error: &anyhow::Error) {
+    if is_daemon_closed_error(error) {
+        record_daemon_closed(shared);
+    }
+}
+
+fn map_client_error(shared: &ServeShared, error: ClientError) -> anyhow::Error {
+    if error.is_closed() {
+        record_daemon_closed(shared);
+    }
+    error.into()
+}
+
+/// Collect every UTF-8 byte the chat template may see for conservative preflight.
+fn conservative_prompt_char_bytes(body: &serde_json::Value) -> u64 {
+    let mut bytes = 0u64;
+    let mut push_str = |text: &str| {
+        bytes = bytes.saturating_add(text.len() as u64);
+    };
     if let Some(prompt) = body.get("prompt").and_then(serde_json::Value::as_str) {
-        chars = chars.saturating_add(prompt.chars().count() as u64);
+        push_str(prompt);
     }
     if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
-            match message.get("content") {
-                Some(serde_json::Value::String(text)) => {
-                    chars = chars.saturating_add(text.chars().count() as u64);
+            push_str(&openai_content_text(message.get("content")));
+            for key in ["reasoning", "reasoning_content", "name", "tool_call_id"] {
+                if let Some(text) = message.get(key).and_then(serde_json::Value::as_str) {
+                    push_str(text);
                 }
-                Some(serde_json::Value::Array(parts)) => {
-                    for part in parts {
-                        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
-                            chars = chars.saturating_add(text.chars().count() as u64);
-                        }
-                    }
+            }
+            if let Some(calls) = message.get("tool_calls") {
+                if let Ok(serialized) = serde_json::to_string(calls) {
+                    push_str(&serialized);
                 }
-                _ => {}
             }
         }
     }
-    chars.div_ceil(2).max(1)
+    if let Some(tools) = body.get("tools") {
+        if let Ok(serialized) = serde_json::to_string(tools) {
+            push_str(&serialized);
+        }
+    }
+    bytes.max(1)
+}
+
+pub(crate) fn conservative_prompt_token_estimate(body: &serde_json::Value) -> u64 {
+    conservative_prompt_char_bytes(body)
+}
+
+fn preflight_enable_thinking(body: &serde_json::Value) -> bool {
+    body.get("enable_thinking")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            body.pointer("/chat_template_kwargs/enable_thinking")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
+fn preflight_reasoning_effort<'a>(body: &'a serde_json::Value) -> Option<&'a str> {
+    body.get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn build_preflight_messages_and_tools(
+    body: &serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    include_reasoning_content: bool,
+) -> Result<(serde_json::Value, Option<serde_json::Value>)> {
+    let mut normalized_messages =
+        normalize_openai_messages(body.get("messages"), include_reasoning_content);
+    if normalized_messages
+        .as_array()
+        .is_some_and(|messages| messages.is_empty())
+    {
+        if let Some(prompt) = body.get("prompt").and_then(serde_json::Value::as_str) {
+            normalized_messages = serde_json::json!([{ "role": "user", "content": prompt }]);
+        }
+    }
+    let default_system = request_string(resolved, "prompt.system", None)?;
+    inject_default_system_message(&mut normalized_messages, default_system.as_deref());
+    let (_, forwarded_tools) = project_tool_choice(
+        body.get("tool_choice"),
+        body.get("tools"),
+        &mut normalized_messages,
+    )?;
+    Ok((normalized_messages, forwarded_tools))
+}
+
+fn count_rendered_prompt_tokens(
+    body: &serde_json::Value,
+    runtime: &ServeRuntime,
+    resolved: &hipfire_config::ResolvedConfig,
+) -> Result<u64> {
+    use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message};
+    use hipfire_runtime::tokenizer::maybe_normalize_prompt;
+
+    let tokenizer = runtime
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| anyhow!("tokenizer unavailable"))?;
+    let template = runtime
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| anyhow!("chat template unavailable"))?;
+    let include_reasoning_content = runtime.current_arch.as_deref() == Some("muse_glimmer");
+    let (messages, tools) =
+        build_preflight_messages_and_tools(body, resolved, include_reasoning_content)?;
+    let mut parsed: Vec<Message> = serde_json::from_value(messages)
+        .map_err(|error| anyhow!("preflight messages: {error}"))?;
+    for entry in &mut parsed {
+        if !entry.content.is_empty() {
+            let normalized = maybe_normalize_prompt(&entry.content);
+            if matches!(normalized, std::borrow::Cow::Owned(_)) {
+                entry.content = normalized.into_owned();
+            }
+        }
+    }
+    let prompt = last_user_prompt(&serde_json::to_value(&parsed)?).unwrap_or_else(|| "Hello".into());
+    let frame = JinjaChatFrame {
+        tokenizer,
+        template,
+        system: None,
+        user: &prompt,
+        enable_thinking: preflight_enable_thinking(body),
+        bos_token: None,
+        reasoning_strength: None,
+        reasoning_effort: preflight_reasoning_effort(body),
+    };
+    let tools_slice = tools
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .map(|array| array.as_slice());
+    let rendered = if tools_slice.is_some() || !parsed.is_empty() {
+        frame
+            .render_messages(&parsed, tools_slice, None)
+            .map_err(|error| anyhow!("preflight render: {error}"))?
+    } else {
+        frame
+            .render()
+            .map_err(|error| anyhow!("preflight render: {error}"))?
+    };
+    Ok(tokenizer.encode(&rendered).len() as u64)
+}
+
+pub(crate) fn count_request_prompt_tokens(
+    body: &serde_json::Value,
+    runtime: &ServeRuntime,
+    resolved: &hipfire_config::ResolvedConfig,
+) -> u64 {
+    count_rendered_prompt_tokens(body, runtime, resolved)
+        .unwrap_or_else(|_| conservative_prompt_token_estimate(body))
+}
+
+/// Legacy name retained for tests; prefer [`count_request_prompt_tokens`].
+pub(crate) fn estimate_prompt_tokens(body: &serde_json::Value) -> u64 {
+    conservative_prompt_token_estimate(body)
 }
 
 pub(crate) fn required_context_tokens(prompt_tokens: u64, max_tokens: u64) -> u64 {
@@ -1617,7 +1759,17 @@ pub(crate) fn preflight_request(shared: &ServeShared, body: &serde_json::Value) 
         .runtime
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let resolved = runtime.ensure_model(model, &shared.meta, None, speculation)?;
+    runtime
+        .ensure_daemon()
+        .map_err(|error| {
+            record_closed_if_present(shared, &error);
+            error
+        })?;
+    let resolved = runtime.ensure_model(model, &shared.meta, None, speculation)
+        .map_err(|error| {
+            record_closed_if_present(shared, &error);
+            error
+        })?;
     let max_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
@@ -1626,7 +1778,8 @@ pub(crate) fn preflight_request(shared: &ServeShared, body: &serde_json::Value) 
     if max_tokens == 0 || max_tokens > 393_216 {
         bail!("max_tokens must be between 1 and 393216");
     }
-    let required = required_context_tokens(estimate_prompt_tokens(body), max_tokens);
+    let prompt_tokens = count_request_prompt_tokens(body, &runtime, &resolved);
+    let required = required_context_tokens(prompt_tokens, max_tokens);
     if runtime.current_max_seq < required {
         bail!(
             "prompt + max_tokens ({required}) exceed loaded max_seq ({})",
@@ -1687,28 +1840,30 @@ pub(crate) fn complete_request_attempt(
             .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        runtime
+            .ensure_daemon()
+            .map_err(|error| {
+                record_closed_if_present(shared, &error);
+                error
+            })?;
         // Attempt id is allocated by the retry driver before any cold reset /
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
         let speculation = request_speculation(body)?;
-        let resolved = runtime.ensure_model(&model, &shared.meta, None, speculation)?;
+        let resolved = runtime
+            .ensure_model(&model, &shared.meta, None, speculation)
+            .map_err(|error| {
+                record_closed_if_present(shared, &error);
+                error
+            })?;
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
                 if force_reset {
                     // Rollback could not be attested: model state is unknown, so
                     // the next request must full-reload rather than trust it.
-                    runtime.current_path = None;
-                    runtime.current_arch = None;
-                    runtime.current_reasoning_contract =
-                        saddle_core::caps::ReasoningContract::Unsupported;
-                    runtime.current_reasoning_effort_native = false;
-                    runtime.current_reasoning_efforts = Vec::new();
-                    runtime.continuous_batch_capable = false;
-                    runtime.current_max_seq = 0;
-                    runtime.current_speculation = None;
-                    runtime.cache_capable = false;
+                    runtime.poison_model_state();
                 }
-                return Err(error.into());
+                return Err(map_client_error(shared, error));
             }
         }
         let contract = project_request_contract(
@@ -1717,7 +1872,8 @@ pub(crate) fn complete_request_attempt(
             include_reasoning_content(runtime.current_arch.as_deref()),
         )?;
         let max_tokens = contract.max_tokens;
-        let required_max_seq = required_context_tokens(estimate_prompt_tokens(body), max_tokens);
+        let prompt_tokens = count_request_prompt_tokens(body, &runtime, &resolved);
+        let required_max_seq = required_context_tokens(prompt_tokens, max_tokens);
         if runtime.current_max_seq < required_max_seq {
             bail!(
                 "prompt + max_tokens ({required_max_seq}) exceed loaded max_seq ({})",
@@ -2083,7 +2239,7 @@ pub(crate) fn complete_request_attempt(
         Some(flag) => engine_clone.generate_cancellable(&generate, flag, &mut on_event),
         None => engine_clone.generate(&generate, &mut on_event),
     };
-    let done = gen_result?;
+    let done = gen_result.map_err(|error| map_client_error(shared, error))?;
     let mut meta = shared
         .meta
         .lock()
@@ -2334,11 +2490,12 @@ pub(crate) fn complete_request_cancellable(
                 return Ok(completion);
             }
             Err(error) => {
+                record_closed_if_present(shared, &error);
                 let was_cancelled = cancelled.load(Ordering::Relaxed)
                     || error
                         .downcast_ref::<ClientError>()
                         .is_some_and(|err| matches!(err, ClientError::Cancelled));
-                if was_cancelled {
+                if was_cancelled || is_daemon_closed_error(&error) {
                     return Err(error);
                 }
                 let eligible = {
@@ -3060,14 +3217,57 @@ mod tests {
             "messages": [{"role": "user", "content": "x".repeat(24_000)}],
             "max_tokens": 32768
         });
-        let prompt = estimate_prompt_tokens(&body);
+        let prompt = conservative_prompt_token_estimate(&body);
         let required = required_context_tokens(prompt, 32768);
-        assert!(prompt >= 12_000, "estimate {prompt}");
+        assert_eq!(prompt, 24_000, "conservative byte estimate {prompt}");
         assert!(
             required > 32768 + 1024,
             "required {required} must exceed the old max_tokens+1024 bump"
         );
         assert_eq!(required, prompt + 32768 + 1);
+    }
+
+    #[test]
+    fn conservative_estimate_beats_chars_div2_on_tool_definitions() {
+        let tools = (0..32)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("lookup_{index}"),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}],
+            "tools": tools,
+        });
+        let conservative = conservative_prompt_token_estimate(&body);
+        let old_chars_div2 = 1u64.div_ceil(2).max(1);
+        assert!(
+            conservative > old_chars_div2 + 200,
+            "tool JSON must not be under-counted: conservative={conservative} old={old_chars_div2}"
+        );
+    }
+
+    #[test]
+    fn daemon_closed_is_not_retried() {
+        let aid = 7u64;
+        let closed = anyhow::Error::new(ClientError::Closed {
+            status: "exited".into(),
+        });
+        assert!(is_daemon_closed_error(&closed));
+        assert_eq!(
+            decide_retry(&closed, aid, &AttemptLatches::default(), true, true, 1),
+            RetryDecision::Fail
+        );
     }
 
     #[test]

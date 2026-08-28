@@ -440,16 +440,18 @@ async fn handle_request(
 
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
+            let (daemon_status, status_code) = crate::serve::daemon_health(&shared);
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
             let body = serde_json::json!({
-                "status": "ok",
+                "status": if daemon_status == "ok" { "ok" } else { "degraded" },
+                "daemon": daemon_status,
                 "model": meta.current_model,
                 "loading_model": meta.loading_model,
                 "pid": std::process::id(),
                 "token": meta.instance_token,
                 "native": true,
             });
-            json_response(body, 200)
+            json_response(body, status_code)
         }
         (Method::GET, "/stats") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());

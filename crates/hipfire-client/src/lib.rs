@@ -105,6 +105,11 @@ impl ClientError {
             _ => None,
         }
     }
+
+    /// True when the daemon stdout channel closed (process exit, OOM kill, etc.).
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed { .. })
+    }
 }
 
 /// Return an address suitable for connecting to a server that may be bound to
