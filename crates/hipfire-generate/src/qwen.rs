@@ -1266,7 +1266,7 @@ pub fn plan_prompt_cache(
             let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
             asst_turn_cache
                 .get(&fp)
-                .and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
+                .map(crate::common::flatten_qwen_cached_turn_tokens)
         },
     );
     let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
@@ -1740,25 +1740,8 @@ pub fn generate_dflash(
                 |msg| {
                     let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
                     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // The qwen family has no Harmony reasoning/tool channels: its whole
-                    // assistant turn is one content slot. `text` must be the message's own
-                    // content so the splice's `content.text == m.content` guard
-                    // (prompt_frame.rs) passes trivially and behaviour is byte-identical to
-                    // the pre-per-channel implementation.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
+                    let hit =
+                        crate::common::qwen_lookup_cached_assistant_turn(cache_ref, fp, &primer);
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache jinja lookup dflash] fp={:#018x} role={:?} primer={} hit={}",
@@ -2047,8 +2030,10 @@ pub fn generate_dflash(
                 emit_qwen_dflash_malformed_terminal(stdout, id, message, class, *retryable, ep);
                 // Fail-closed: no done, no cache, no tool release.
                 let _ = qwen_dflash_apply_cache_action(
-                    |_fp, _seq| {},
+                    |_fp, _turn| {},
                     &qwen_dflash_cache_action(&terminal),
+                    tokenizer,
+                    "",
                     cached_seq,
                 );
                 return true;
@@ -2152,32 +2137,33 @@ pub fn generate_dflash(
                             action.fingerprint_text.chars().take(60).collect::<String>(),
                         );
                     }
+                    let reasoning_text = qwen_dflash_reasoning_from_finish(&run.finish);
                     let _ = qwen_dflash_apply_cache_action(
-                        |fp, seq| {
+                        |fp, turn| {
                             if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
                                 == Some("1")
                             {
                                 eprintln!(
                                     "[qwen-cache store dflash] fp={:#018x} cached_seq={}",
                                     fp,
-                                    seq.len()
+                                    turn.content.as_ref().map(|c| c.token_ids.len()).unwrap_or(0)
+                                        + turn
+                                            .reasoning
+                                            .as_ref()
+                                            .map(|r| r.token_ids.len())
+                                            .unwrap_or(0)
+                                        + turn
+                                            .tools
+                                            .iter()
+                                            .map(|t| t.token_ids.len())
+                                            .sum::<usize>()
                                 );
                             }
-                            m.asst_turn_cache.insert(
-                                fp,
-                                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                    reasoning: None,
-                                    tools: Vec::new(),
-                                    content: Some(
-                                        hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                            token_ids: seq,
-                                            text: String::new(),
-                                        },
-                                    ),
-                                },
-                            );
+                            m.asst_turn_cache.insert(fp, turn);
                         },
                         &action,
+                        tokenizer,
+                        &reasoning_text,
                         cached_seq,
                     );
                 }
@@ -2318,17 +2304,14 @@ pub fn generate_dflash(
                     emit_text.chars().take(60).collect::<String>(),
                 );
             }
-            m.asst_turn_cache.insert(
-                fp,
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: None,
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: cached_seq,
-                        text: String::new(),
-                    }),
-                },
+            let turn = crate::common::qwen_build_cached_assistant_turn(
+                cached_seq,
+                "",
+                &emit_text,
+                &wire_calls,
+                tokenizer,
             );
+            m.asst_turn_cache.insert(fp, turn);
         }
         emit_staged_terminal_done(stdout, &pending_done);
     }
@@ -4926,16 +4909,25 @@ pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> QwenDflash
 pub fn qwen_dflash_apply_cache_action<F>(
     mut insert: F,
     action: &QwenDflashCacheAction,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    reasoning_text: &str,
     cached_seq: Vec<u32>,
 ) -> Option<u64>
 where
-    F: FnMut(u64, Vec<u32>),
+    F: FnMut(u64, hipfire_runtime::prompt_frame::CachedAssistantTurn),
 {
     if !action.store || cached_seq.is_empty() {
         return None;
     }
     let fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
-    insert(fp, cached_seq);
+    let turn = crate::common::qwen_build_cached_assistant_turn(
+        cached_seq,
+        reasoning_text,
+        &action.fingerprint_text,
+        &action.tool_calls,
+        tokenizer,
+    );
+    insert(fp, turn);
     Some(fp)
 }
 
@@ -4950,6 +4942,17 @@ pub fn qwen_dflash_decoded_eot_from_tokens(
         return false;
     };
     last == eos || im_end == Some(last) || tokenizer.is_terminator(last)
+}
+
+/// Reasoning-channel text accumulated in finish events (for cache fingerprinting).
+pub fn qwen_dflash_reasoning_from_finish(finish: &FinishSummary) -> String {
+    let mut s = String::new();
+    for ev in &finish.events {
+        if let ClientEvent::Reasoning(t) = ev {
+            s.push_str(t);
+        }
+    }
+    s
 }
 
 /// Visible fingerprint text from held finish events (Token channel only).

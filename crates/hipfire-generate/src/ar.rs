@@ -56,10 +56,12 @@ pub fn qwen_ar_route_think_events(
     router: &mut ToolOutputRouter,
     channel_events: Vec<ThinkRouteEvent>,
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     for channel_event in channel_events {
         match channel_event {
             ThinkRouteEvent::Reasoning(reasoning) => {
+                reasoning_acc.push_str(&reasoning);
                 emit_reasoning_token(stdout, id, &reasoning);
             }
             ThinkRouteEvent::Content(content) => {
@@ -90,10 +92,11 @@ pub fn qwen_ar_route_filter_text(
     router: &mut ToolOutputRouter,
     text: &str,
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     let mut channel_events = Vec::new();
     think_router.push_into(text, &mut channel_events);
-    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
+    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc, reasoning_acc)
 }
 
 /// Outcome of finishing the Qwen AR semantic router for one turn.
@@ -245,19 +248,36 @@ pub fn qwen_ar_observe_and_route(
     router: &mut ToolOutputRouter,
     new_bytes: &[u8],
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<bool, ToolRouteError> {
     match filter.observe(new_bytes) {
         FilterAction::Emit(text_bytes) => {
             let text = std::str::from_utf8(&text_bytes).unwrap_or("");
             if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
+                qwen_ar_route_filter_text(
+                    stdout,
+                    id,
+                    think_router,
+                    router,
+                    text,
+                    visible_acc,
+                    reasoning_acc,
+                )?;
             }
             Ok(false)
         }
         FilterAction::EmitAndStop(text_bytes) => {
             let text = std::str::from_utf8(&text_bytes).unwrap_or("");
             if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
+                qwen_ar_route_filter_text(
+                    stdout,
+                    id,
+                    think_router,
+                    router,
+                    text,
+                    visible_acc,
+                    reasoning_acc,
+                )?;
             }
             Ok(true)
         }
@@ -276,18 +296,27 @@ pub fn qwen_ar_drain_pending_into_router(
     think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     let pending = filter.flush_pending();
     if !pending.is_empty() {
         let text = std::str::from_utf8(&pending).unwrap_or("");
         if !text.is_empty() {
-            qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
+            qwen_ar_route_filter_text(
+                stdout,
+                id,
+                think_router,
+                router,
+                text,
+                visible_acc,
+                reasoning_acc,
+            )?;
         }
     }
 
     let mut channel_events = Vec::new();
     think_router.finish_into(&mut channel_events);
-    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
+    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc, reasoning_acc)
 }
 
 /// Raw-commit bookkeeping shared by production and tests. Advances
@@ -360,16 +389,25 @@ pub fn qwen_ar_cache_action(
 pub fn qwen_ar_apply_cache_action<F>(
     mut insert: F,
     action: &QwenArCacheAction,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    reasoning_text: &str,
     cached_seq: Vec<u32>,
 ) -> Option<u64>
 where
-    F: FnMut(u64, Vec<u32>),
+    F: FnMut(u64, hipfire_runtime::prompt_frame::CachedAssistantTurn),
 {
     if !action.store || cached_seq.is_empty() {
         return None;
     }
     let fp = crate::common::asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
-    insert(fp, cached_seq);
+    let turn = crate::common::qwen_build_cached_assistant_turn(
+        cached_seq,
+        reasoning_text,
+        &action.fingerprint_text,
+        &action.tool_calls,
+        tokenizer,
+    );
+    insert(fp, turn);
     Some(fp)
 }
 
@@ -446,6 +484,7 @@ pub struct QwenArSemanticProducer {
     pub think_router: ThinkOutputRouter,
     pub router: ToolOutputRouter,
     pub visible_acc: String,
+    pub reasoning_acc: String,
     /// Tokens that completed raw-commit before classify for this producer.
     pub raw_committed: Vec<u32>,
     /// Stream positions recorded at each raw commit (testable ordering).
@@ -473,6 +512,7 @@ impl QwenArSemanticProducer {
                 ToolOutputRouter::disabled()
             },
             visible_acc: String::new(),
+            reasoning_acc: String::new(),
             raw_committed: Vec::new(),
             raw_commit_positions: Vec::new(),
             stopped_by_filter: false,
@@ -520,6 +560,7 @@ impl QwenArSemanticProducer {
                     &mut self.router,
                     new_bytes.as_ref(),
                     &mut self.visible_acc,
+                    &mut self.reasoning_acc,
                 )?;
                 if stop {
                     self.stopped_by_filter = true;
@@ -604,6 +645,7 @@ impl QwenArSemanticProducer {
             &mut self.think_router,
             &mut self.router,
             &mut self.visible_acc,
+            &mut self.reasoning_acc,
         )?;
         let open_think = self.think_router.in_think();
         let cause =
@@ -2413,22 +2455,29 @@ pub fn generate(
                     let normalized =
                         crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
                     let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // Content-only turn: see the dflash sibling above for why `text` is
-                    // `msg.content`.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
+                    let hit = crate::common::qwen_lookup_cached_assistant_turn(cache_ref, fp, &primer)
+                        .or_else(|| {
+                            // Legacy flat-only entries stored before per-channel split.
+                            cache_ref.get(&fp).and_then(|turn| {
+                                if turn.reasoning.is_some() || !turn.tools.is_empty() {
+                                    return None;
+                                }
+                                turn.content.as_ref().map(|c| {
+                                    let mut v = primer.clone();
+                                    v.extend_from_slice(&c.token_ids);
+                                    hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                                        reasoning: None,
+                                        tools: Vec::new(),
+                                        content: Some(
+                                            hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                                token_ids: v,
+                                                text: msg.content.clone(),
+                                            },
+                                        ),
+                                    }
+                                })
+                            })
+                        });
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
@@ -2484,12 +2533,11 @@ pub fn generate(
                     let normalized =
                         hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
                     let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // `build_cached_history` (the non-Jinja ChatScaffold path) still splices a
-                    // flat token vector, so project the content slot out of the per-channel
-                    // cache value. Qwen turns are content-only, so nothing is dropped.
+                    // `build_cached_history` splices a flat token vector — flatten any
+                    // per-channel cache entry back into document order.
                     let hit = cache_ref
                         .get(&fp)
-                        .and_then(|turn| turn.content.as_ref().map(|c| c.token_ids.clone()));
+                        .map(crate::common::flatten_qwen_cached_turn_tokens);
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} tool_calls={} hit={}",
@@ -4287,22 +4335,31 @@ pub fn generate(
                 );
             }
             let _ = qwen_ar_apply_cache_action(
-                |fp, seq| {
-                    m.asst_turn_cache.insert(
-                        fp,
-                        hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                            reasoning: None,
-                            tools: Vec::new(),
-                            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                token_ids: seq,
-                                text: String::new(),
-                            }),
-                        },
-                    )
+                |fp, turn| {
+                    m.asst_turn_cache.insert(fp, turn);
                 },
                 &cache_action,
+                tokenizer,
+                &semantic.reasoning_acc,
                 cached_seq,
             );
+        }
+
+        // Semantic-anchor checkpoint: capture recurrent state at the committed
+        // turn boundary so a mid-turn LCP miss can resume near tool/think edges
+        // instead of only at 2048-token periodic slots.
+        if ckpt_resume_enabled() {
+            if let Some(b) = m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }) {
+                speculative::take_dn_checkpoint_boundary(
+                    &mut m.prefill_checkpoints,
+                    &b.dn_state,
+                    gpu,
+                    m.seq_pos,
+                    ckpt_max(),
+                );
+            }
         }
 
         emit_staged_terminal_done(stdout, &pending_done);

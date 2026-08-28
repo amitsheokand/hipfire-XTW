@@ -7092,6 +7092,35 @@ pub fn spec_step_ddtree_batched(
 /// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
 /// positional and stays resident, so resume only restores the recurrent state).
 /// Gating (resume enabled / no eviction) is the caller's responsibility.
+/// Snapshot at an exact turn/tool/think boundary regardless of the periodic
+/// `interval` gate. Skips duplicate positions already captured.
+pub fn take_dn_checkpoint_boundary(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    gpu: &mut Gpu,
+    pos: usize,
+    cap: usize,
+) {
+    if pos == 0 || cap == 0 {
+        return;
+    }
+    if cks.last().map(|(p, _)| *p) == Some(pos) {
+        return;
+    }
+    let mut snap = if cks.len() >= cap {
+        cks.remove(0).1
+    } else {
+        match DeltaNetSnapshot::new_for(gpu, dn) {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+    if snap.save_from(dn, gpu).is_err() {
+        return;
+    }
+    cks.push((pos, snap));
+}
+
 pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
     dn: &DeltaNetState,
