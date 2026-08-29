@@ -10,7 +10,7 @@
 
 use crate::serve::complete::{
     complete_request_cancellable, completion_json, gate_chat_completions_tools,
-    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
+    openai_stream_delta_for_event, openai_stream_terminal_chunks, preflight_request, Completion,
 };
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard};
@@ -579,7 +579,7 @@ async fn handle_request(
             if let Err(error) = gate_chat_completions_tools(&body_val) {
                 return openai_error(&error.to_string(), 400);
             }
-            if let Err(error) = complete::preflight_request(&shared, &body_val) {
+            if let Err(error) = preflight_request(&shared, &body_val) {
                 let message = error.to_string();
                 return openai_error(&message, request_error_status(&message));
             }
