@@ -1120,6 +1120,61 @@ fn plain_gemm_key_for(dt: DType) -> hipfire_dispatch::types::KernelKey {
     }
 }
 
+fn qkvza_projections_all_q8(wqkv: DType, wz: DType, w_beta: DType, w_alpha: DType) -> bool {
+    matches!(wqkv, DType::Q8_0)
+        && matches!(wz, DType::Q8_0)
+        && matches!(w_beta, DType::Q8_0)
+        && matches!(w_alpha, DType::Q8_0)
+}
+
+/// Mixed-dtype LA QKVZA (e.g. MIX Q8 `in_proj_qkv` + MQ4 `in_proj_z`).
+///
+/// Fused Q8 WMMA / `plain_gemm_key_for` both assume a single stride. Launching
+/// `FusedQkvzaQ8_0` on an MQ4 sibling is the Tier-1 kernel-vs-stride page-fault
+/// (release builds compile `debug_assert!` out). Populate `x_norm_batch` with
+/// unrotated rmsnorm, FWHT into `x_rot_batch` when any sibling needs it, then
+/// dispatch each weight through [`batched_gemm_single_weight`].
+fn run_mixed_qkvza_batched(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    wqkv: &WeightTensor,
+    wz: &WeightTensor,
+    w_beta: &WeightTensor,
+    w_alpha: &WeightTensor,
+    n: usize,
+) -> HipResult<()> {
+    use hipfire_dispatch::types::dtype_needs_rotation;
+    let weights = [wqkv, wz, w_beta, w_alpha];
+    if let Some(sample) = weights
+        .into_iter()
+        .find(|w| dtype_needs_rotation(w.gpu_dtype))
+    {
+        rotate_x_mq_batched_for(
+            gpu,
+            sample,
+            &pbs.x_norm_batch,
+            &pbs.x_rot_batch,
+            sample.k,
+            n,
+        )?;
+    }
+    let outs = [
+        &pbs.dn_qkv_batch,
+        &pbs.dn_z_batch,
+        &pbs.dn_beta_batch,
+        &pbs.dn_alpha_batch,
+    ];
+    for (w, y) in weights.into_iter().zip(outs) {
+        let x = if dtype_needs_rotation(w.gpu_dtype) {
+            &pbs.x_rot_batch
+        } else {
+            &pbs.x_norm_batch
+        };
+        batched_gemm_single_weight(gpu, w, x, y, n)?;
+    }
+    Ok(())
+}
+
 /// Accepts the dtypes the batched prefill path can handle (shared by the
 /// eligibility check in `forward_prefill_batch` and the per-layer dtype
 /// branches in `forward_prefill_chunk`).
@@ -3875,6 +3930,13 @@ fn batch_chunk_delta_net_attn(
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
     let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let qkvza_all_q8 = qkvza_projections_all_q8(
+        layer.wqkv.gpu_dtype,
+        layer.wz.gpu_dtype,
+        layer.w_beta.gpu_dtype,
+        layer.w_alpha.gpu_dtype,
+    );
+    let qkvza_mixed_q8 = is_q8 && !qkvza_all_q8;
 
     // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
@@ -3891,6 +3953,18 @@ fn batch_chunk_delta_net_attn(
             dim,
             config.norm_eps,
             n,
+        )?;
+    } else if qkvza_mixed_q8 {
+        // MIX: Q8 qkv vs MQ z/a/b cannot share one activation. Unrotated
+        // rmsnorm lands in x_norm_batch; run_mixed_qkvza_batched FWHT-copies
+        // into x_rot_batch only for siblings that need it.
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_norm_batch,
+            n,
+            dim,
+            config.norm_eps,
         )?;
     } else {
         gpu.rmsnorm_batched(
@@ -3924,17 +3998,12 @@ fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_q8 && q8_wmma_arch {
+    } else if qkvza_all_q8 && q8_wmma_arch {
         // `is_q8` only inspects `wqkv` (the routing anchor). The fused
         // kernel assumes ALL four weights share the Q8_0 stride; a
         // mixed-dtype layer would silently re-introduce the Tier-1
-        // kernel-vs-stride corruption mode.
-        debug_assert!(
-            matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
-            "LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
-        );
+        // kernel-vs-stride corruption mode. This is a runtime check —
+        // `debug_assert!` is compiled out of release.
         run_fused_qkvza_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvzaQ8_0,
@@ -3952,6 +4021,16 @@ fn batch_chunk_delta_net_attn(
             layer.w_beta.m,
             layer.w_alpha.m,
             layer.wqkv.k,
+            n,
+        )?;
+    } else if qkvza_mixed_q8 {
+        run_mixed_qkvza_batched(
+            gpu,
+            pbs,
+            &layer.wqkv,
+            &layer.wz,
+            &layer.w_beta,
+            &layer.w_alpha,
             n,
         )?;
     } else if is_q8 || is_lowbit {
@@ -5900,6 +5979,13 @@ fn batch_chunk_delta_net_moe(
     // dn_alpha_batch, dn_beta_batch).
     let is_paro = matches!(layer.wqkv.gpu_dtype, DType::ParoQ4G128);
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
+    let qkvza_all_q8 = qkvza_projections_all_q8(
+        layer.wqkv.gpu_dtype,
+        layer.wz.gpu_dtype,
+        layer.w_beta.gpu_dtype,
+        layer.w_alpha.gpu_dtype,
+    );
+    let qkvza_mixed_q8 = is_q8 && !qkvza_all_q8;
 
     if is_mq {
         // AWQ-aware: next linear is LA's fused wqkv.
@@ -5918,6 +6004,15 @@ fn batch_chunk_delta_net_moe(
         // Givens rotation. Write rmsnorm into x_norm_batch (the
         // dedicated normalized buffer); x_rot_batch becomes the
         // per-weight rotation scratch (overwritten per GEMM).
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_norm_batch,
+            n,
+            dim,
+            config.norm_eps,
+        )?;
+    } else if qkvza_mixed_q8 {
         gpu.rmsnorm_batched(
             &pbs.x_batch,
             &layer.attn_norm,
@@ -6036,18 +6131,10 @@ fn batch_chunk_delta_net_moe(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_q8 && q8_wmma_arch {
-        // Fused Q8 QKVZA WMMA — assumes all 4 weights share Q8_0
-        // stride; mixed Q8/other layers within DNMoe are rejected
-        // upstream by `moe_ffn_batched_admissible` (router/gate Q8 OK, but
-        // shared_expert + experts must be MQ4) and would otherwise
-        // re-introduce Tier-1 stride corruption.
-        debug_assert!(
-            matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
-            "DNMoe LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
-        );
+    } else if qkvza_all_q8 && q8_wmma_arch {
+        // Fused Q8 QKVZA WMMA — all four weights must share Q8_0
+        // stride. Mixed Q8/MQ layers take `run_mixed_qkvza_batched`
+        // rather than a release-elided debug_assert.
         run_fused_qkvza_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvzaQ8_0,
@@ -6065,6 +6152,16 @@ fn batch_chunk_delta_net_moe(
             layer.w_beta.m,
             layer.w_alpha.m,
             layer.wqkv.k,
+            n,
+        )?;
+    } else if qkvza_mixed_q8 {
+        run_mixed_qkvza_batched(
+            gpu,
+            pbs,
+            &layer.wqkv,
+            &layer.wz,
+            &layer.w_beta,
+            &layer.w_alpha,
             n,
         )?;
     } else if is_q8 || is_lowbit {
@@ -8179,6 +8276,24 @@ mod tests {
         assert!(paro_batched_admit_enabled_from_env(Some("1")));
         assert!(!paro_batched_admit_enabled_from_env(Some("surprise")));
         assert!(!paro_batched_admit_enabled_from_env(Some("0")));
+    }
+
+    #[test]
+    fn qkvza_projections_all_q8_rejects_mixed_mq4_z() {
+        // MIX analog: promoting GDN in_proj_qkv to Q8 without z is not
+        // uniform. Release builds used to launch FusedQkvzaQ8_0 anyway.
+        assert!(qkvza_projections_all_q8(
+            DType::Q8_0,
+            DType::Q8_0,
+            DType::Q8_0,
+            DType::Q8_0
+        ));
+        assert!(!qkvza_projections_all_q8(
+            DType::Q8_0,
+            DType::MQ4G256,
+            DType::Q8_0,
+            DType::Q8_0
+        ));
     }
 
     #[test]

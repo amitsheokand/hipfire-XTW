@@ -1712,15 +1712,60 @@ def runtime_promotion_anchor_for_name(name, *, base_format, promotion_format):
     return None
 
 
+RUNTIME_PROMOTION_DEPENDENT_SUFFIXES = {
+    ".self_attn.q_proj.weight": (
+        ".self_attn.k_proj.weight",
+        ".self_attn.v_proj.weight",
+    ),
+    ".linear_attn.in_proj_qkv.weight": (
+        ".linear_attn.in_proj_z.weight",
+        ".linear_attn.in_proj_a.weight",
+        ".linear_attn.in_proj_b.weight",
+    ),
+    ".mlp.gate_proj.weight": (".mlp.up_proj.weight",),
+}
+
+
+def runtime_promotion_dependents_for_name(name, *, base_format, promotion_format):
+    if not runtime_promotion_bundles_enabled(base_format, promotion_format):
+        return []
+    for suffix, deps in RUNTIME_PROMOTION_DEPENDENT_SUFFIXES.items():
+        if name.endswith(suffix):
+            prefix = name[: -len(suffix)]
+            return [prefix + dep for dep in deps]
+    return []
+
+
+def runtime_promotion_group_names(name, *, base_format, promotion_format):
+    if not runtime_promotion_bundles_enabled(base_format, promotion_format):
+        return [name]
+    anchor = runtime_promotion_anchor_for_name(
+        name,
+        base_format=base_format,
+        promotion_format=promotion_format,
+    ) or name
+    group = [anchor]
+    for dep in runtime_promotion_dependents_for_name(
+        anchor,
+        base_format=base_format,
+        promotion_format=promotion_format,
+    ):
+        if dep not in group:
+            group.append(dep)
+    if name not in group:
+        group.append(name)
+    return group
+
+
 def runtime_bundle_summary(base_format, promotion_format, added_anchors):
     return {
         "enabled": runtime_promotion_bundles_enabled(base_format, promotion_format),
         "added_anchor_count": len(added_anchors),
         "added_anchors": added_anchors,
         "rules": [
-            "self_attn k/v require q anchor",
-            "linear_attn z/a/b require qkv anchor",
-            "mlp up requires gate anchor",
+            "self_attn k/v require q, and q pulls k/v",
+            "linear_attn z/a/b require qkv, and qkv pulls z/a/b",
+            "mlp up requires gate, and gate pulls up",
         ],
     }
 
@@ -1748,20 +1793,46 @@ def expand_runtime_promotion_selection(selected, available_items, *, base_format
         name = item.get("hfq_name")
         if not name:
             continue
-        anchor = runtime_promotion_anchor_for_name(
+        group_names = runtime_promotion_group_names(
             name,
             base_format=base_format,
             promotion_format=promotion_format,
         )
-        if anchor and anchor not in expanded_names:
-            anchor_item = available_items.get(anchor)
-            if anchor_item is None:
-                if strict:
-                    raise ValueError(f"selected tensor {name} requires runtime anchor {anchor}, but it is unavailable")
+        group_anchor = runtime_promotion_anchor_for_name(
+            name,
+            base_format=base_format,
+            promotion_format=promotion_format,
+        ) or name
+        for gname in group_names:
+            if gname in expanded_names:
+                continue
+            gitem = available_items.get(gname)
+            if gitem is None:
+                if gname == name:
+                    add_item(item, anchor=runtime_promotion_anchor_for_name(
+                        name,
+                        base_format=base_format,
+                        promotion_format=promotion_format,
+                    ))
+                elif gname == group_anchor and strict:
+                    raise ValueError(
+                        f"selected tensor {name} requires runtime anchor {gname}, but it is unavailable"
+                    )
+                continue
+            if gname == name:
+                add_item(
+                    gitem,
+                    anchor=runtime_promotion_anchor_for_name(
+                        name,
+                        base_format=base_format,
+                        promotion_format=promotion_format,
+                    ),
+                )
+            elif gname == group_anchor:
+                add_item(gitem, role="anchor", trigger=name)
+                added_anchors.append({"anchor": gname, "trigger": name})
             else:
-                add_item(anchor_item, role="anchor", trigger=name)
-                added_anchors.append({"anchor": anchor, "trigger": name})
-        add_item(item, anchor=anchor)
+                add_item(gitem, role="dependent", trigger=name, anchor=group_anchor)
 
     return expanded, runtime_bundle_summary(base_format, promotion_format, added_anchors)
 
@@ -3150,21 +3221,39 @@ def build_policy(
         if name in selected_names:
             continue
         bundle = []
-        anchor = runtime_promotion_anchor_for_name(
+        group_names = runtime_promotion_group_names(
             name,
             base_format=base_format,
             promotion_format=promotion_format,
         )
-        if anchor and anchor not in selected_names:
-            anchor_item = candidate_by_name.get(anchor)
-            if anchor_item is None:
-                skipped_item = dict(item)
-                skipped_item["reason"] = "runtime_anchor_missing"
-                skipped_item["runtime_bundle_anchor"] = anchor
-                skipped.append(skipped_item)
+        group_anchor = runtime_promotion_anchor_for_name(
+            name,
+            base_format=base_format,
+            promotion_format=promotion_format,
+        ) or name
+        missing_required = None
+        for gname in group_names:
+            if gname in selected_names:
                 continue
-            bundle.append(("anchor", anchor_item, name))
-        bundle.append(("selected", item, anchor))
+            gitem = candidate_by_name.get(gname)
+            if gitem is None:
+                if gname == group_anchor and gname != name:
+                    missing_required = gname
+                    break
+                continue
+            if gname == name:
+                bundle.append(("selected", gitem, group_anchor if group_anchor != name else None))
+            elif gname == group_anchor:
+                bundle.append(("anchor", gitem, name))
+            else:
+                bundle.append(("dependent", gitem, name))
+        if missing_required:
+            skipped_item = dict(item)
+            skipped_item["reason"] = "runtime_anchor_missing"
+            skipped_item["runtime_bundle_anchor"] = missing_required
+            skipped.append(skipped_item)
+            continue
+        anchor = group_anchor if group_anchor != name else None
 
         unique_bundle = []
         bundle_names = set()
@@ -3183,6 +3272,10 @@ def build_policy(
                     selected_item["runtime_bundle_role"] = "anchor"
                     selected_item["runtime_bundle_trigger"] = trigger
                     added_runtime_anchors.append({"anchor": selected_item["hfq_name"], "trigger": trigger})
+                elif role == "dependent":
+                    selected_item["runtime_bundle_role"] = "dependent"
+                    selected_item["runtime_bundle_anchor"] = group_anchor
+                    selected_item["runtime_bundle_trigger"] = trigger
                 elif trigger:
                     selected_item["runtime_bundle_anchor"] = trigger
                 selected.append(selected_item)

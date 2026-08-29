@@ -40,11 +40,14 @@ use hipfire_dispatch::pipeline::superop::SuperOpKind;
 use hipfire_dispatch::pipeline::superop::WeightSlot;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
+use hipfire_dispatch::types::dtype_needs_rotation;
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
+use hipfire_runtime::llama::rotate_x_for_mq;
+use hipfire_runtime::llama::weight_gemv_prerotated;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::ParoRotation;
@@ -2510,6 +2513,46 @@ fn paro_to_givens(p: &ParoRotation) -> GivensRef<'_> {
     }
 }
 
+/// Mixed-dtype QKVZA: rmsnorm once, FWHT only for MQ siblings, per-weight GEMV.
+#[allow(clippy::too_many_arguments)]
+fn qkvza_mixed_unfused(
+    gpu: &mut Gpu,
+    wqkv: &WeightTensor,
+    wz: &WeightTensor,
+    w_beta: &WeightTensor,
+    w_alpha: &WeightTensor,
+    attn_norm: &GpuTensor,
+    x: &GpuTensor,
+    tmp: &GpuTensor,
+    x_rot: &GpuTensor,
+    dn_qkv: &GpuTensor,
+    dn_z: &GpuTensor,
+    dn_beta: &GpuTensor,
+    dn_alpha: &GpuTensor,
+    eps: f32,
+) -> HipResult<()> {
+    gpu.rmsnorm_f32(x, attn_norm, tmp, eps)?;
+    let weights = [wqkv, wz, w_beta, w_alpha];
+    let outs = [dn_qkv, dn_z, dn_beta, dn_alpha];
+    let mut rotated = None;
+    if let Some(sample) = weights
+        .into_iter()
+        .find(|w| dtype_needs_rotation(w.gpu_dtype))
+    {
+        rotate_x_for_mq(gpu, sample, tmp, x_rot)?;
+        rotated = Some(x_rot);
+    }
+    for (w, y) in weights.into_iter().zip(outs) {
+        let xr = if dtype_needs_rotation(w.gpu_dtype) {
+            rotated
+        } else {
+            None
+        };
+        weight_gemv_prerotated(gpu, w, tmp, xr, y)?;
+    }
+    Ok(())
+}
+
 /// Unified QKVZA (4-way) projection via execute_steps for DeltaNet layers.
 /// Covers all dtypes — the interpreter selects fused QKVZA kernels for eligible
 /// dtypes via FUSED_TABLE guards; everything else falls through to per-op
@@ -2533,6 +2576,22 @@ fn qkvza_via_execute_steps(
     dn_alpha: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
+    let qkvza_all_q8 = matches!(wqkv.gpu_dtype, DType::Q8_0)
+        && matches!(wz.gpu_dtype, DType::Q8_0)
+        && matches!(w_beta.gpu_dtype, DType::Q8_0)
+        && matches!(w_alpha.gpu_dtype, DType::Q8_0);
+    let qkvza_any_q8 = matches!(wqkv.gpu_dtype, DType::Q8_0)
+        || matches!(wz.gpu_dtype, DType::Q8_0)
+        || matches!(w_beta.gpu_dtype, DType::Q8_0)
+        || matches!(w_alpha.gpu_dtype, DType::Q8_0);
+    if qkvza_any_q8 && !qkvza_all_q8 {
+        // MIX / mixed-bit: fused Q8 QKVZA and a shared FWHT both assume one
+        // stride. Split rmsnorm + per-weight GEMV (rotate only MQ siblings).
+        return qkvza_mixed_unfused(
+            gpu, wqkv, wz, w_beta, w_alpha, attn_norm, x, tmp, x_rot, dn_qkv, dn_z, dn_beta,
+            dn_alpha, eps,
+        );
+    }
     let rotation = dtype_rotation_plan(wqkv.gpu_dtype);
     if rotation == RotationPlan::Givens {
         // ParoQ4G128: plain rmsnorm, then per-weight Givens rotation inside run_auto.

@@ -47,6 +47,7 @@ use super::weights::WeightTensorDescriptor;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::types::dtype_needs_rotation;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
@@ -59,6 +60,14 @@ use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::DType;
 use rdna_compute::GpuTensor;
+
+fn gemv_x_rot_for<'a>(w: &WeightTensor, x_rot: Option<&'a GpuTensor>) -> Option<&'a GpuTensor> {
+    if dtype_needs_rotation(w.gpu_dtype) {
+        x_rot
+    } else {
+        None
+    }
+}
 
 fn layer_moe_ffn(layer: &LayerWeights) -> Option<&MoeFfnWeights> {
     match layer {
@@ -2675,10 +2684,34 @@ fn forward_scratch_layers_multi(
                             layer.wqkv.k,
                         )?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
-                        weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.wqkv,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.wqkv, x_rot),
+                            &s.dn_qkv,
+                        )?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.wz,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.wz, x_rot),
+                            &s.dn_z,
+                        )?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.w_beta,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.w_beta, x_rot),
+                            &s.dn_beta,
+                        )?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.w_alpha,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.w_alpha, x_rot),
+                            &s.dn_alpha,
+                        )?;
                     }
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,
@@ -3448,10 +3481,34 @@ fn forward_scratch_layers_multi(
                             layer.wqkv.k,
                         )?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
-                        weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.wqkv,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.wqkv, x_rot),
+                            &s.dn_qkv,
+                        )?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.wz,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.wz, x_rot),
+                            &s.dn_z,
+                        )?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.w_beta,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.w_beta, x_rot),
+                            &s.dn_beta,
+                        )?;
+                        weight_gemv_prerotated(
+                            gpu,
+                            &layer.w_alpha,
+                            &s.tmp,
+                            gemv_x_rot_for(&layer.w_alpha, x_rot),
+                            &s.dn_alpha,
+                        )?;
                     }
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,

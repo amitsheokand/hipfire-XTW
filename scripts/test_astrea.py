@@ -976,6 +976,57 @@ class AstreaTests(unittest.TestCase):
         self.assertEqual(policy["selected"][0]["runtime_bundle_role"], "anchor")
         self.assertEqual(policy["selected"][1]["runtime_bundle_anchor"], anchor_name)
 
+    def test_policy_bundles_runtime_dependents_when_anchor_selected(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            sensitivity = root / "sensitivity.json"
+            qkv = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+            z = "model.language_model.layers.0.linear_attn.in_proj_z.weight"
+            a = "model.language_model.layers.0.linear_attn.in_proj_a.weight"
+            b = "model.language_model.layers.0.linear_attn.in_proj_b.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    (qkv, 13, [1, 256], 256, 136),
+                    (z, 13, [1, 256], 256, 136),
+                    (a, 13, [1, 256], 256, 136),
+                    (b, 13, [1, 256], 256, 136),
+                ],
+            )
+            sensitivity.write_text(
+                json.dumps(
+                    {
+                        "tensors": [
+                            {"name": qkv, "score": 1.00},
+                            {"name": z, "score": 0.01},
+                            {"name": a, "score": 0.01},
+                            {"name": b, "score": 0.01},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq4",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=544,
+            )
+
+        self.assertEqual(
+            [item["hfq_name"] for item in policy["selected"]],
+            [qkv, z, a, b],
+        )
+        self.assertEqual(policy["selected_extra_bytes"], 544)
+        self.assertEqual(
+            {item["hfq_name"]: item.get("runtime_bundle_role") for item in policy["selected"] if item.get("runtime_bundle_role")},
+            {z: "dependent", a: "dependent", b: "dependent"},
+        )
+
     def test_promote_policy_candidate_rebuilds_hfq_with_q8_tensor(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
