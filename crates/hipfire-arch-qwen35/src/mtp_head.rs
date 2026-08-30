@@ -365,11 +365,9 @@ pub struct Qwen35MtpHeadScratch {
     // Populated by `mtp_head_forward_compressed` instead of `logits`.
     pub logits_compressed: Option<GpuTensor>,
 
-    // FlashAttention partials buffer for the asym3 attention kernel.
-    // Sized [n_heads * max_tiles * (2 + head_dim)] F32 where max_tiles =
-    // ceil(max_seq / 128). Required by `attention_flash_asym3`. Trunk
-    // sizes this with batch_mult=16 for batched prefill; MTP single-step
-    // forward uses batch_mult=1.
+    // FlashAttention partials. Tile size follows Q8 flash geometry
+    // (`q8_flash_tile_size`); max_tiles = ceil(max_seq / tile). Used by
+    // Q8 flash, asym3, and fwht4 MTP decode.
     pub flash_partials: GpuTensor,
 
     // Position scalar — uploaded each forward into a 4-byte device buffer.
@@ -487,12 +485,16 @@ impl Qwen35MtpHeadScratch {
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             logits_compressed: None,
             flash_partials: {
-                // Same sizing as trunk's prefill_partials at qwen35.rs:2822
-                // (TILE_SIZE=128) but with batch_mult=1 since MTP forward
-                // is single-token. Allocated per scratch instance, lives
-                // for the lifetime of the slot.
-                let tile_size = 128usize;
-                let max_tiles = (config.max_seq + tile_size - 1) / tile_size;
+                // Match trunk Q8 flash tile geometry (gfx12 default 128;
+                // gfx1100 32). Hardcoding 128 under-allocates gfx1100.
+                let tile_size = rdna_compute::attention::q8_flash_tile_size(
+                    gpu.arch.as_str(),
+                    config.n_head,
+                    config.n_head_kv,
+                    config.head_dim,
+                    config.max_seq,
+                );
+                let max_tiles = config.max_seq.div_ceil(tile_size.max(1));
                 gpu.alloc_tensor(
                     &[config.n_head * max_tiles * (2 + config.head_dim)],
                     DType::F32,
@@ -1221,6 +1223,33 @@ mod packed_dtype_tests {
         assert_eq!(mtp_packed_dtype(47), Some(DType::MQ6G256V2));
         assert_eq!(mtp_packed_dtype(48), None);
     }
+
+    #[test]
+    fn mtp_q8_flash_tracks_trunk_auto_on_rdna3_and_rdna4() {
+        assert_eq!(mtp_q8_flash_mode_for("auto", "gfx1201"), 2);
+        assert_eq!(mtp_q8_flash_mode_for("auto", "gfx1100"), 2);
+        assert_eq!(mtp_q8_flash_mode_for("auto", "gfx1030"), 1);
+        assert_eq!(mtp_q8_flash_mode_for("never", "gfx1201"), 0);
+        assert_eq!(mtp_q8_flash_mode_for("always", "gfx1030"), 2);
+    }
+}
+
+/// Same flash_mode the trunk scratch uses (`Qwen35Scratch` / llama decode).
+/// `KvCache::tier_inputs()` hardcodes 0; MTP must not inherit that for Q8.
+fn mtp_q8_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
+    match mode {
+        "never" | "0" | "off" => 0,
+        "always" | "2" | "force" => 2,
+        _ if gpu_arch.starts_with("gfx11") || gpu_arch.starts_with("gfx12") => 2,
+        _ => 1,
+    }
+}
+
+fn mtp_q8_flash_mode(gpu: &Gpu) -> usize {
+    mtp_q8_flash_mode_for(
+        hipfire_runtime::config::get().attention_flash_mode.as_str(),
+        gpu.arch.as_str(),
+    )
 }
 
 // ─── Forward pass ────────────────────────────────────────────────────────
@@ -1579,29 +1608,21 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
 
     // ── 6+7. KV cache write + attention (dispatch on kv.kv_mode) ─────────
     //
-    // Mirrors trunk's per-token decode dispatch at qwen35.rs:6062-6138.
-    // - Q8: 2-call kv_cache_write_q8_0 + attention_q8_0_kv (no flash partials)
-    // - Asym3: kv_cache_write_asym3_fused + attention_flash_asym3 (Givens cos/sin)
-    // - Fwht4: kv_cache_write_fwht4_fused + attention_flash_fwht4 (FWHT signs
-    //   stored in kv_cache.givens_cos/givens_sin slots — field-name reuse
-    //   per Phase 1 fwht4 commit `c64c0e3f`).
-    // KV write + attention via the shared KV-usage abstraction. kv.inner is
-    // built per kv_mode (new_gpu_q8/asym3/fwht4), so kv.inner.tier_inputs()
-    // produces exactly the tier kv.kv_mode used to dispatch: Q8→AttnQ8_0Kv
-    // (non-flash), Asym3→AttnFlashAsym3, Fwht4→AttnFlashAsym4Fwht — byte-
-    // identical kernels (incl. the Givens cos/sin + v_mode_bits sub-plan). The
-    // dispatch arm computes seq_len = pos+1, so pos = seq_len_hint-1 reproduces
-    // the hand seq_len_hint exactly (the write position flows via pos_buf).
-    // SPEC-DECODE: draft logits stay byte-identical → τ unchanged (validated by
-    // coherence-gate-dflash.sh + a τ A/B). flash_partials is always Some (the Q8
-    // non-flash arm ignores it; asym3/fwht4 require it). Q8 non-flash is
-    // unconditional → derive returns AttnQ8_0Kv at seq_len_hint<=15000 (the
-    // documented >15k Q8-fidelity edge).
-    let dispatch_pos = seq_len_hint - 1;
+    // Mirrors trunk decode (`kv_cache_attention_dispatch`): same flash_mode
+    // as Qwen35Scratch (auto → always-flash on gfx11/gfx12). `tier_inputs()`
+    // hardcodes flash_mode=0, which pinned MTP Q8 to AttnQ8_0Kv at every
+    // context — 86k decode then sat in the non-flash tile loop for ~12 min
+    // while trunk flash finished the same window in tens of ms.
+    // Asym3/Fwht4 already select flash via the tier, independent of this.
+    let dispatch_pos = seq_len_hint
+        .saturating_sub(1)
+        .min(kv.max_seq.saturating_sub(1));
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
         hipfire_dispatch::families::kv_tier::KvTierInputs {
             pos: dispatch_pos,
+            flash_mode: mtp_q8_flash_mode(gpu),
+            capture_mode: gpu.graphs.capture_mode,
             ..kv.inner.tier_inputs()
         },
     )
