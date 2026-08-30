@@ -795,6 +795,8 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
     let lower = message.to_ascii_lowercase();
     if lower.contains("model not found") {
         404
+    } else if lower.contains("exceed") && lower.contains("max_seq") {
+        413
     } else if lower.contains("kv budget")
         || lower.contains("max_tokens")
         || lower.contains("max_seq")

@@ -24,7 +24,7 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, errno, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import argparse, atexit, errno, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
@@ -2452,7 +2452,12 @@ def send(cfg, messages, tools=None):
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
                                  data=body_bytes,
                                  headers={"Content-Type": "application/json"}, method="POST")
-    for raw in urllib.request.urlopen(req, timeout=1800):
+    try:
+        response = urllib.request.urlopen(req, timeout=1800)
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", "replace")
+        raise RuntimeError(f"HTTP {err.code} {err.reason}: {detail}") from err
+    for raw in response:
         line = raw.decode("utf-8", "ignore").strip()
         if not line.startswith("data:"): continue
         p = line[5:].strip()

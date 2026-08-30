@@ -1633,13 +1633,22 @@ pub(crate) fn conservative_prompt_token_estimate(body: &serde_json::Value) -> u6
 }
 
 fn preflight_enable_thinking(body: &serde_json::Value) -> bool {
-    body.get("enable_thinking")
+    if let Some(value) = body
+        .get("enable_thinking")
         .and_then(serde_json::Value::as_bool)
         .or_else(|| {
             body.pointer("/chat_template_kwargs/enable_thinking")
                 .and_then(serde_json::Value::as_bool)
         })
-        .unwrap_or(true)
+    {
+        return value;
+    }
+    // Daemon sentinel: max_think_tokens == 1 means thinking is off. Preflight
+    // used to default enable_thinking=true, so a think-off 86k filler fell
+    // through to the conservative byte estimate (2× tokens) and 400'd.
+    body.get("max_think_tokens")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
 }
 
 fn preflight_reasoning_effort<'a>(body: &'a serde_json::Value) -> Option<&'a str> {
@@ -1691,8 +1700,8 @@ fn count_rendered_prompt_tokens(
     let include_reasoning_content = runtime.current_arch.as_deref() == Some("muse_glimmer");
     let (messages, tools) =
         build_preflight_messages_and_tools(body, resolved, include_reasoning_content)?;
-    let mut parsed: Vec<Message> = serde_json::from_value(messages)
-        .map_err(|error| anyhow!("preflight messages: {error}"))?;
+    let mut parsed: Vec<Message> =
+        serde_json::from_value(messages).map_err(|error| anyhow!("preflight messages: {error}"))?;
     for entry in &mut parsed {
         if !entry.content.is_empty() {
             let normalized = maybe_normalize_prompt(&entry.content);
@@ -1701,7 +1710,8 @@ fn count_rendered_prompt_tokens(
             }
         }
     }
-    let prompt = last_user_prompt(&serde_json::to_value(&parsed)?).unwrap_or_else(|| "Hello".into());
+    let prompt =
+        last_user_prompt(&serde_json::to_value(&parsed)?).unwrap_or_else(|| "Hello".into());
     let frame = JinjaChatFrame {
         tokenizer,
         template,
@@ -1733,8 +1743,36 @@ pub(crate) fn count_request_prompt_tokens(
     runtime: &ServeRuntime,
     resolved: &hipfire_config::ResolvedConfig,
 ) -> u64 {
-    count_rendered_prompt_tokens(body, runtime, resolved)
-        .unwrap_or_else(|_| conservative_prompt_token_estimate(body))
+    count_rendered_prompt_tokens(body, runtime, resolved).unwrap_or_else(|_| {
+        tokenizer_message_token_estimate(body, runtime)
+            .unwrap_or_else(|| conservative_prompt_token_estimate(body))
+    })
+}
+
+/// When Jinja preflight render fails, count the user/assistant strings with the
+/// loaded tokenizer and add a small ChatML wrap pad. Byte-length fallback is
+/// ~2× too high on `"x "` fillers and falsely exceeds max_seq.
+fn tokenizer_message_token_estimate(
+    body: &serde_json::Value,
+    runtime: &ServeRuntime,
+) -> Option<u64> {
+    let tokenizer = runtime.tokenizer.as_ref()?;
+    let mut tokens = 0u64;
+    if let Some(prompt) = body.get("prompt").and_then(serde_json::Value::as_str) {
+        tokens = tokens.saturating_add(tokenizer.encode(prompt).len() as u64);
+    }
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            let text = openai_content_text(message.get("content"));
+            if !text.is_empty() {
+                tokens = tokens.saturating_add(tokenizer.encode(&text).len() as u64);
+            }
+        }
+    }
+    if tokens == 0 {
+        return None;
+    }
+    Some(tokens.saturating_add(64))
 }
 
 /// Legacy name retained for tests; prefer [`count_request_prompt_tokens`].
@@ -1759,13 +1797,12 @@ pub(crate) fn preflight_request(shared: &ServeShared, body: &serde_json::Value) 
         .runtime
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    runtime
-        .ensure_daemon()
-        .map_err(|error| {
-            record_closed_if_present(shared, &error);
-            error
-        })?;
-    let resolved = runtime.ensure_model(model, &shared.meta, None, speculation)
+    runtime.ensure_daemon().map_err(|error| {
+        record_closed_if_present(shared, &error);
+        error
+    })?;
+    let resolved = runtime
+        .ensure_model(model, &shared.meta, None, speculation)
         .map_err(|error| {
             record_closed_if_present(shared, &error);
             error
@@ -1840,12 +1877,10 @@ pub(crate) fn complete_request_attempt(
             .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        runtime
-            .ensure_daemon()
-            .map_err(|error| {
-                record_closed_if_present(shared, &error);
-                error
-            })?;
+        runtime.ensure_daemon().map_err(|error| {
+            record_closed_if_present(shared, &error);
+            error
+        })?;
         // Attempt id is allocated by the retry driver before any cold reset /
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
@@ -3209,6 +3244,22 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(request_speculation(&serde_json::json!({"speculation": "nope"})).is_err());
+    }
+
+    #[test]
+    fn preflight_enable_thinking_respects_think_off_sentinel() {
+        assert!(!super::preflight_enable_thinking(
+            &serde_json::json!({"max_think_tokens": 1})
+        ));
+        assert!(super::preflight_enable_thinking(
+            &serde_json::json!({"max_think_tokens": 128})
+        ));
+        assert!(super::preflight_enable_thinking(
+            &serde_json::json!({"enable_thinking": true, "max_think_tokens": 1})
+        ));
+        assert!(!super::preflight_enable_thinking(
+            &serde_json::json!({"enable_thinking": false, "max_think_tokens": 128})
+        ));
     }
 
     #[test]
