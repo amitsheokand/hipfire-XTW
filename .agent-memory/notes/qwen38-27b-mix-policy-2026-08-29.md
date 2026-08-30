@@ -32,6 +32,51 @@ Equal-byte test that matters: this MIX (GDN `in_proj_qkv` Q8) vs published `mq4 
 - cold factual (prompt md5 `1d32df5f…`): Paris / Seine / Eiffel, `finish=length`, prefill 31.1 tok/s, decode 20.4 tok/s
 - warm battery (same home): factual `finish=length` prefill 354.6 tok/s decode 24.9 tok/s; code (prompt md5 `02daccb4…`) `def reverse_string(s: str) -> str: return s[::-1]`, `finish=stop`, gen=23, decode 25.0 tok/s, empty=0 attractor=0
 
-Single-session numbers, not a quality or perf claim. `runaway=1` is the 64-token factual cap, same class as XT. KLD still not run (no Qwen3.8-27B kldref; `fetch-eval-refs.sh` only has 3.5-9B / 3.6-27B). Local models dir has MIX + XT mq4, not published mq4-pro. Serve units stay masked.
+Single-session numbers, not a quality or perf claim. `runaway=1` is the 64-token factual cap, same class as XT. Serve units stay masked.
+
+**KLD 2026-08-30 (local llama-b10488 WT2 teacher, not Hub-comparable):** dumped `~/.hipfire/kldref/qwen3.8-27b.ref_wt2.native-llama-b10488.bin` (50 675 552 B, md5 `3c0268e9…`). llama.cpp vulkan b10488 / `9d77fa172` on Vulkan1 R9700; `--chunks 24` `--n-ctx 2048` top-k 256. Teacher PPL **6.2391** (hiptrx BF16 native was 6.2385). GGUF `qwen3.8-27b-bf16.gguf` md5 `4f958917…` deleted after dump.
+
+`eval_hipfire` git `36e4a282` fingerprint `47041ba6…` gfx1201, `--kv-mode q8 --kv-v q8 --scoring-mode prefill --max-chunks 24`, `HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0`. All 24 chunks finite, no KLD=0.
+
+| variant | bytes | body codec | extra Q8 | WT2 KLD | PPL |
+|---|---:|---|---|---:|---:|
+| XT `qwen38-27b.mq4` | 14 980 361 216 | MQ4G256 V1 | embed+conv1d | **0.066394** | 6.5684 |
+| MIX `qwen38-27b.mix-qkv.hfq` | 16 463 519 700 | MQ4G256 V1 | + GDN `in_proj_qkv` (+ FA q/k/v 3/7/59) | **0.056936** | 6.5228 |
+| pro `qwen3.8-27b.mq4-pro` | 16 464 182 272 | MQ4V2 | lm_head+embed+conv1d+`ssm_out` | **0.032715** | 6.3311 |
+
+MIX beats its V1 floor (−14.2 % KLD vs XT). MIX does **not** beat equal-byte pro (codec confound: V1+qkv-Q8 vs V2+ssm_out-Q8). Artifacts: `~/.hipfire/calib/qwen38-27b-mix/wt2-kld-summary.json` + `kldseq/`.
+
+**Hy4 residual / hybrid 2026-08-30 (allocation isolation on V1 XT):** Astrea `--role-prior residual` + pack-rank (ssm_out + lm_head before QKVZA bundles) + streaming promote (index-only prefix, chunked Q8, no 15 GB `bytearray` — the in-RAM writer OOM-killed at ~47 GB RSS). Keep MIX as qkv control. Disk kept all scored files.
+
+| variant | bytes | extra Q8 | WT2 KLD | PPL |
+|---|---:|---|---:|---:|
+| residual-v1 `qwen38-27b.mix-hy4-residual-v1.hfq` | 16 457 949 140 | 48× `out_proj` + lm_head | **0.050907** | 6.5053 |
+| hybrid-v1 `qwen38-27b.mix-hy4-hybrid-v1.hfq` | 16 458 819 540 | last-8 GDN `out_proj` + 30 qkv groups | **0.058232** | 6.5049 |
+
+Residual-V1 is **between** MIX 0.0569 and pro 0.0327: allocation helps vs MIX, codec is still the larger gap vs pro. Hybrid lost to MIX. Policies: `policy-hy4-residual-v1.json` / `policy-hy4-hybrid-v1.json`; tensortypes export next to them. Serve stays masked. No Hub-number citation.
 
 `in_proj_z` is **not** tiny: shape `[6144, 5120]`, extra **16.7 MiB** each vs `a`/`b` at 128 KiB. Bundling all 48 z with qkv is ~802 MiB extra — it does **not** fit the xt→pro 1.38 GiB budget (a rebuild kept 33 complete GDN groups and dropped FA). Mixed QKVZA (Q8 qkv/a/b + MQ4 z) is the intended MIX analog; do not re-promote z just to hit fused Q8.
+
+**Product axes once architecture is in place (MQ4V2 + ladder xt/base/pro):** mix-bit at 4.9 bpw is mostly done. Residual-v1 0.0509 vs pro 0.0327 is the codec gap, not leftover allocation.
+
+- **Disk / weight VRAM:** equal-byte ~15.33 GiB. No smaller SKU from another knapsack at `--max-extra-bytes 1483821056`. Smaller = mq3/mq2 + GSQ encoder (later L3) or serve `xt`.
+- **Serve speed:** not measured on residual/hybrid. Ladder AR decode ~ xt 35 → base 33 → pro 32 tok/s; Q8 lm_head costs BW. Remaining lever is DFlash τ / kernels, not 1.38 GiB Q8 placement.
+- **Bandwidth:** KV + spec, not Q8 role at fixed size.
+- **34 GB context:** weights leave ~19 GB for KV + DeltaNet/conv. Long-ctx (windowed DFlash, CASK, KV mode, rolling buffer) is the product lever that still moves.
+
+**N4/N5b (2026-08-30):** published mq4-xt sha256 `9f91556f…`. `mix-qkv-v2.hfq` 16 459 603 021 B, md5 `f9b55d7b…`, 33 fused QKVZA groups.
+
+| variant | WT2 KLD | PPL |
+|---|---:|---:|
+| V1 XT | 0.066394 | 6.568 |
+| MIX (V1+qkv) | 0.056936 | 6.523 |
+| v2-xt | 0.057414 | 6.416 |
+| mix-qkv-v2 | **0.050561** | 6.392 |
+| residual-v1 | 0.050907 | 6.505 |
+| pro | **0.032715** | 6.331 |
+
+V2 floor ≈ MIX. V2+qkv ≈ V1+residual. Pro (V2+residual) still −0.018 KLD ahead. On V2, residual extras beat qkv extras.
+
+Astrea `metrics` (product baseline = `mq4-pro`): **`no_quality_gain`** (KLD +0.0178, PPL +0.061). Report: *quality evidence does not justify promotion yet*. vs MIX: `quality_improved` (codec). residual-v1 vs MIX: `quality_improved` (allocation). Do not Atlas. Do not unmask serve. Product remains published mq4-pro.
+
+Artifacts: `~/.hipfire/calib/qwen38-27b-mix/metrics-mix-qkv-v2-vs-pro.json`, `report-mix-qkv-v2-vs-pro.json`. `uv run --with numpy python3 scripts/test_astrea.py` 43/43. L1–L4 not this round.

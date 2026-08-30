@@ -54,6 +54,8 @@ PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
 SUPPORTED_FORMATS = {
     "mq3",
     "mq4",
+    "mq4v1",
+    "mq4v2",
     "mq6",
     "hfq4",
     "hfq6",
@@ -62,6 +64,28 @@ SUPPORTED_FORMATS = {
     "paro4",
     "q8",
     "f16",
+}
+
+# Product-class aliases: --format mq4 is MQ4G256V2 (qt 44) at the quantizer,
+# while historical XT files may still be qt 13 MQ4G256. Policy treats both as mq4.
+POLICY_FORMAT_ALIASES = {
+    "mq4v1": "mq4",
+    "mq4v2": "mq4",
+    "mq4g256": "mq4",
+}
+
+SUPPORTED_ROLE_PRIORS = {
+    "none",
+    "residual",
+}
+
+# Hy4 / Unsloth residual-stream prior. Residual writers get +2 levels; bulk
+# gate/up can stay low. Applied to imatrix score before score/byte ranking.
+RESIDUAL_PRIOR_MULTIPLIERS = {
+    "residual_out": 8.0,
+    "attn_in": 1.0,
+    "bulk_in": 0.35,
+    "other": 1.0,
 }
 
 SUPPORTED_METHODS = {
@@ -201,6 +225,7 @@ HFQ_QUANT_TYPE_NAMES = {
     12: "HFQ3G128",
     13: "MQ4G256",
     14: "MQ8G256",
+    44: "MQ4G256V2",
     17: "MQ3G256",
     18: "MQ2G256",
     19: "MQ2G256_LLOYD",
@@ -218,6 +243,7 @@ HFQ_QUANT_TYPE_FORMATS = {
     "HFQ4G128": "hfq4",
     "HFQ6G256": "hfq6",
     "MQ4G256": "mq4",
+    "MQ4G256V2": "mq4",
     "MQ3G256": "mq3",
     "MQ3G256_LLOYD": "mq3",
     "HFP4G32": "hfp4",
@@ -484,95 +510,126 @@ def metadata_summary(metadata):
     return summary
 
 
-def read_hfq_index(path, *, max_tensors=32):
+def read_hfq_prefix(path):
+    """Parse HFQ header + tensor index without mapping payload bytes."""
     p = Path(path)
+    file_bytes = p.stat().st_size
     with p.open("rb") as f:
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            if len(mm) < 32:
-                raise ValueError("HFQ file is smaller than the 32-byte header")
-            magic = mm[0:4]
-            if magic != b"HFQM":
-                raise ValueError("not an HFQ file")
-            version = struct.unpack_from("<I", mm, 4)[0]
-            arch_id = struct.unpack_from("<I", mm, 8)[0]
-            n_tensors = struct.unpack_from("<I", mm, 12)[0]
-            metadata_offset = struct.unpack_from("<Q", mm, 16)[0]
-            data_offset = struct.unpack_from("<Q", mm, 24)[0]
-            if metadata_offset > data_offset or data_offset > len(mm):
-                raise ValueError("invalid HFQ metadata/data offsets")
+        header = f.read(32)
+        if len(header) < 32:
+            raise ValueError("HFQ file is smaller than the 32-byte header")
+        magic = header[0:4]
+        if magic != b"HFQM":
+            raise ValueError("not an HFQ file")
+        version = struct.unpack_from("<I", header, 4)[0]
+        arch_id = struct.unpack_from("<I", header, 8)[0]
+        n_tensors = struct.unpack_from("<I", header, 12)[0]
+        metadata_offset = struct.unpack_from("<Q", header, 16)[0]
+        data_offset = struct.unpack_from("<Q", header, 24)[0]
+        if metadata_offset > data_offset or data_offset > file_bytes:
+            raise ValueError("invalid HFQ metadata/data offsets")
+        f.seek(0)
+        prefix = f.read(data_offset)
+        if len(prefix) != data_offset:
+            raise ValueError("truncated HFQ prefix")
 
-            metadata_bytes = mm[metadata_offset:data_offset]
-            json_end = json_object_end(metadata_bytes)
-            metadata_text = metadata_bytes[:json_end].decode("utf-8")
-            metadata = json.loads(metadata_text)
+    metadata_region = prefix[metadata_offset:data_offset]
+    json_end = json_object_end(metadata_region)
+    metadata_bytes = bytes(metadata_region[:json_end])
+    metadata = json.loads(metadata_bytes.decode("utf-8"))
+    pos = metadata_offset + json_end
+    if pos + 4 > data_offset:
+        raise ValueError("missing HFQ tensor index")
+    idx_n = struct.unpack_from("<I", prefix, pos)[0]
+    pos += 4
+    if idx_n != n_tensors:
+        raise ValueError(f"HFQ index count {idx_n} does not match header count {n_tensors}")
 
-            pos = metadata_offset + json_end
-            if pos + 4 > data_offset:
-                raise ValueError("missing HFQ tensor index")
-            idx_n = struct.unpack_from("<I", mm, pos)[0]
+    records = []
+    cumulative_offset = data_offset
+    for _ in range(n_tensors):
+        name_len = struct.unpack_from("<H", prefix, pos)[0]
+        pos += 2
+        name = prefix[pos : pos + name_len].decode("utf-8")
+        pos += name_len
+        quant_type = prefix[pos]
+        pos += 1
+        n_dims = prefix[pos]
+        pos += 1
+        shape = []
+        for _ in range(n_dims):
+            shape.append(struct.unpack_from("<I", prefix, pos)[0])
             pos += 4
-            if idx_n != n_tensors:
-                raise ValueError(f"HFQ index count {idx_n} does not match header count {n_tensors}")
-
-            tensors = []
-            tensor_map = {}
-            all_names = []
-            quant_type_counts = {}
-            cumulative_offset = data_offset
-            for i in range(n_tensors):
-                name_len = struct.unpack_from("<H", mm, pos)[0]
-                pos += 2
-                name = mm[pos : pos + name_len].decode("utf-8")
-                pos += name_len
-                quant_type = mm[pos]
-                pos += 1
-                n_dims = mm[pos]
-                pos += 1
-                shape = []
-                for _ in range(n_dims):
-                    shape.append(struct.unpack_from("<I", mm, pos)[0])
-                    pos += 4
-                group_size = struct.unpack_from("<I", mm, pos)[0]
-                pos += 4
-                data_size = struct.unpack_from("<Q", mm, pos)[0]
-                pos += 8
-
-                quant_type_name = HFQ_QUANT_TYPE_NAMES.get(quant_type, f"UNKNOWN_{quant_type}")
-                item = {
-                    "name": name,
-                    "quant_type": quant_type,
-                    "quant_type_name": quant_type_name,
-                    "shape": shape,
-                    "group_size": group_size,
-                    "data_offset": cumulative_offset,
-                    "data_size": data_size,
-                }
-                all_names.append(name)
-                tensor_map[name] = item
-                quant_type_counts[quant_type_name] = quant_type_counts.get(quant_type_name, 0) + 1
-                if i < max_tensors:
-                    tensors.append(dict(item))
-                cumulative_offset += data_size
-
-            names_md5 = hashlib.md5("\n".join(all_names).encode("utf-8")).hexdigest()
-            summary = {
-                "schema": HFQ_SUMMARY_SCHEMA,
-                "magic": magic.decode("ascii"),
-                "version": version,
-                "arch_id": arch_id,
-                "tensor_count": n_tensors,
-                "metadata_offset": metadata_offset,
-                "data_offset": data_offset,
-                "data_end": cumulative_offset,
-                "file_bytes": len(mm),
-                "data_end_matches_file_size": cumulative_offset == len(mm),
-                "metadata": metadata_summary(metadata),
-                "quant_type_counts": dict(sorted(quant_type_counts.items())),
-                "tensor_names_md5": names_md5,
-                "tensors": tensors,
-                "tensors_truncated": n_tensors > len(tensors),
+        group_size = struct.unpack_from("<I", prefix, pos)[0]
+        pos += 4
+        data_size = struct.unpack_from("<Q", prefix, pos)[0]
+        pos += 8
+        records.append(
+            {
+                "name": name,
+                "quant_type": quant_type,
+                "quant_type_name": HFQ_QUANT_TYPE_NAMES.get(quant_type, f"UNKNOWN_{quant_type}"),
+                "shape": shape,
+                "group_size": group_size,
+                "data_offset": cumulative_offset,
+                "data_size": data_size,
             }
-            return summary, tensor_map
+        )
+        cumulative_offset += data_size
+    return {
+        "magic": magic.decode("ascii"),
+        "version": version,
+        "arch_id": arch_id,
+        "metadata_offset": metadata_offset,
+        "data_offset": data_offset,
+        "metadata_bytes": metadata_bytes,
+        "metadata": metadata,
+        "records": records,
+        "file_bytes": file_bytes,
+        "data_end": cumulative_offset,
+    }
+
+
+def read_hfq_index(path, *, max_tensors=32):
+    prefix = read_hfq_prefix(path)
+    tensors = []
+    tensor_map = {}
+    all_names = []
+    quant_type_counts = {}
+    for i, record in enumerate(prefix["records"]):
+        item = {
+            "name": record["name"],
+            "quant_type": record["quant_type"],
+            "quant_type_name": record["quant_type_name"],
+            "shape": record["shape"],
+            "group_size": record["group_size"],
+            "data_offset": record["data_offset"],
+            "data_size": record["data_size"],
+        }
+        all_names.append(item["name"])
+        tensor_map[item["name"]] = item
+        quant_type_counts[item["quant_type_name"]] = quant_type_counts.get(item["quant_type_name"], 0) + 1
+        if i < max_tensors:
+            tensors.append(dict(item))
+    names_md5 = hashlib.md5("\n".join(all_names).encode("utf-8")).hexdigest()
+    summary = {
+        "schema": HFQ_SUMMARY_SCHEMA,
+        "magic": prefix["magic"],
+        "version": prefix["version"],
+        "arch_id": prefix["arch_id"],
+        "tensor_count": len(prefix["records"]),
+        "metadata_offset": prefix["metadata_offset"],
+        "data_offset": prefix["data_offset"],
+        "data_end": prefix["data_end"],
+        "file_bytes": prefix["file_bytes"],
+        "data_end_matches_file_size": prefix["data_end"] == prefix["file_bytes"],
+        "metadata": metadata_summary(prefix["metadata"]),
+        "quant_type_counts": dict(sorted(quant_type_counts.items())),
+        "tensor_names_md5": names_md5,
+        "tensors": tensors,
+        "tensors_truncated": len(prefix["records"]) > len(tensors),
+    }
+    return summary, tensor_map
 
 
 def summarize_hfq(path, *, max_tensors=32):
@@ -1568,6 +1625,96 @@ def load_safetensors_array(source_tensors, name):
     return arr.reshape(tuple(shape))
 
 
+HFQ_COPY_CHUNK = 8 * 1024 * 1024
+Q8_PROMOTE_CHUNK_ELEMS = 1_048_576  # 32-aligned f32 working set ~4 MiB
+
+
+def tensor_element_count_shape(shape):
+    n = 1
+    for dim in shape:
+        n *= int(dim)
+    return n
+
+
+def copy_file_bytes(src_f, dst_f, src_off, nbytes):
+    remaining = int(nbytes)
+    src_f.seek(int(src_off))
+    while remaining:
+        chunk = src_f.read(min(HFQ_COPY_CHUNK, remaining))
+        if not chunk:
+            raise ValueError("truncated HFQ payload copy")
+        dst_f.write(chunk)
+        remaining -= len(chunk)
+
+
+def load_safetensors_f32_elements(source_tensors, name, start_elem, count):
+    if np is None:
+        return None
+    tensor = source_tensors.get(name)
+    if tensor is None:
+        raise ValueError(f"source tensor not found: {name}")
+    dtype = tensor.get("dtype")
+    offsets = tensor.get("data_offsets") or []
+    if len(offsets) != 2:
+        raise ValueError(f"source tensor {name} missing data offsets")
+    if dtype == "BF16" or dtype == "F16":
+        itemsize = 2
+    elif dtype == "F32":
+        itemsize = 4
+    else:
+        raise ValueError(f"unsupported source tensor dtype for {name}: {dtype}")
+    file_path = Path(tensor["file"])
+    with file_path.open("rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        f.seek(8 + header_len + offsets[0] + int(start_elem) * itemsize)
+        raw = f.read(int(count) * itemsize)
+    if len(raw) != int(count) * itemsize:
+        raise ValueError(f"source tensor {name} slice is truncated")
+    if dtype == "BF16":
+        bits = np.frombuffer(raw, dtype="<u2").astype(np.uint32, copy=False) << np.uint32(16)
+        arr = bits.view(np.float32)
+    elif dtype == "F16":
+        arr = np.frombuffer(raw, dtype="<f2").astype(np.float32)
+    else:
+        arr = np.frombuffer(raw, dtype="<f4").astype(np.float32, copy=False)
+    return np.asarray(arr, dtype=np.float32).reshape(-1)
+
+
+def quantize_source_tensor_to_q8_into(dst_f, source_tensors, record):
+    """Quantize one tensor to Q8F16 and write it. Bounded RAM (chunked)."""
+    name = record["name"]
+    shape = tuple(int(dim) for dim in record["shape"])
+    n_elem = tensor_element_count_shape(shape)
+    expected = q8f16_data_size_for_shape(shape)
+    if np is None:
+        if n_elem > 1_000_000:
+            raise RuntimeError(
+                "numpy is required to promote large tensors; "
+                "run via `uv run --with numpy python3 scripts/astrea.py promote ...`"
+            )
+        packed = quantize_source_tensor_to_q8(source_tensors, record)
+        if len(packed) != expected:
+            raise ValueError(f"Q8F16 packed size mismatch for {name}: {len(packed)} vs {expected}")
+        dst_f.write(packed)
+        return expected
+    chunk = Q8_PROMOTE_CHUNK_ELEMS - (Q8_PROMOTE_CHUNK_ELEMS % 32)
+    offset = 0
+    written = 0
+    while offset < n_elem:
+        take = min(chunk, n_elem - offset)
+        arr = load_safetensors_f32_elements(source_tensors, name, offset, take)
+        if arr is None:
+            raise RuntimeError("numpy is required for chunked Q8 promotion")
+        packed = quantize_q8f16_values_numpy(arr)
+        dst_f.write(packed)
+        written += len(packed)
+        offset += take
+        del arr, packed
+    if written != expected:
+        raise ValueError(f"Q8F16 packed size mismatch for {name}: {written} vs {expected}")
+    return written
+
+
 def copy_candidate_file(model, candidate):
     src = Path(model)
     dst = Path(candidate)
@@ -1584,76 +1731,99 @@ def copy_candidate_file(model, candidate):
 
 
 def read_hfq_layout(path):
+    """Read an HFQ layout without copying tensor payloads into anonymous RAM.
+
+    15 GB models OOM'd the previous `read_bytes()` + per-tensor `bytes()` +
+    concatenated `bytearray()` path (~47 GB anon RSS). File-backed mmap keeps
+    unselected weights on disk until `write_hfq_layout` streams them out.
+    """
     p = Path(path)
-    data = p.read_bytes()
-    if len(data) < 32 or data[0:4] != b"HFQM":
-        raise ValueError("not an HFQ file")
-    version = struct.unpack_from("<I", data, 4)[0]
-    arch_id = struct.unpack_from("<I", data, 8)[0]
-    n_tensors = struct.unpack_from("<I", data, 12)[0]
-    metadata_offset = struct.unpack_from("<Q", data, 16)[0]
-    data_offset = struct.unpack_from("<Q", data, 24)[0]
-    metadata_region = data[metadata_offset:data_offset]
-    json_end = json_object_end(metadata_region)
-    metadata_bytes = bytes(metadata_region[:json_end])
-    pos = metadata_offset + json_end
-    idx_n = struct.unpack_from("<I", data, pos)[0]
-    pos += 4
-    if idx_n != n_tensors:
-        raise ValueError(f"HFQ index count {idx_n} does not match header count {n_tensors}")
-    records = []
-    cumulative_offset = data_offset
-    for _ in range(n_tensors):
-        name_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        name = data[pos : pos + name_len].decode("utf-8")
-        pos += name_len
-        quant_type = data[pos]
-        pos += 1
-        n_dims = data[pos]
-        pos += 1
-        shape = []
-        for _ in range(n_dims):
-            shape.append(struct.unpack_from("<I", data, pos)[0])
-            pos += 4
-        group_size = struct.unpack_from("<I", data, pos)[0]
+    fh = p.open("rb")
+    try:
+        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    except Exception:
+        fh.close()
+        raise
+    data = mm
+    try:
+        if len(data) < 32 or data[0:4] != b"HFQM":
+            raise ValueError("not an HFQ file")
+        version = struct.unpack_from("<I", data, 4)[0]
+        arch_id = struct.unpack_from("<I", data, 8)[0]
+        n_tensors = struct.unpack_from("<I", data, 12)[0]
+        metadata_offset = struct.unpack_from("<Q", data, 16)[0]
+        data_offset = struct.unpack_from("<Q", data, 24)[0]
+        metadata_region = data[metadata_offset:data_offset]
+        json_end = json_object_end(metadata_region)
+        metadata_bytes = bytes(metadata_region[:json_end])
+        pos = metadata_offset + json_end
+        idx_n = struct.unpack_from("<I", data, pos)[0]
         pos += 4
-        data_size = struct.unpack_from("<Q", data, pos)[0]
-        pos += 8
-        payload = bytes(data[cumulative_offset : cumulative_offset + data_size])
-        if len(payload) != data_size:
-            raise ValueError(f"HFQ tensor {name} payload is truncated")
-        quant_type_name = HFQ_QUANT_TYPE_NAMES.get(quant_type, f"UNKNOWN_{quant_type}")
-        records.append(
-            {
-                "name": name,
-                "quant_type": quant_type,
-                "quant_type_name": quant_type_name,
-                "shape": shape,
-                "group_size": group_size,
-                "data_size": data_size,
-                "data": payload,
-            }
-        )
-        cumulative_offset += data_size
-    if cumulative_offset != len(data):
-        raise ValueError(f"HFQ data end {cumulative_offset} does not match file size {len(data)}")
+        if idx_n != n_tensors:
+            raise ValueError(f"HFQ index count {idx_n} does not match header count {n_tensors}")
+        records = []
+        cumulative_offset = data_offset
+        file_size = len(data)
+        for _ in range(n_tensors):
+            name_len = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            name = data[pos : pos + name_len].decode("utf-8")
+            pos += name_len
+            quant_type = data[pos]
+            pos += 1
+            n_dims = data[pos]
+            pos += 1
+            shape = []
+            for _ in range(n_dims):
+                shape.append(struct.unpack_from("<I", data, pos)[0])
+                pos += 4
+            group_size = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+            data_size = struct.unpack_from("<Q", data, pos)[0]
+            pos += 8
+            end = cumulative_offset + data_size
+            if end > file_size:
+                raise ValueError(f"HFQ tensor {name} payload is truncated")
+            payload = memoryview(data)[cumulative_offset:end]
+            quant_type_name = HFQ_QUANT_TYPE_NAMES.get(quant_type, f"UNKNOWN_{quant_type}")
+            records.append(
+                {
+                    "name": name,
+                    "quant_type": quant_type,
+                    "quant_type_name": quant_type_name,
+                    "shape": shape,
+                    "group_size": group_size,
+                    "data_size": data_size,
+                    "data": payload,
+                }
+            )
+            cumulative_offset += data_size
+        if cumulative_offset != file_size:
+            raise ValueError(f"HFQ data end {cumulative_offset} does not match file size {file_size}")
+    except Exception:
+        mm.close()
+        fh.close()
+        raise
     return {
         "version": version,
         "arch_id": arch_id,
         "metadata_bytes": metadata_bytes,
         "records": records,
+        "_mmap": mm,
+        "_mmap_file": fh,
     }
 
 
 def write_hfq_layout(path, layout):
+    """Stream an HFQ to disk. Do not concatenate payloads in a Python bytearray."""
     records = layout["records"]
-    metadata = layout["metadata_bytes"]
+    metadata = bytes(layout["metadata_bytes"])
     index = bytearray()
     index += struct.pack("<I", len(records))
-    payloads = []
     for record in records:
         payload = record["data"]
+        if payload is None:
+            raise ValueError(f"missing payload for {record['name']}")
         if len(payload) != int(record["data_size"]):
             raise ValueError(f"payload size mismatch for {record['name']}")
         raw_name = record["name"].encode("utf-8")
@@ -1665,23 +1835,38 @@ def write_hfq_layout(path, layout):
             index += struct.pack("<I", int(dim))
         index += struct.pack("<I", int(record["group_size"]))
         index += struct.pack("<Q", int(record["data_size"]))
-        payloads.append(payload)
     metadata_offset = 32
     data_offset = metadata_offset + len(metadata) + len(index)
-    out = bytearray()
-    out += b"HFQM"
-    out += struct.pack("<I", int(layout["version"]))
-    out += struct.pack("<I", int(layout["arch_id"]))
-    out += struct.pack("<I", len(records))
-    out += struct.pack("<Q", metadata_offset)
-    out += struct.pack("<Q", data_offset)
-    out += metadata
-    out += index
-    for payload in payloads:
-        out += payload
     dst = Path(path)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(out)
+    tmp = dst.with_name(dst.name + ".tmp")
+    try:
+        with tmp.open("wb") as f:
+            f.write(b"HFQM")
+            f.write(struct.pack("<I", int(layout["version"])))
+            f.write(struct.pack("<I", int(layout["arch_id"])))
+            f.write(struct.pack("<I", len(records)))
+            f.write(struct.pack("<Q", metadata_offset))
+            f.write(struct.pack("<Q", data_offset))
+            f.write(metadata)
+            f.write(index)
+            for record in records:
+                f.write(record["data"])
+                record["data"] = None
+        tmp.replace(dst)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    mm = layout.get("_mmap")
+    fh = layout.get("_mmap_file")
+    if mm is not None:
+        with contextlib.suppress(BufferError, ValueError):
+            mm.close()
+        layout["_mmap"] = None
+    if fh is not None:
+        fh.close()
+        layout["_mmap_file"] = None
 
 
 def q8f16_data_size_for_shape(shape):
@@ -1874,6 +2059,8 @@ def write_policy_promotion_candidate(
     max_tensors=None,
     tensor_filter=None,
 ):
+    import gc
+
     if policy.get("promotion_format") != "q8":
         raise ValueError("policy promotion writer currently supports promotion_format=q8 only")
     model = policy.get("model")
@@ -1882,8 +2069,8 @@ def write_policy_promotion_candidate(
     requested_selected = selected_policy_items(policy, max_tensors=max_tensors, tensor_filter=tensor_filter)
     if not requested_selected:
         raise ValueError("policy has no selected tensors to promote")
-    layout = read_hfq_layout(model)
-    available_items = {record["name"]: {"hfq_name": record["name"]} for record in layout["records"]}
+    prefix = read_hfq_prefix(model)
+    available_items = {record["name"]: {"hfq_name": record["name"]} for record in prefix["records"]}
     for item in (policy.get("selected") or []) + (policy.get("skipped") or []):
         name = item.get("hfq_name")
         if name:
@@ -1896,55 +2083,98 @@ def write_policy_promotion_candidate(
     )
     selected_names = {item["hfq_name"] for item in selected}
     source_summary, source_tensors = read_safetensors_dir_index(source_dir)
-    promoted = []
     missing = sorted(name for name in selected_names if name not in source_tensors)
     if missing:
         raise ValueError(f"source tensors missing for selected policy entries: {missing[:8]}")
 
-    for record in layout["records"]:
-        if record["name"] not in selected_names:
-            continue
-        tensor_format = HFQ_QUANT_TYPE_FORMATS.get(record["quant_type_name"], "unknown")
-        if tensor_format != policy.get("base_format"):
-            raise ValueError(
-                f"selected tensor {record['name']} is {tensor_format}, expected {policy.get('base_format')}"
+    out_records = []
+    for record in prefix["records"]:
+        item = dict(record)
+        if item["name"] in selected_names:
+            tensor_format = canonical_policy_format(
+                HFQ_QUANT_TYPE_FORMATS.get(item["quant_type_name"], "unknown")
             )
-        packed = quantize_source_tensor_to_q8(source_tensors, record)
-        expected_size = q8f16_data_size_for_shape(record["shape"])
-        if len(packed) != expected_size:
-            raise ValueError(f"Q8F16 packed size mismatch for {record['name']}: {len(packed)} vs {expected_size}")
-        old = {
-            "quant_type": record["quant_type"],
-            "quant_type_name": record["quant_type_name"],
-            "group_size": record["group_size"],
-            "data_size": record["data_size"],
-        }
-        record["quant_type"] = 3
-        record["quant_type_name"] = "Q8F16"
-        record["group_size"] = 32
-        record["data_size"] = len(packed)
-        record["data"] = packed
-        promoted.append(
-            {
-                "hfq_name": record["name"],
-                "shape": record["shape"],
-                "old": old,
-                "new": {
-                    "quant_type": record["quant_type"],
-                    "quant_type_name": record["quant_type_name"],
-                    "group_size": record["group_size"],
-                    "data_size": record["data_size"],
-                },
-                "extra_bytes": record["data_size"] - old["data_size"],
-            }
-        )
+            expected_base = canonical_policy_format(policy.get("base_format"))
+            if tensor_format != expected_base:
+                raise ValueError(
+                    f"selected tensor {item['name']} is {tensor_format}, expected {expected_base}"
+                )
+            item["old_quant_type"] = item["quant_type"]
+            item["old_quant_type_name"] = item["quant_type_name"]
+            item["old_group_size"] = item["group_size"]
+            item["old_data_size"] = item["data_size"]
+            item["quant_type"] = 3
+            item["quant_type_name"] = "Q8F16"
+            item["group_size"] = 32
+            item["data_size"] = q8f16_data_size_for_shape(item["shape"])
+        out_records.append(item)
+
+    metadata = bytes(prefix["metadata_bytes"])
+    index = bytearray()
+    index += struct.pack("<I", len(out_records))
+    for record in out_records:
+        raw_name = record["name"].encode("utf-8")
+        index += struct.pack("<H", len(raw_name))
+        index += raw_name
+        index += struct.pack("<B", int(record["quant_type"]))
+        index += struct.pack("<B", len(record["shape"]))
+        for dim in record["shape"]:
+            index += struct.pack("<I", int(dim))
+        index += struct.pack("<I", int(record["group_size"]))
+        index += struct.pack("<Q", int(record["data_size"]))
+    metadata_offset = 32
+    data_offset = metadata_offset + len(metadata) + len(index)
+
+    dst = Path(output)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    promoted = []
+    try:
+        with Path(model).open("rb") as src_f, tmp.open("wb") as dst_f:
+            dst_f.write(b"HFQM")
+            dst_f.write(struct.pack("<I", int(prefix["version"])))
+            dst_f.write(struct.pack("<I", int(prefix["arch_id"])))
+            dst_f.write(struct.pack("<I", len(out_records)))
+            dst_f.write(struct.pack("<Q", metadata_offset))
+            dst_f.write(struct.pack("<Q", data_offset))
+            dst_f.write(metadata)
+            dst_f.write(index)
+            for record in out_records:
+                if record["name"] in selected_names:
+                    packed_size = quantize_source_tensor_to_q8_into(dst_f, source_tensors, record)
+                    promoted.append(
+                        {
+                            "hfq_name": record["name"],
+                            "shape": record["shape"],
+                            "old": {
+                                "quant_type": record["old_quant_type"],
+                                "quant_type_name": record["old_quant_type_name"],
+                                "group_size": record["old_group_size"],
+                                "data_size": record["old_data_size"],
+                            },
+                            "new": {
+                                "quant_type": record["quant_type"],
+                                "quant_type_name": record["quant_type_name"],
+                                "group_size": record["group_size"],
+                                "data_size": packed_size,
+                            },
+                            "extra_bytes": packed_size - record["old_data_size"],
+                        }
+                    )
+                    gc.collect()
+                else:
+                    copy_file_bytes(src_f, dst_f, record["data_offset"], record["data_size"])
+        tmp.replace(dst)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
     if len(promoted) != len(selected_names):
         promoted_names = {item["hfq_name"] for item in promoted}
         missing_model = sorted(selected_names - promoted_names)
         raise ValueError(f"selected tensors missing from HFQ model: {missing_model[:8]}")
 
-    write_hfq_layout(output, layout)
     return {
         "schema": PROMOTION_SCHEMA,
         "captured_at_utc": utc_now(),
@@ -2965,7 +3195,7 @@ def estimate_format_data_size(shape, quant_format):
         return elements * 2
     if fmt == "q8":
         return q8f16_data_size_for_shape(shape)
-    if fmt in {"mq4", "hfq4"}:
+    if fmt in {"mq4", "mq4v1", "mq4v2", "hfq4"}:
         return ceil_div(elements, 256) * 136
     if fmt == "mq3":
         return ceil_div(elements, 256) * 104
@@ -3049,6 +3279,236 @@ def load_imatrix_sensitivity(model, imatrix):
         "scores": scores,
         "aliases": aliases,
     }
+
+
+def canonical_policy_format(fmt):
+    if not fmt:
+        return fmt
+    lowered = str(fmt).lower()
+    return POLICY_FORMAT_ALIASES.get(lowered, lowered)
+
+
+def is_lm_head_tensor(name):
+    return name == "lm_head.weight" or name.endswith(".lm_head.weight") or name.endswith("/lm_head.weight")
+
+
+def gdn_out_proj_layer_index(name):
+    suffix = "linear_attn.out_proj.weight"
+    if not name.endswith(suffix):
+        return None
+    marker = ".layers."
+    start = name.find(marker)
+    if start < 0:
+        return None
+    rest = name[start + len(marker) :]
+    layer_s, _, _ = rest.partition(".")
+    try:
+        return int(layer_s)
+    except ValueError:
+        return None
+
+
+def tensor_residual_role(name):
+    """Classify a tensor for the Hy4 residual-stream prior."""
+    if is_lm_head_tensor(name):
+        return "residual_out"
+    if name.endswith("linear_attn.out_proj.weight"):
+        return "residual_out"
+    if name.endswith("self_attn.o_proj.weight"):
+        return "residual_out"
+    if name.endswith("mlp.down_proj.weight"):
+        return "residual_out"
+    if (
+        name.endswith("linear_attn.in_proj_qkv.weight")
+        or name.endswith("linear_attn.in_proj_z.weight")
+        or name.endswith("self_attn.q_proj.weight")
+        or name.endswith("self_attn.k_proj.weight")
+        or name.endswith("self_attn.v_proj.weight")
+    ):
+        return "attn_in"
+    if (
+        name.endswith("linear_attn.in_proj_a.weight")
+        or name.endswith("linear_attn.in_proj_b.weight")
+        or name.endswith("mlp.gate_proj.weight")
+        or name.endswith("mlp.up_proj.weight")
+    ):
+        return "bulk_in"
+    return "other"
+
+
+def residual_prior_multiplier(name):
+    return RESIDUAL_PRIOR_MULTIPLIERS[tensor_residual_role(name)]
+
+
+def residual_pack_rank(name):
+    """Lower packs first under --role-prior residual.
+
+    Product `pro` spends the xt→pro byte delta on GDN `out_proj` (ssm_out)
+    plus `lm_head`. Other residual writers fill leftover. Attn/bulk stay
+    after that so tiny `in_proj_a` tensors cannot drain the budget via
+    QKVZA runtime bundles.
+    """
+    if is_lm_head_tensor(name) or name.endswith("linear_attn.out_proj.weight"):
+        return 0
+    role = tensor_residual_role(name)
+    if role == "residual_out":
+        return 1
+    if role == "attn_in":
+        return 2
+    if role == "bulk_in":
+        return 3
+    return 2
+
+
+def policy_to_tensortypes(policy):
+    """Hy4-style first-match-wins recipe from an Astrea policy selected list."""
+    promotion = policy.get("promotion_format") or "q8"
+    lines = [
+        "# hipfire Astrea tensor-type recipe (first match wins)",
+        f"# policy_id={policy.get('policy_id')}",
+        f"# base={policy.get('base_format')} promote={promotion}",
+        f"# role_prior={policy.get('role_prior', 'none')}",
+        "",
+    ]
+    for item in policy.get("selected") or []:
+        name = item.get("hfq_name")
+        if name:
+            lines.append(f"{name}={promotion}")
+    return "\n".join(lines) + "\n"
+
+
+def pack_policy_selection(
+    candidates,
+    *,
+    max_extra_bytes,
+    base_format,
+    promotion_format,
+    preferred_names=None,
+):
+    """Greedy pack in rank order, then leftover-fill by smallest extra bytes."""
+    candidate_by_name = {item["hfq_name"]: item for item in candidates}
+    selected = []
+    selected_names = set()
+    skip_by_name = {}
+    remaining = int(max_extra_bytes)
+    added_runtime_anchors = []
+
+    def attempt(item):
+        nonlocal remaining
+        name = item["hfq_name"]
+        if name in selected_names:
+            return "already"
+        bundle = []
+        group_names = runtime_promotion_group_names(
+            name,
+            base_format=base_format,
+            promotion_format=promotion_format,
+        )
+        group_anchor = (
+            runtime_promotion_anchor_for_name(
+                name,
+                base_format=base_format,
+                promotion_format=promotion_format,
+            )
+            or name
+        )
+        missing_required = None
+        for gname in group_names:
+            if gname in selected_names:
+                continue
+            gitem = candidate_by_name.get(gname)
+            if gitem is None:
+                if gname == group_anchor and gname != name:
+                    missing_required = gname
+                    break
+                continue
+            if gname == name:
+                bundle.append(("selected", gitem, group_anchor if group_anchor != name else None))
+            elif gname == group_anchor:
+                bundle.append(("anchor", gitem, name))
+            else:
+                bundle.append(("dependent", gitem, name))
+        if missing_required:
+            skipped_item = dict(item)
+            skipped_item["reason"] = "runtime_anchor_missing"
+            skipped_item["runtime_bundle_anchor"] = missing_required
+            skip_by_name[name] = skipped_item
+            return "missing"
+        anchor = group_anchor if group_anchor != name else None
+        unique_bundle = []
+        bundle_names = set()
+        for role, bundle_item, trigger in bundle:
+            bundle_name = bundle_item["hfq_name"]
+            if bundle_name in selected_names or bundle_name in bundle_names:
+                continue
+            unique_bundle.append((role, bundle_item, trigger))
+            bundle_names.add(bundle_name)
+        bundle_extra = sum(int(bundle_item["extra_bytes"]) for _, bundle_item, _ in unique_bundle)
+        if bundle_extra <= remaining:
+            for role, bundle_item, trigger in unique_bundle:
+                selected_item = dict(bundle_item)
+                if role == "anchor":
+                    selected_item["runtime_bundle_role"] = "anchor"
+                    selected_item["runtime_bundle_trigger"] = trigger
+                    added_runtime_anchors.append(
+                        {"anchor": selected_item["hfq_name"], "trigger": trigger}
+                    )
+                elif role == "dependent":
+                    selected_item["runtime_bundle_role"] = "dependent"
+                    selected_item["runtime_bundle_anchor"] = group_anchor
+                    selected_item["runtime_bundle_trigger"] = trigger
+                elif trigger:
+                    selected_item["runtime_bundle_anchor"] = trigger
+                selected.append(selected_item)
+                selected_names.add(selected_item["hfq_name"])
+                remaining -= int(selected_item["extra_bytes"])
+                skip_by_name.pop(selected_item["hfq_name"], None)
+            return "selected"
+        skipped_item = dict(item)
+        skipped_item["reason"] = "over_budget"
+        if anchor:
+            skipped_item["runtime_bundle_anchor"] = anchor
+            skipped_item["required_runtime_bundle_extra_bytes"] = bundle_extra
+        skip_by_name[name] = skipped_item
+        return "over_budget"
+
+    for name in preferred_names or []:
+        item = candidate_by_name.get(name)
+        if item is not None:
+            attempt(item)
+
+    for item in candidates:
+        if item["hfq_name"] not in selected_names:
+            attempt(item)
+
+    leftover_blocked = set()
+    while True:
+        fitting = []
+        for name, skipped_item in skip_by_name.items():
+            if (
+                skipped_item.get("reason") != "over_budget"
+                or name in selected_names
+                or name in leftover_blocked
+            ):
+                continue
+            extra = int(skipped_item["extra_bytes"])
+            if extra <= remaining:
+                fitting.append(skipped_item)
+        if not fitting:
+            break
+        fitting.sort(
+            key=lambda item: (
+                -float(item["score_per_extra_byte"]),
+                int(item["extra_bytes"]),
+                item["hfq_name"],
+            )
+        )
+        pick = fitting[0]
+        if attempt(pick) != "selected":
+            leftover_blocked.add(pick["hfq_name"])
+
+    skipped = [skip_by_name[name] for name in sorted(skip_by_name) if name not in selected_names]
+    return selected, skipped, remaining, added_runtime_anchors
 
 
 def build_ingress_summary(hfq_tensors, model_family=None):
@@ -3147,14 +3607,24 @@ def build_policy(
     domains=None,
     model_family=None,
     policy_id=None,
+    role_prior="none",
+    hybrid_last_n=0,
 ):
     validate_values([base_format, promotion_format], SUPPORTED_FORMATS, "format")
+    requested_base_format = base_format
+    base_format = canonical_policy_format(base_format)
+    promotion_format = canonical_policy_format(promotion_format)
     methods = methods or []
     validate_values(methods, SUPPORTED_METHODS, "method")
     objectives = objectives or ["dynamic-tensor-policy"]
     validate_values(objectives, SUPPORTED_POLICY_OBJECTIVES, "policy objective")
     domains = domains or ["weights"]
     validate_values(domains, SUPPORTED_POLICY_DOMAINS, "policy domain")
+    if role_prior not in SUPPORTED_ROLE_PRIORS:
+        raise ValueError(f"unsupported role prior: {role_prior}")
+    hybrid_last_n = int(hybrid_last_n or 0)
+    if hybrid_last_n < 0:
+        raise ValueError("--hybrid-last-n must be non-negative")
     if max_extra_bytes is None or max_extra_bytes < 0:
         raise ValueError("--max-extra-bytes must be non-negative")
     if not sensitivity_json and not imatrix:
@@ -3165,20 +3635,30 @@ def build_policy(
         sensitivity = load_json_sensitivity(sensitivity_json)
     else:
         sensitivity = load_imatrix_sensitivity(model, imatrix)
-    scores = sensitivity["scores"]
-    aliases = sensitivity["aliases"]
+    scores = dict(sensitivity["scores"])
+    aliases = dict(sensitivity["aliases"])
     ingress = build_ingress_summary(hfq_tensors, model_family=model_family)
 
     base_data_bytes = sum(int(item["data_size"]) for item in hfq_tensors.values())
+    scored_values = [float(v) for v in scores.values() if v is not None]
+    synthetic_lm_head = max(scored_values) if scored_values else 1.0
     candidates = []
     unscored_tensor_count = 0
     format_mismatch_count = 0
+    structural_lm_head_count = 0
     for name, tensor in sorted(hfq_tensors.items()):
-        tensor_format = HFQ_QUANT_TYPE_FORMATS.get(tensor["quant_type_name"], "unknown")
+        tensor_format = canonical_policy_format(
+            HFQ_QUANT_TYPE_FORMATS.get(tensor["quant_type_name"], "unknown")
+        )
         if tensor_format != base_format:
             format_mismatch_count += 1
             continue
         score = scores.get(name)
+        score_source = "sensitivity"
+        if score is None and role_prior == "residual" and is_lm_head_tensor(name):
+            score = synthetic_lm_head
+            score_source = "structural_lm_head"
+            structural_lm_head_count += 1
         if score is None:
             unscored_tensor_count += 1
             continue
@@ -3187,6 +3667,10 @@ def build_policy(
         extra = promoted_size - base_size
         if extra <= 0:
             continue
+        raw_score = float(score)
+        multiplier = residual_prior_multiplier(name) if role_prior == "residual" else 1.0
+        weighted = raw_score * multiplier
+        pack_rank = residual_pack_rank(name) if role_prior == "residual" else 0
         candidates.append(
             {
                 "hfq_name": name,
@@ -3196,98 +3680,53 @@ def build_policy(
                 "base_data_size": base_size,
                 "promoted_data_size": promoted_size,
                 "extra_bytes": extra,
-                "score": float(score),
-                "score_per_extra_byte": float(score) / float(extra),
+                "raw_score": raw_score,
+                "role": tensor_residual_role(name),
+                "role_prior_multiplier": multiplier,
+                "pack_rank": pack_rank,
+                "score_source": score_source,
+                "score": weighted,
+                "score_per_extra_byte": weighted / float(extra),
             }
         )
 
-    candidates.sort(
-        key=lambda item: (
-            -item["score_per_extra_byte"],
-            -item["score"],
-            item["extra_bytes"],
-            item["hfq_name"],
+    if role_prior == "residual" and hybrid_last_n == 0:
+        candidates.sort(
+            key=lambda item: (
+                item["pack_rank"],
+                -item["score_per_extra_byte"],
+                -item["score"],
+                item["extra_bytes"],
+                item["hfq_name"],
+            )
         )
+    else:
+        candidates.sort(
+            key=lambda item: (
+                -item["score_per_extra_byte"],
+                -item["score"],
+                item["extra_bytes"],
+                item["hfq_name"],
+            )
+        )
+
+    preferred_names = []
+    if hybrid_last_n > 0:
+        out_proj = [
+            (gdn_out_proj_layer_index(item["hfq_name"]), item["hfq_name"])
+            for item in candidates
+            if gdn_out_proj_layer_index(item["hfq_name"]) is not None
+        ]
+        out_proj.sort(key=lambda pair: (-pair[0], pair[1]))
+        preferred_names = [name for _, name in out_proj[:hybrid_last_n]]
+
+    selected, skipped, _remaining, added_runtime_anchors = pack_policy_selection(
+        candidates,
+        max_extra_bytes=max_extra_bytes,
+        base_format=base_format,
+        promotion_format=promotion_format,
+        preferred_names=preferred_names,
     )
-
-    candidate_by_name = {item["hfq_name"]: item for item in candidates}
-    selected = []
-    selected_names = set()
-    skipped = []
-    remaining = int(max_extra_bytes)
-    added_runtime_anchors = []
-    for item in candidates:
-        name = item["hfq_name"]
-        if name in selected_names:
-            continue
-        bundle = []
-        group_names = runtime_promotion_group_names(
-            name,
-            base_format=base_format,
-            promotion_format=promotion_format,
-        )
-        group_anchor = runtime_promotion_anchor_for_name(
-            name,
-            base_format=base_format,
-            promotion_format=promotion_format,
-        ) or name
-        missing_required = None
-        for gname in group_names:
-            if gname in selected_names:
-                continue
-            gitem = candidate_by_name.get(gname)
-            if gitem is None:
-                if gname == group_anchor and gname != name:
-                    missing_required = gname
-                    break
-                continue
-            if gname == name:
-                bundle.append(("selected", gitem, group_anchor if group_anchor != name else None))
-            elif gname == group_anchor:
-                bundle.append(("anchor", gitem, name))
-            else:
-                bundle.append(("dependent", gitem, name))
-        if missing_required:
-            skipped_item = dict(item)
-            skipped_item["reason"] = "runtime_anchor_missing"
-            skipped_item["runtime_bundle_anchor"] = missing_required
-            skipped.append(skipped_item)
-            continue
-        anchor = group_anchor if group_anchor != name else None
-
-        unique_bundle = []
-        bundle_names = set()
-        for role, bundle_item, trigger in bundle:
-            bundle_name = bundle_item["hfq_name"]
-            if bundle_name in selected_names or bundle_name in bundle_names:
-                continue
-            unique_bundle.append((role, bundle_item, trigger))
-            bundle_names.add(bundle_name)
-
-        bundle_extra = sum(int(bundle_item["extra_bytes"]) for _, bundle_item, _ in unique_bundle)
-        if bundle_extra <= remaining:
-            for role, bundle_item, trigger in unique_bundle:
-                selected_item = dict(bundle_item)
-                if role == "anchor":
-                    selected_item["runtime_bundle_role"] = "anchor"
-                    selected_item["runtime_bundle_trigger"] = trigger
-                    added_runtime_anchors.append({"anchor": selected_item["hfq_name"], "trigger": trigger})
-                elif role == "dependent":
-                    selected_item["runtime_bundle_role"] = "dependent"
-                    selected_item["runtime_bundle_anchor"] = group_anchor
-                    selected_item["runtime_bundle_trigger"] = trigger
-                elif trigger:
-                    selected_item["runtime_bundle_anchor"] = trigger
-                selected.append(selected_item)
-                selected_names.add(selected_item["hfq_name"])
-                remaining -= int(selected_item["extra_bytes"])
-        else:
-            skipped_item = dict(item)
-            skipped_item["reason"] = "over_budget"
-            if anchor:
-                skipped_item["runtime_bundle_anchor"] = anchor
-                skipped_item["required_runtime_bundle_extra_bytes"] = bundle_extra
-            skipped.append(skipped_item)
 
     selected_extra = sum(item["extra_bytes"] for item in selected)
     model_name = Path(model).name.replace(".", "-").replace("/", "-")
@@ -3305,7 +3744,11 @@ def build_policy(
             "tensor_names_md5": hfq_summary["tensor_names_md5"],
         },
         "base_format": base_format,
+        "base_format_requested": requested_base_format,
         "promotion_format": promotion_format,
+        "role_prior": role_prior,
+        "hybrid_last_n": hybrid_last_n,
+        "structural_lm_head_count": structural_lm_head_count,
         "methods": methods,
         "objectives": objectives,
         "domains": domains,
@@ -3720,6 +4163,17 @@ def build_parser():
     policy.add_argument("--domain", dest="domains", action="append", default=[])
     policy.add_argument("--model-family")
     policy.add_argument("--policy-id")
+    policy.add_argument("--role-prior", choices=sorted(SUPPORTED_ROLE_PRIORS), default="none")
+    policy.add_argument(
+        "--hybrid-last-n",
+        type=int,
+        default=0,
+        help="Force-select the last N GDN out_proj tensors first, then fill remaining budget.",
+    )
+    policy.add_argument(
+        "--export-tensortypes",
+        help="Write a first-match-wins tensor recipe (Hy4 tensortypes analog).",
+    )
     policy.add_argument("--pretty", action="store_true")
     policy.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
@@ -3731,6 +4185,13 @@ def build_parser():
     promote.add_argument("--tensor-filter")
     promote.add_argument("--pretty", action="store_true")
     promote.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    recipe_export = sub.add_parser(
+        "recipe-export",
+        help="Write a Hy4-style tensortypes recipe from a policy JSON.",
+    )
+    recipe_export.add_argument("--policy", required=True)
+    recipe_export.add_argument("--out", required=True)
 
     kv_profile = sub.add_parser("kv-profile", help="Emit a KV cache policy/profile artifact.")
     kv_profile.add_argument("--model", required=True)
@@ -3863,22 +4324,36 @@ def run(argv=None):
             out=args.out,
         )
     elif args.command == "policy":
+        policy = build_policy(
+            model=args.model,
+            base_format=args.base_format,
+            promotion_format=args.promotion_format,
+            sensitivity_json=args.sensitivity_json,
+            imatrix=args.imatrix,
+            max_extra_bytes=args.max_extra_bytes,
+            methods=args.methods,
+            objectives=args.objectives or None,
+            domains=args.domains or None,
+            model_family=args.model_family,
+            policy_id=args.policy_id,
+            role_prior=args.role_prior,
+            hybrid_last_n=args.hybrid_last_n,
+        )
+        write_json(policy, pretty=args.pretty, out=args.out)
+        if args.export_tensortypes:
+            Path(args.export_tensortypes).write_text(policy_to_tensortypes(policy), encoding="utf-8")
+    elif args.command == "recipe-export":
+        policy = load_json(args.policy)
+        Path(args.out).write_text(policy_to_tensortypes(policy), encoding="utf-8")
         write_json(
-            build_policy(
-                model=args.model,
-                base_format=args.base_format,
-                promotion_format=args.promotion_format,
-                sensitivity_json=args.sensitivity_json,
-                imatrix=args.imatrix,
-                max_extra_bytes=args.max_extra_bytes,
-                methods=args.methods,
-                objectives=args.objectives or None,
-                domains=args.domains or None,
-                model_family=args.model_family,
-                policy_id=args.policy_id,
-            ),
-            pretty=args.pretty,
-            out=args.out,
+            {
+                "schema": "hipfire.astrea.recipe_export.v0",
+                "policy_id": policy.get("policy_id"),
+                "out": args.out,
+                "selected_count": len(policy.get("selected") or []),
+            },
+            pretty=True,
+            out=None,
         )
     elif args.command == "promote":
         write_json(

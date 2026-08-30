@@ -881,11 +881,261 @@ class AstreaTests(unittest.TestCase):
             [item["hfq_name"] for item in policy["selected"]],
             [
                 "model.language_model.layers.0.mlp.gate_proj.weight",
-                "model.language_model.layers.0.mlp.down_proj.weight",
+                "model.language_model.layers.0.mlp.up_proj.weight",
             ],
         )
-        self.assertEqual(policy["skipped"][0]["hfq_name"], "model.language_model.layers.0.mlp.up_proj.weight")
+        self.assertEqual(
+            policy["skipped"][0]["hfq_name"],
+            "model.language_model.layers.0.mlp.down_proj.weight",
+        )
         self.assertEqual(policy["next_step"], "write candidate weights, then collect KLD/PPL and Atlas AR/DFlash rows")
+
+    def test_policy_does_not_stop_early_when_higher_ranked_tensor_does_not_fit(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            sensitivity = root / "sensitivity.json"
+            too_big = "model.language_model.layers.0.mlp.down_proj.weight"
+            leftover = "model.language_model.layers.0.self_attn.o_proj.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    (too_big, 13, [2, 256], 256, 272),
+                    (leftover, 13, [1, 256], 256, 136),
+                ],
+            )
+            sensitivity.write_text(
+                json.dumps(
+                    {
+                        "tensors": [
+                            {"name": too_big, "score": 9.0},
+                            {"name": leftover, "score": 0.1},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq4",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=200,
+            )
+        names = [item["hfq_name"] for item in policy["selected"]]
+        self.assertEqual(names, [leftover])
+        self.assertEqual(policy["skipped"][0]["hfq_name"], too_big)
+        self.assertEqual(policy["skipped"][0]["reason"], "over_budget")
+
+    def test_residual_prior_selects_out_proj_before_qkv_bundle(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            sensitivity = root / "sensitivity.json"
+            out_proj = "model.language_model.layers.0.linear_attn.out_proj.weight"
+            qkv = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+            proj_a = "model.language_model.layers.0.linear_attn.in_proj_a.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    (out_proj, 13, [1, 256], 256, 136),
+                    (qkv, 13, [1, 256], 256, 136),
+                    (proj_a, 13, [1, 256], 256, 136),
+                ],
+            )
+            sensitivity.write_text(
+                json.dumps(
+                    {
+                        "tensors": [
+                            {"name": out_proj, "score": 0.01},
+                            {"name": qkv, "score": 9.0},
+                            {"name": proj_a, "score": 9.0},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq4",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=136,
+                role_prior="residual",
+            )
+        self.assertEqual(
+            [item["hfq_name"] for item in policy["selected"]],
+            [out_proj],
+        )
+        self.assertEqual(policy["selected"][0]["pack_rank"], 0)
+
+    def test_residual_prior_prefers_down_proj_over_higher_raw_gate(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            sensitivity = root / "sensitivity.json"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    ("model.language_model.layers.0.mlp.gate_proj.weight", 13, [1, 256], 256, 136),
+                    ("model.language_model.layers.0.mlp.down_proj.weight", 13, [1, 256], 256, 136),
+                    ("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 13, [1, 256], 256, 136),
+                ],
+            )
+            sensitivity.write_text(
+                json.dumps(
+                    {
+                        "tensors": [
+                            {"name": "model.language_model.layers.0.mlp.gate_proj.weight", "score": 0.90},
+                            {"name": "model.language_model.layers.0.mlp.down_proj.weight", "score": 0.80},
+                            {
+                                "name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                                "score": 0.85,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq4",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=136,
+                role_prior="residual",
+                policy_id="residual-prior-smoke",
+            )
+        self.assertEqual(
+            [item["hfq_name"] for item in policy["selected"]],
+            ["model.language_model.layers.0.mlp.down_proj.weight"],
+        )
+        self.assertEqual(policy["role_prior"], "residual")
+        self.assertEqual(policy["selected"][0]["role"], "residual_out")
+
+    def test_residual_prior_promotes_unscored_lm_head(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            sensitivity = root / "sensitivity.json"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    ("lm_head.weight", 13, [1, 256], 256, 136),
+                    ("model.language_model.layers.0.mlp.gate_proj.weight", 13, [1, 256], 256, 136),
+                ],
+            )
+            sensitivity.write_text(
+                json.dumps(
+                    {
+                        "tensors": [
+                            {"name": "model.language_model.layers.0.mlp.gate_proj.weight", "score": 0.10},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq4",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=136,
+                role_prior="residual",
+            )
+        self.assertEqual(policy["selected"][0]["hfq_name"], "lm_head.weight")
+        self.assertEqual(policy["selected"][0]["score_source"], "structural_lm_head")
+        self.assertEqual(policy["structural_lm_head_count"], 1)
+
+    def test_hybrid_last_n_prefers_late_gdn_out_proj(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            sensitivity = root / "sensitivity.json"
+            early = "model.language_model.layers.1.linear_attn.out_proj.weight"
+            late = "model.language_model.layers.10.linear_attn.out_proj.weight"
+            qkv = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    (early, 13, [1, 256], 256, 136),
+                    (late, 13, [1, 256], 256, 136),
+                    (qkv, 13, [1, 256], 256, 136),
+                ],
+            )
+            sensitivity.write_text(
+                json.dumps(
+                    {
+                        "tensors": [
+                            {"name": early, "score": 0.01},
+                            {"name": late, "score": 0.01},
+                            {"name": qkv, "score": 9.0},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq4",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=272,
+                role_prior="residual",
+                hybrid_last_n=1,
+            )
+        names = [item["hfq_name"] for item in policy["selected"]]
+        self.assertIn(late, names)
+        self.assertNotIn(early, names)
+
+    def test_policy_maps_mq4v2_qt44_as_mq4_base(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4v2.hfq"
+            sensitivity = root / "sensitivity.json"
+            name = "model.language_model.layers.0.mlp.down_proj.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[(name, 44, [1, 256], 256, 136)],
+            )
+            sensitivity.write_text(
+                json.dumps({"tensors": [{"name": name, "score": 1.0}]}),
+                encoding="utf-8",
+            )
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq4v2",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=136,
+            )
+        self.assertEqual(policy["base_format"], "mq4")
+        self.assertEqual(policy["base_format_requested"], "mq4v2")
+        self.assertEqual(policy["format_mismatch_count"], 0)
+        self.assertEqual(policy["selected"][0]["quant_type_name"], "MQ4G256V2")
+        recipe = astrea.policy_to_tensortypes(policy)
+        self.assertIn(f"{name}=q8", recipe)
+
+    def test_tensor_residual_role_names(self):
+        astrea = load_astrea()
+        self.assertEqual(
+            astrea.tensor_residual_role("model.language_model.layers.3.linear_attn.out_proj.weight"),
+            "residual_out",
+        )
+        self.assertEqual(
+            astrea.tensor_residual_role("model.language_model.layers.3.linear_attn.in_proj_qkv.weight"),
+            "attn_in",
+        )
+        self.assertEqual(
+            astrea.tensor_residual_role("model.language_model.layers.3.mlp.gate_proj.weight"),
+            "bulk_in",
+        )
 
     def test_policy_can_score_hfq_tensors_from_imatrix_aliases(self):
         astrea = load_astrea()
