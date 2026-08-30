@@ -1122,6 +1122,33 @@ class AstreaTests(unittest.TestCase):
         recipe = astrea.policy_to_tensortypes(policy)
         self.assertIn(f"{name}=q8", recipe)
 
+    def test_policy_maps_mq3v2_qt49_as_mq3_base(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq3v2.hfq"
+            sensitivity = root / "sensitivity.json"
+            name = "model.language_model.layers.0.mlp.down_proj.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[(name, 49, [1, 256], 256, 104)],
+            )
+            sensitivity.write_text(
+                json.dumps({"tensors": [{"name": name, "score": 1.0}]}),
+                encoding="utf-8",
+            )
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="mq3v2",
+                promotion_format="q8",
+                sensitivity_json=str(sensitivity),
+                max_extra_bytes=168,
+            )
+        self.assertEqual(policy["base_format"], "mq3")
+        self.assertEqual(policy["base_format_requested"], "mq3v2")
+        self.assertEqual(policy["format_mismatch_count"], 0)
+        self.assertEqual(policy["selected"][0]["quant_type_name"], "MQ3G256V2")
+
     def test_tensor_residual_role_names(self):
         astrea = load_astrea()
         self.assertEqual(
@@ -1136,6 +1163,19 @@ class AstreaTests(unittest.TestCase):
             astrea.tensor_residual_role("model.language_model.layers.3.mlp.gate_proj.weight"),
             "bulk_in",
         )
+
+    def test_file_summary_skips_md5_on_large_files(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "big.bin"
+            path.write_bytes(b"hello")
+            small = astrea.file_summary(path, md5_max_bytes=1024)
+            self.assertEqual(small["md5"], "5d41402abc4b2a76b9719d911017c592")
+            self.assertNotIn("md5_skipped", small)
+            large = astrea.file_summary(path, md5_max_bytes=4)
+            self.assertIsNone(large["md5"])
+            self.assertTrue(large["md5_skipped"])
+            self.assertEqual(large["bytes"], 5)
 
     def test_policy_can_score_hfq_tensors_from_imatrix_aliases(self):
         astrea = load_astrea()

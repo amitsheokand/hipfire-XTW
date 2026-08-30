@@ -52,11 +52,17 @@ PARO_PROBE_SCHEMA = "hipfire.astrea.paro_probe.v0"
 PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
 
 SUPPORTED_FORMATS = {
+    "mq2",
+    "mq2v2",
     "mq3",
+    "mq3v2",
     "mq4",
     "mq4v1",
     "mq4v2",
+    "mq5",
+    "mq5v2",
     "mq6",
+    "mq6v2",
     "hfq4",
     "hfq6",
     "hfp4",
@@ -68,10 +74,15 @@ SUPPORTED_FORMATS = {
 
 # Product-class aliases: --format mq4 is MQ4G256V2 (qt 44) at the quantizer,
 # while historical XT files may still be qt 13 MQ4G256. Policy treats both as mq4.
+# Same for mq3 (qt 17 vs 49), mq2 (18 vs 50), mq5 (31 vs 48), mq6 (15 vs 47).
 POLICY_FORMAT_ALIASES = {
+    "mq2v2": "mq2",
+    "mq3v2": "mq3",
     "mq4v1": "mq4",
     "mq4v2": "mq4",
     "mq4g256": "mq4",
+    "mq5v2": "mq5",
+    "mq6v2": "mq6",
 }
 
 SUPPORTED_ROLE_PRIORS = {
@@ -225,13 +236,20 @@ HFQ_QUANT_TYPE_NAMES = {
     12: "HFQ3G128",
     13: "MQ4G256",
     14: "MQ8G256",
-    44: "MQ4G256V2",
+    15: "MQ6G256",
     17: "MQ3G256",
     18: "MQ2G256",
     19: "MQ2G256_LLOYD",
     20: "MQ3G256_LLOYD",
     21: "HFP4G32",
     24: "MFP4G32",
+    31: "MQ5G256",
+    44: "MQ4G256V2",
+    45: "MQ4CG256",
+    47: "MQ6G256V2",
+    48: "MQ5G256V2",
+    49: "MQ3G256V2",
+    50: "MQ2G256V2",
 }
 
 HFQ_QUANT_TYPE_FORMATS = {
@@ -244,8 +262,17 @@ HFQ_QUANT_TYPE_FORMATS = {
     "HFQ6G256": "hfq6",
     "MQ4G256": "mq4",
     "MQ4G256V2": "mq4",
+    "MQ4CG256": "mq4",
     "MQ3G256": "mq3",
     "MQ3G256_LLOYD": "mq3",
+    "MQ3G256V2": "mq3",
+    "MQ2G256": "mq2",
+    "MQ2G256_LLOYD": "mq2",
+    "MQ2G256V2": "mq2",
+    "MQ5G256": "mq5",
+    "MQ5G256V2": "mq5",
+    "MQ6G256": "mq6",
+    "MQ6G256V2": "mq6",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
 }
@@ -253,6 +280,10 @@ HFQ_QUANT_TYPE_FORMATS = {
 
 def utc_now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# metrics --candidate-model on a 16G HFQ used to hash the whole file; skip above this.
+FILE_SUMMARY_MD5_MAX_BYTES = 256 * 1024 * 1024
 
 
 def md5_file(path):
@@ -266,7 +297,7 @@ def md5_file(path):
     return digest.hexdigest()
 
 
-def file_summary(path):
+def file_summary(path, *, md5_max_bytes=FILE_SUMMARY_MD5_MAX_BYTES):
     if not path:
         return None
     p = Path(path)
@@ -279,7 +310,10 @@ def file_summary(path):
     }
     if p.is_file():
         item["bytes"] = p.stat().st_size
-        item["md5"] = md5_file(p)
+        if md5_max_bytes is not None and item["bytes"] > int(md5_max_bytes):
+            item["md5_skipped"] = True
+        else:
+            item["md5"] = md5_file(p)
     return item
 
 
@@ -3197,9 +3231,13 @@ def estimate_format_data_size(shape, quant_format):
         return q8f16_data_size_for_shape(shape)
     if fmt in {"mq4", "mq4v1", "mq4v2", "hfq4"}:
         return ceil_div(elements, 256) * 136
-    if fmt == "mq3":
+    if fmt in {"mq3", "mq3v2"}:
         return ceil_div(elements, 256) * 104
-    if fmt in {"mq6", "hfq6"}:
+    if fmt in {"mq2", "mq2v2"}:
+        return ceil_div(elements, 256) * 72
+    if fmt in {"mq5", "mq5v2"}:
+        return ceil_div(elements, 256) * 168
+    if fmt in {"mq6", "mq6v2", "hfq6"}:
         return ceil_div(elements, 256) * 200
     if fmt in {"hfp4", "mfp4"}:
         if len(shape or []) != 2:

@@ -79,4 +79,16 @@ V2 floor ≈ MIX. V2+qkv ≈ V1+residual. Pro (V2+residual) still −0.018 KLD a
 
 Astrea `metrics` (product baseline = `mq4-pro`): **`no_quality_gain`** (KLD +0.0178, PPL +0.061). Report: *quality evidence does not justify promotion yet*. vs MIX: `quality_improved` (codec). residual-v1 vs MIX: `quality_improved` (allocation). Do not Atlas. Do not unmask serve. Product remains published mq4-pro.
 
-Artifacts: `~/.hipfire/calib/qwen38-27b-mix/metrics-mix-qkv-v2-vs-pro.json`, `report-mix-qkv-v2-vs-pro.json`. `uv run --with numpy python3 scripts/test_astrea.py` 43/43. L1–L4 not this round.
+Artifacts: `~/.hipfire/calib/qwen38-27b-mix/metrics-mix-qkv-v2-vs-pro.json`, `report-mix-qkv-v2-vs-pro.json`. L1–L4 not this round.
+
+**Astrea MQ V2 type table (continue):** qt 44 `MQ4G256V2` → mq4 was N3. Same class for the rest of the V2 family so inspect/policy of published mq3-pro is not `UNKNOWN_49`: 45 `MQ4CG256`→mq4, 47 `MQ6G256V2`→mq6, 48 `MQ5G256V2`→mq5, 49 `MQ3G256V2`→mq3, 50 `MQ2G256V2`→mq2. Aliases `mq3v2`/`mq2v2`/`mq5v2`/`mq6v2`. `file_summary` skips md5 above 256 MiB (`md5_skipped`) so `metrics --candidate-model` does not hash 16G HFQs. Tests: `uv run --with numpy python3 scripts/test_astrea.py` **45/45**. Promote of an mq3 body is **not** N6.
+
+**N6 (2026-08-30, same local llama-b10488 teacher, 24 chunks, all finite, no KLD=0):** published `qwen3.8:27b-mq3-pro` sha256 `394c50966bf4f68172df8eb34cd7ded8f9d0576c9ef24ea6ba639a88c184f795`, 13 184 433 152 B. Inspect: `MQ3G256V2` 448 + `MQ6G256V2` 48 (`ssm_out`) + `Q8F16` 50 (lm_head+embed+48×conv1d) + F16 753. `hipfire_base_format=mq3v2` `hipfire_product_tier=pro`. Prefill 154 tok/s (not a serve claim).
+
+| variant | bytes | body | extra | WT2 KLD | PPL |
+|---|---:|---|---|---:|---:|
+| mq4-pro | 16 464 182 272 | MQ4V2 | lm_head+embed+conv1d+`ssm_out` Q8 | **0.032715** | 6.331 |
+| v2-xt | 14 980 361 216 | MQ4V2 | embed+conv1d | 0.057414 | 6.416 |
+| mq3-pro | 13 184 433 152 | MQ3V2 | lm_head+embed+conv1d Q8, `ssm_out` MQ6 | **0.130304** | 6.775 |
+
+Astrea `metrics` vs `mq4-pro`: **`no_quality_gain`** (KLD +0.0976, PPL +0.444). Report: *quality evidence does not justify promotion yet*. This is the smaller SKU, not another 4.9 bpw knapsack. Local 0.1303 is the number that belongs in this table — do not import Hub WT2 0.130 as a second protocol. Serve stays masked. Product remains published **mq4-pro**. Closing the mq3 gap is L3 (GSQ encoder), not mix-bit at 4.9 bpw. Artifacts: `kldseq/mq3-pro__gfx1201__prefill.kldseq`, `inspect-mq3-pro.json`, `metrics-mq3-pro-vs-mq4-pro.json`, `report-mq3-pro-vs-mq4-pro.json`.
