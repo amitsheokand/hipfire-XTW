@@ -1118,7 +1118,12 @@ impl Qwen35Scratch {
                 } else {
                     super::prefill::prefill_max_batch(gpu)
                 };
-                s.prefill_batch = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
+                // Plain prefill never reads the GDN S-tape; DFlash tree-verify
+                // owns its own VerifyScratch PBS. Allocating the tape here at
+                // gfx1201 chunk=384 is 1.64 GB on Qwen3.8-27B for nothing.
+                s.prefill_batch = Some(PrefillBatchScratch::new_opt(
+                    gpu, config, max_batch, /*cap_gdn_tape=*/ false,
+                )?);
             }
             Ok(s)
         })

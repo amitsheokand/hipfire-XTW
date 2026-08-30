@@ -186,6 +186,20 @@ impl PrefillBatchScratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
+        // Refuse before the first hipMalloc. A mid-`new_opt` OOM still runs
+        // the ledger `hipFree`s below; on this HIP runtime that has aborted
+        // the GPU daemon while the HTTP parent stayed up (the ~94k Qwen
+        // prefill). Projected bytes use the same arithmetic as the allocs.
+        let projected = Self::projected_allocation_bytes(config, max_batch, cap_gdn_tape)?;
+        if let Ok((free, _)) = gpu.hip.get_vram_info() {
+            if projected > free as u64 {
+                let msg = format!(
+                    "PrefillBatchScratch needs {projected} bytes (max_batch={max_batch}, gdn_tape={cap_gdn_tape}), GPU reports {free} bytes free"
+                );
+                return Err(HipError::new(0, &msg));
+            }
+        }
+
         // hunt3 H-E residual: this struct literal allocates ~40 GpuTensors via
         // `?` early-returns. PrefillBatchScratch has no Drop impl (GpuTensor
         // carries no Gpu handle; free_tensor needs &mut Gpu), so a `?` failure
