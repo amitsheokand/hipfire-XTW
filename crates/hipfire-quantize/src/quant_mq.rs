@@ -137,30 +137,39 @@ pub(crate) const MQ2V2_GROUP_BYTES: usize = 72;
 /// MQ3G256V2 scale/zero fit. Wire layout is identical; only (s,z,q) change.
 ///
 /// `Ls` is the default (GSQ-style least-squares + reassign on the 8-level
-/// grid). `Minmax` is the published encoder and the never-regress floor.
+/// grid). `Minmax` is the published encoder and the LS never-regress floor.
+/// `Gumbel` is opt-in (`HIPFIRE_MQ3V2_FIT=gumbel`): LS, then deterministic
+/// softmax annealing over the 8 reconstruction levels. Never-regresses vs LS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mq3v2Fit {
     Minmax,
     Ls,
+    Gumbel,
 }
 
 const MQ3V2_LS_ITERS: usize = 8;
+const MQ3V2_GUMBEL_ITERS: usize = 16;
 
 fn mq3v2_fit_from_env() -> Mq3v2Fit {
     match hipfire_config::developer_var("HIPFIRE_MQ3V2_FIT") {
         Ok(s) if s.eq_ignore_ascii_case("minmax") => Mq3v2Fit::Minmax,
+        Ok(s) if s.eq_ignore_ascii_case("gumbel") || s.eq_ignore_ascii_case("gsq") => {
+            Mq3v2Fit::Gumbel
+        }
         _ => Mq3v2Fit::Ls,
     }
 }
 
 /// Use imatrix column weights on LS when the env is unset or `ls-w`/`weighted`.
-/// `HIPFIRE_MQ3V2_FIT=ls` keeps slice-1 unweighted LS; `minmax` ignores weights.
+/// `HIPFIRE_MQ3V2_FIT=ls` keeps slice-1 unweighted LS; `minmax`/`gumbel` ignore weights.
 fn mq3v2_want_col_weights() -> bool {
     match hipfire_config::developer_var("HIPFIRE_MQ3V2_FIT") {
         Ok(s)
             if s.eq_ignore_ascii_case("minmax")
                 || s.eq_ignore_ascii_case("ls")
-                || s.eq_ignore_ascii_case("unweighted") =>
+                || s.eq_ignore_ascii_case("unweighted")
+                || s.eq_ignore_ascii_case("gumbel")
+                || s.eq_ignore_ascii_case("gsq") =>
         {
             false
         }
@@ -171,6 +180,7 @@ fn mq3v2_want_col_weights() -> bool {
 pub(crate) fn mq3v2_fit_label() -> &'static str {
     match mq3v2_fit_from_env() {
         Mq3v2Fit::Minmax => "minmax",
+        Mq3v2Fit::Gumbel => "gumbel",
         Mq3v2Fit::Ls if mq3v2_want_col_weights() && crate::calibration::IMATRIX.get().is_some() => {
             "ls-w"
         }
@@ -208,7 +218,7 @@ fn mq3v2_half_mse(slice: &[f32], q: &[u8], st: f32, z: f32, w: Option<&[f32]>) -
 /// Least squares for `w ≈ q * s + z` on a 128-wide half.
 /// Optional `w` is a per-element importance (imatrix column, applied after FWHT
 /// as a diagonal proxy — not a rotated Hessian).
-fn mq3v2_ls_sz(slice: &[f32], q: &[u8], w: Option<&[f32]>) -> Option<(f32, f32)> {
+fn mq3v2_ls_sz_f(slice: &[f32], q: &[f64], w: Option<&[f32]>) -> Option<(f32, f32)> {
     let mut sum_a = 0.0f64;
     let mut sum_aq = 0.0f64;
     let mut sum_aq2 = 0.0f64;
@@ -222,7 +232,7 @@ fn mq3v2_ls_sz(slice: &[f32], q: &[u8], w: Option<&[f32]>) -> Option<(f32, f32)>
         if ai == 0.0 {
             continue;
         }
-        let qi = q[i] as f64;
+        let qi = q[i];
         let wi = slice[i] as f64;
         sum_a += ai;
         sum_aq += ai * qi;
@@ -240,6 +250,45 @@ fn mq3v2_ls_sz(slice: &[f32], q: &[u8], w: Option<&[f32]>) -> Option<(f32, f32)>
         return None;
     }
     Some((s as f32, z as f32))
+}
+
+fn mq3v2_ls_sz(slice: &[f32], q: &[u8], w: Option<&[f32]>) -> Option<(f32, f32)> {
+    let mut qf = [0.0f64; 128];
+    for i in 0..128 {
+        qf[i] = q[i] as f64;
+    }
+    mq3v2_ls_sz_f(slice, &qf, w)
+}
+
+/// Deterministic Concrete / softmax assignment (Gumbel noise = 0) over 8 levels.
+fn mq3v2_soft_q(slice: &[f32], st: f32, z: f32, tau: f64, q_soft: &mut [f64]) {
+    let st = st as f64;
+    let z = z as f64;
+    let tau = tau.max(1e-12);
+    for i in 0..128 {
+        let v = slice[i] as f64;
+        let mut logits = [0.0f64; 8];
+        let mut m = f64::NEG_INFINITY;
+        for j in 0..8 {
+            let rec = j as f64 * st + z;
+            let d = v - rec;
+            logits[j] = -(d * d) / tau;
+            if logits[j] > m {
+                m = logits[j];
+            }
+        }
+        let mut sum = 0.0;
+        for j in 0..8 {
+            logits[j] = (logits[j] - m).exp();
+            sum += logits[j];
+        }
+        let inv = 1.0 / sum;
+        let mut e = 0.0;
+        for j in 0..8 {
+            e += j as f64 * logits[j] * inv;
+        }
+        q_soft[i] = e;
+    }
 }
 
 fn mq3v2_minmax_half(slice: &[f32]) -> (u16, u16, f32, f32, bool) {
@@ -296,6 +345,47 @@ fn mq3v2_fit_half(
             best_q.copy_from_slice(&cur_q);
         }
     }
+    if fit == Mq3v2Fit::Gumbel {
+        // Concrete softmax (Gumbel noise = 0) from minmax (s,z). High-τ then
+        // snap to the qt=49 wire. 2026-08-30: did not beat LS MSE on Gaussian or
+        // heavy-tail halves — never-regress keeps the LS blob. Opt-in only;
+        // do not 27B-encode unless a proto MSE win appears.
+        let span = (st.abs() as f64 * 7.0).max(1e-8);
+        let tau0 = span * span;
+        let tau1 = (st.abs() as f64).max(1e-8).powi(2) * 0.25;
+        let mut st_n = st;
+        let mut z_n = z;
+        let mut q_soft = [0.0f64; 128];
+        let snap_from = MQ3V2_GUMBEL_ITERS.saturating_sub(4);
+        for t in 0..MQ3V2_GUMBEL_ITERS {
+            let frac = t as f64 / (MQ3V2_GUMBEL_ITERS - 1).max(1) as f64;
+            let tau = tau0 * (tau1 / tau0).powf(frac);
+            mq3v2_soft_q(slice, st_n, z_n, tau, &mut q_soft);
+            let Some((s_ls, z_ls)) = mq3v2_ls_sz_f(slice, &q_soft, w) else {
+                break;
+            };
+            if t < snap_from {
+                st_n = s_ls;
+                z_n = z_ls;
+                continue;
+            }
+            let nb_s = f32_to_f16(s_ls);
+            let nb_z = f32_to_f16(z_ls);
+            st_n = f16_to_f32(nb_s);
+            z_n = f16_to_f32(nb_z);
+            if st_n == 0.0 {
+                break;
+            }
+            mq3v2_assign_half(slice, st_n, z_n, &mut cur_q);
+            let mse = mq3v2_half_mse(slice, &cur_q, st_n, z_n, w);
+            if mse < best_mse {
+                best_mse = mse;
+                best_s = nb_s;
+                best_z = nb_z;
+                best_q.copy_from_slice(&cur_q);
+            }
+        }
+    }
     q_out.copy_from_slice(&best_q);
     (best_s, best_z)
 }
@@ -347,7 +437,8 @@ fn unpack_mq3v2_payload(payload: &[u8], q: &mut [u8; 256]) {
 /// Payload unchanged from MQ3G256: 8 values per 3 bytes, little-endian bitstream.
 ///
 /// Default fit is least-squares + reassign (see [`Mq3v2Fit::Ls`]). Set
-/// `HIPFIRE_MQ3V2_FIT=minmax` to reproduce the published minmax encoder.
+/// `HIPFIRE_MQ3V2_FIT=minmax` to reproduce the published minmax encoder, or
+/// `HIPFIRE_MQ3V2_FIT=gumbel` for softmax-annealed assignment on the same wire.
 pub(crate) fn quantize_mq3g256v2(
     w: &[f32],
     m: usize,
@@ -3108,6 +3199,73 @@ mod mqv2_lowbit_tests {
             unpack_mq3v2_payload(&ls[base + 8..base + MQ3V2_GROUP_BYTES], &mut q);
             assert!(q.iter().all(|&qq| qq <= 7));
         }
+    }
+
+    #[test]
+    fn mq3v2_gumbel_never_regresses_ls_gaussian_mse() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next_f32 = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u1 = (((rng >> 33) as u32) as f32 / (1u32 << 31) as f32).clamp(1e-6, 1.0 - 1e-6);
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u2 = (((rng >> 33) as u32) as f32 / (1u32 << 31) as f32).clamp(1e-6, 1.0 - 1e-6);
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        };
+        let m = 16;
+        let k = 512;
+        let w: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+        let ls = quantize_mq3g256v2_with_fit(&w, m, k, &s1, &s2, Mq3v2Fit::Ls, None);
+        let gumbel = quantize_mq3g256v2_with_fit(&w, m, k, &s1, &s2, Mq3v2Fit::Gumbel, None);
+        assert_eq!(ls.len(), gumbel.len());
+        assert_eq!(gumbel.len(), m * (k / 256) * MQ3V2_GROUP_BYTES);
+        let mse_ls = mq3v2_rotated_mse(&w, m, k, &s1, &s2, &ls);
+        let mse_g = mq3v2_rotated_mse(&w, m, k, &s1, &s2, &gumbel);
+        assert!(
+            mse_g <= mse_ls + 1e-6,
+            "Gumbel reconstruction MSE {mse_g} exceeded LS {mse_ls}"
+        );
+        for g in 0..(m * (k / 256)) {
+            let base = g * MQ3V2_GROUP_BYTES;
+            let mut q = [0u8; 256];
+            unpack_mq3v2_payload(&gumbel[base + 8..base + MQ3V2_GROUP_BYTES], &mut q);
+            assert!(q.iter().all(|&qq| qq <= 7));
+        }
+    }
+
+    #[test]
+    fn mq3v2_gumbel_vs_ls_heavy_tail_mse() {
+        let s1 = gen_fwht_signs(7, 256);
+        let s2 = gen_fwht_signs(99, 256);
+        let mut rng = 0xcafef00ddeadbeefu64;
+        let mut next_f32 = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u1 = (((rng >> 33) as u32) as f32 / (1u32 << 31) as f32).clamp(1e-6, 1.0 - 1e-6);
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u2 = (((rng >> 33) as u32) as f32 / (1u32 << 31) as f32).clamp(1e-6, 1.0 - 1e-6);
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        };
+        let m = 16;
+        let k = 512;
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| {
+                let g = next_f32();
+                if i % 17 == 0 {
+                    g * 12.0
+                } else {
+                    g
+                }
+            })
+            .collect();
+        let ls = quantize_mq3g256v2_with_fit(&w, m, k, &s1, &s2, Mq3v2Fit::Ls, None);
+        let gumbel = quantize_mq3g256v2_with_fit(&w, m, k, &s1, &s2, Mq3v2Fit::Gumbel, None);
+        let mse_ls = mq3v2_rotated_mse(&w, m, k, &s1, &s2, &ls);
+        let mse_g = mq3v2_rotated_mse(&w, m, k, &s1, &s2, &gumbel);
+        assert!(
+            mse_g <= mse_ls + 1e-6,
+            "Gumbel reconstruction MSE {mse_g} exceeded LS {mse_ls}"
+        );
     }
 
     #[test]

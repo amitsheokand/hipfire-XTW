@@ -197,6 +197,7 @@ minmax (`q=0`).
 
 Escape hatch for the published minmax encoder: `HIPFIRE_MQ3V2_FIT=minmax`.
 Unweighted LS (slice 1): `HIPFIRE_MQ3V2_FIT=ls`. Default with `--imatrix` is **ls-w** (column-weighted LS).
+Opt-in Gumbel / Concrete softmax annealing (slice 2): `HIPFIRE_MQ3V2_FIT=gumbel` — minmax init, 16 temperature steps over the 8 reconstruction levels, hard-assign, **never-regress vs unweighted LS**. Same 104 B wire. Proto MSE tied LS on Gaussian and heavy-tail (2026-08-30); not a product default and not a 27B candidate unless a later proto MSE win appears.
 
 See [`docs/plans/2026-08-30-l3-gsq-mq3v2.md`](../plans/2026-08-30-l3-gsq-mq3v2.md).
 
