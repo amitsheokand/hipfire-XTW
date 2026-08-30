@@ -160,7 +160,11 @@ byte-identical to qt=1/6/13.
 ## 4 · Encoder contract
 
 For each 256-weight group, after FWHT-256 (`cpu_fwht_256` with the tensor's
-sign seeds):
+sign seeds). **Reconstruction is always** `w = q * f32(scale[h]) + f32(zero[h])`
+against fp16-rounded header fields. The decoder/kernel contract does not
+change with fit method.
+
+### 4.1 · Minmax (default for MQ6/5/4/2 V2)
 
 ```
 for h in {0, 1}:
@@ -181,6 +185,20 @@ for h in {0, 1}:
 pack header LE: s0, z0, s1, z1
 pack payload with the bit-width rules in §3
 ```
+
+### 4.2 · MQ3G256V2 least-squares (default since 2026-08-30)
+
+`quantize_mq3g256v2` keeps the qt=49 wire (104 B/group) but fits `(scale, zero)`
+by Lloyd on the 8 reconstruction levels: minmax init, then up to 8 iterations of
+unweighted least-squares `w ≈ q·s + z` given `q ∈ {0..7}`, fp16 round-trip,
+reassign. The encoder **never emits a half whose reconstruction MSE is worse
+than that half's minmax**. Degenerate halves (`hi == lo` or fp16 scale 0) stay
+minmax (`q=0`).
+
+Escape hatch for the published minmax encoder: `HIPFIRE_MQ3V2_FIT=minmax`.
+Unweighted LS (slice 1): `HIPFIRE_MQ3V2_FIT=ls`. Default with `--imatrix` is **ls-w** (column-weighted LS).
+
+See [`docs/plans/2026-08-30-l3-gsq-mq3v2.md`](../plans/2026-08-30-l3-gsq-mq3v2.md).
 
 **Degenerate half:** `scale=0`, `zero=f16(lo)`, `q=0` → decoder reproduces `lo`
 exactly.

@@ -133,10 +133,221 @@ pub(crate) fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 }
 pub(crate) const MQ3V2_GROUP_BYTES: usize = 104;
 pub(crate) const MQ2V2_GROUP_BYTES: usize = 72;
+
+/// MQ3G256V2 scale/zero fit. Wire layout is identical; only (s,z,q) change.
+///
+/// `Ls` is the default (GSQ-style least-squares + reassign on the 8-level
+/// grid). `Minmax` is the published encoder and the never-regress floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mq3v2Fit {
+    Minmax,
+    Ls,
+}
+
+const MQ3V2_LS_ITERS: usize = 8;
+
+fn mq3v2_fit_from_env() -> Mq3v2Fit {
+    match hipfire_config::developer_var("HIPFIRE_MQ3V2_FIT") {
+        Ok(s) if s.eq_ignore_ascii_case("minmax") => Mq3v2Fit::Minmax,
+        _ => Mq3v2Fit::Ls,
+    }
+}
+
+/// Use imatrix column weights on LS when the env is unset or `ls-w`/`weighted`.
+/// `HIPFIRE_MQ3V2_FIT=ls` keeps slice-1 unweighted LS; `minmax` ignores weights.
+fn mq3v2_want_col_weights() -> bool {
+    match hipfire_config::developer_var("HIPFIRE_MQ3V2_FIT") {
+        Ok(s)
+            if s.eq_ignore_ascii_case("minmax")
+                || s.eq_ignore_ascii_case("ls")
+                || s.eq_ignore_ascii_case("unweighted") =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+pub(crate) fn mq3v2_fit_label() -> &'static str {
+    match mq3v2_fit_from_env() {
+        Mq3v2Fit::Minmax => "minmax",
+        Mq3v2Fit::Ls if mq3v2_want_col_weights() && crate::calibration::IMATRIX.get().is_some() => {
+            "ls-w"
+        }
+        Mq3v2Fit::Ls => "ls",
+    }
+}
+
+fn mq3v2_assign_half(slice: &[f32], st: f32, z: f32, q: &mut [u8]) {
+    debug_assert_eq!(slice.len(), 128);
+    debug_assert_eq!(q.len(), 128);
+    if st == 0.0 {
+        q.fill(0);
+        return;
+    }
+    let inv = 1.0 / st;
+    for i in 0..128 {
+        q[i] = ((slice[i] - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+    }
+}
+
+fn mq3v2_half_mse(slice: &[f32], q: &[u8], st: f32, z: f32, w: Option<&[f32]>) -> f64 {
+    let mut acc = 0.0f64;
+    for i in 0..128 {
+        let rec = q[i] as f32 * st + z;
+        let d = (slice[i] - rec) as f64;
+        let ai = match w {
+            Some(a) => a[i].max(0.0) as f64,
+            None => 1.0,
+        };
+        acc += ai * d * d;
+    }
+    acc
+}
+
+/// Least squares for `w ≈ q * s + z` on a 128-wide half.
+/// Optional `w` is a per-element importance (imatrix column, applied after FWHT
+/// as a diagonal proxy — not a rotated Hessian).
+fn mq3v2_ls_sz(slice: &[f32], q: &[u8], w: Option<&[f32]>) -> Option<(f32, f32)> {
+    let mut sum_a = 0.0f64;
+    let mut sum_aq = 0.0f64;
+    let mut sum_aq2 = 0.0f64;
+    let mut sum_aw = 0.0f64;
+    let mut sum_aqw = 0.0f64;
+    for i in 0..128 {
+        let ai = match w {
+            Some(a) => a[i].max(0.0) as f64,
+            None => 1.0,
+        };
+        if ai == 0.0 {
+            continue;
+        }
+        let qi = q[i] as f64;
+        let wi = slice[i] as f64;
+        sum_a += ai;
+        sum_aq += ai * qi;
+        sum_aq2 += ai * qi * qi;
+        sum_aw += ai * wi;
+        sum_aqw += ai * qi * wi;
+    }
+    let det = sum_aq2 * sum_a - sum_aq * sum_aq;
+    if !det.is_finite() || det.abs() < 1e-12 || sum_a <= 0.0 {
+        return None;
+    }
+    let s = (sum_a * sum_aqw - sum_aq * sum_aw) / det;
+    let z = (sum_aq2 * sum_aw - sum_aq * sum_aqw) / det;
+    if !s.is_finite() || !z.is_finite() || s == 0.0 {
+        return None;
+    }
+    Some((s as f32, z as f32))
+}
+
+fn mq3v2_minmax_half(slice: &[f32]) -> (u16, u16, f32, f32, bool) {
+    let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+    let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let step_f32 = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+    let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+    let z_bits = f32_to_f16(lo);
+    let st = f16_to_f32(sc_bits);
+    let z = f16_to_f32(z_bits);
+    let degenerate = hi == lo || step_f32 == 0.0 || st == 0.0;
+    (sc_bits, z_bits, st, z, degenerate)
+}
+
+fn mq3v2_fit_half(
+    slice: &[f32],
+    fit: Mq3v2Fit,
+    q_out: &mut [u8],
+    w: Option<&[f32]>,
+) -> (u16, u16) {
+    let (sc_bits, z_bits, st, z, degenerate) = mq3v2_minmax_half(slice);
+    if degenerate {
+        q_out.fill(0);
+        return (sc_bits, z_bits);
+    }
+    mq3v2_assign_half(slice, st, z, q_out);
+    if fit == Mq3v2Fit::Minmax {
+        return (sc_bits, z_bits);
+    }
+    let mut best_s = sc_bits;
+    let mut best_z = z_bits;
+    let mut best_q = [0u8; 128];
+    best_q.copy_from_slice(q_out);
+    let mut best_mse = mq3v2_half_mse(slice, q_out, st, z, w);
+    let mut cur_q = [0u8; 128];
+    cur_q.copy_from_slice(q_out);
+    for _ in 0..MQ3V2_LS_ITERS {
+        let Some((s_ls, z_ls)) = mq3v2_ls_sz(slice, &cur_q, w) else {
+            break;
+        };
+        let nb_s = f32_to_f16(s_ls);
+        let nb_z = f32_to_f16(z_ls);
+        let st_n = f16_to_f32(nb_s);
+        let z_n = f16_to_f32(nb_z);
+        if st_n == 0.0 {
+            break;
+        }
+        mq3v2_assign_half(slice, st_n, z_n, &mut cur_q);
+        let mse = mq3v2_half_mse(slice, &cur_q, st_n, z_n, w);
+        if mse < best_mse {
+            best_mse = mse;
+            best_s = nb_s;
+            best_z = nb_z;
+            best_q.copy_from_slice(&cur_q);
+        }
+    }
+    q_out.copy_from_slice(&best_q);
+    (best_s, best_z)
+}
+
+fn pack_mq3v2_payload(q: &[u8; 256], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), 96);
+    for chunk in 0..32 {
+        let ci = chunk * 8;
+        let qq0 = q[ci] & 7;
+        let qq1 = q[ci + 1] & 7;
+        let qq2 = q[ci + 2] & 7;
+        let qq3 = q[ci + 3] & 7;
+        let qq4 = q[ci + 4] & 7;
+        let qq5 = q[ci + 5] & 7;
+        let qq6 = q[ci + 6] & 7;
+        let qq7 = q[ci + 7] & 7;
+        let b0 = qq0 | (qq1 << 3) | ((qq2 & 3) << 6);
+        let b1 = ((qq2 >> 2) & 1) | (qq3 << 1) | (qq4 << 4) | ((qq5 & 1) << 7);
+        let b2 = ((qq5 >> 1) & 3) | (qq6 << 2) | (qq7 << 5);
+        let bo = chunk * 3;
+        out[bo] = b0;
+        out[bo + 1] = b1;
+        out[bo + 2] = b2;
+    }
+}
+
+fn unpack_mq3v2_payload(payload: &[u8], q: &mut [u8; 256]) {
+    debug_assert_eq!(payload.len(), 96);
+    for chunk in 0..32 {
+        let bo = chunk * 3;
+        let b0 = payload[bo];
+        let b1 = payload[bo + 1];
+        let b2 = payload[bo + 2];
+        let ci = chunk * 8;
+        q[ci] = b0 & 7;
+        q[ci + 1] = (b0 >> 3) & 7;
+        q[ci + 2] = ((b0 >> 6) & 3) | ((b1 & 1) << 2);
+        q[ci + 3] = (b1 >> 1) & 7;
+        q[ci + 4] = (b1 >> 4) & 7;
+        q[ci + 5] = ((b1 >> 7) & 1) | ((b2 & 3) << 1);
+        q[ci + 6] = (b2 >> 2) & 7;
+        q[ci + 7] = (b2 >> 5) & 7;
+    }
+}
+
 /// MQ3G256V2 encoder — per-128 asymmetric fp16 header, neutral-size.
 ///
 /// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..104) 96B packed 3-bit`.
 /// Payload unchanged from MQ3G256: 8 values per 3 bytes, little-endian bitstream.
+///
+/// Default fit is least-squares + reassign (see [`Mq3v2Fit::Ls`]). Set
+/// `HIPFIRE_MQ3V2_FIT=minmax` to reproduce the published minmax encoder.
 pub(crate) fn quantize_mq3g256v2(
     w: &[f32],
     m: usize,
@@ -144,9 +355,43 @@ pub(crate) fn quantize_mq3g256v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
+    quantize_mq3g256v2_named(w, m, k, signs1, signs2, None)
+}
+
+pub(crate) fn quantize_mq3g256v2_named(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    tensor_name: Option<&str>,
+) -> Vec<u8> {
+    let fit = mq3v2_fit_from_env();
+    let col_w = if fit == Mq3v2Fit::Ls && mq3v2_want_col_weights() {
+        tensor_name
+            .and_then(crate::calibration::imatrix_weights_for)
+            .filter(|s| s.len() == k)
+    } else {
+        None
+    };
+    quantize_mq3g256v2_with_fit(w, m, k, signs1, signs2, fit, col_w)
+}
+
+pub(crate) fn quantize_mq3g256v2_with_fit(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    fit: Mq3v2Fit,
+    col_w: Option<&[f32]>,
+) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ3G256V2 requires K % 256 == 0, got K={k}");
     let n = w.len();
     assert_eq!(n, m * k, "w.len() {} != m*k {}*{}={}", n, m, k, m * k);
+    if let Some(cw) = col_w {
+        assert_eq!(cw.len(), k, "col_w.len() {} != k {}", cw.len(), k);
+    }
     let gpr = k / 256;
     let total_groups = m * gpr;
     let block_bytes = MQ3V2_GROUP_BYTES;
@@ -156,68 +401,24 @@ pub(crate) fn quantize_mq3g256v2(
         let mut group = [0.0f32; 256];
         group.copy_from_slice(&w[start..start + 256]);
         cpu_fwht_256(&mut group, signs1, signs2);
+        let k_off = start % k;
+        let mut q = [0u8; 256];
         let mut scales = [0u16; 2];
         let mut zeros = [0u16; 2];
-        let mut sts = [0.0f32; 2];
-        let mut zs = [0.0f32; 2];
-        let mut degenerate = [false; 2];
         for h in 0..2 {
             let off = h * 128;
-            let slice = &group[off..off + 128];
-            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step_f32 = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
-            let mut sc_bits = f32_to_f16(step_f32);
-            if hi == lo {
-                sc_bits = 0u16;
-            }
-            let z_bits = f32_to_f16(lo);
-            let st = f16_to_f32(sc_bits);
-            let z = f16_to_f32(z_bits);
-            scales[h] = sc_bits;
-            zeros[h] = z_bits;
-            sts[h] = st;
-            zs[h] = z;
-            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+            let half_w = col_w.map(|cw| &cw[k_off + off..k_off + off + 128]);
+            let (sc, zc) =
+                mq3v2_fit_half(&group[off..off + 128], fit, &mut q[off..off + 128], half_w);
+            scales[h] = sc;
+            zeros[h] = zc;
         }
         let out_off = b * block_bytes;
         output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
         output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
         output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
         output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
-        let mut q = [0u8; 256];
-        for h in 0..2 {
-            let off = h * 128;
-            if degenerate[h] {
-                for i in 0..128 {
-                    q[off + i] = 0;
-                }
-            } else {
-                let st = sts[h];
-                let z = zs[h];
-                let inv = 1.0 / st;
-                for i in 0..128 {
-                    let v = group[off + i];
-                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
-                    q[off + i] = qq;
-                }
-            }
-        }
-        for chunk in 0..32 {
-            let ci = chunk * 8;
-            let mut qq = [0u8; 8];
-            for j in 0..8 {
-                qq[j] = q[ci + j] & 7;
-            }
-            let b0 = (qq[0] & 7) | ((qq[1] & 7) << 3) | ((qq[2] & 3) << 6);
-            let b1 =
-                ((qq[2] >> 2) & 1) | ((qq[3] & 7) << 1) | ((qq[4] & 7) << 4) | ((qq[5] & 1) << 7);
-            let b2 = ((qq[5] >> 1) & 3) | ((qq[6] & 7) << 2) | ((qq[7] & 7) << 5);
-            let bo = out_off + 8 + chunk * 3;
-            output[bo] = b0;
-            output[bo + 1] = b1;
-            output[bo + 2] = b2;
-        }
+        pack_mq3v2_payload(&q, &mut output[out_off + 8..out_off + block_bytes]);
     }
     output
 }
@@ -2826,6 +3027,166 @@ mod mqv2_lowbit_tests {
             assert!(st >= 0.0);
             let _ = (st, zt, bbytes);
         }
+    }
+
+    fn mq3v2_rotated_mse(
+        w: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+        blob: &[u8],
+    ) -> f64 {
+        let gpr = k / 256;
+        let total_groups = m * gpr;
+        assert_eq!(blob.len(), total_groups * MQ3V2_GROUP_BYTES);
+        let mut acc = 0.0f64;
+        let mut q = [0u8; 256];
+        for b in 0..total_groups {
+            let start = b * 256;
+            let mut group = [0.0f32; 256];
+            group.copy_from_slice(&w[start..start + 256]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+            let base = b * MQ3V2_GROUP_BYTES;
+            let s0 = f16_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
+            let z0 = f16_to_f32(u16::from_le_bytes([blob[base + 2], blob[base + 3]]));
+            let s1 = f16_to_f32(u16::from_le_bytes([blob[base + 4], blob[base + 5]]));
+            let z1 = f16_to_f32(u16::from_le_bytes([blob[base + 6], blob[base + 7]]));
+            unpack_mq3v2_payload(&blob[base + 8..base + MQ3V2_GROUP_BYTES], &mut q);
+            for i in 0..256 {
+                let (st, z) = if i < 128 { (s0, z0) } else { (s1, z1) };
+                let rec = q[i] as f32 * st + z;
+                let d = (group[i] - rec) as f64;
+                acc += d * d;
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn mq3v2_payload_pack_unpack_roundtrip() {
+        let mut q = [0u8; 256];
+        for i in 0..256 {
+            q[i] = (i % 8) as u8;
+        }
+        let mut packed = [0u8; 96];
+        pack_mq3v2_payload(&q, &mut packed);
+        let mut got = [0u8; 256];
+        unpack_mq3v2_payload(&packed, &mut got);
+        assert_eq!(q, got);
+    }
+
+    #[test]
+    fn mq3v2_ls_never_regresses_gaussian_mse() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next_f32 = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u1 = (((rng >> 33) as u32) as f32 / (1u32 << 31) as f32).clamp(1e-6, 1.0 - 1e-6);
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u2 = (((rng >> 33) as u32) as f32 / (1u32 << 31) as f32).clamp(1e-6, 1.0 - 1e-6);
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        };
+        let m = 16;
+        let k = 512;
+        let w: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+        let minmax = quantize_mq3g256v2_with_fit(&w, m, k, &s1, &s2, Mq3v2Fit::Minmax, None);
+        let ls = quantize_mq3g256v2_with_fit(&w, m, k, &s1, &s2, Mq3v2Fit::Ls, None);
+        assert_eq!(minmax.len(), ls.len());
+        assert_eq!(ls.len(), m * (k / 256) * MQ3V2_GROUP_BYTES);
+        let mse_minmax = mq3v2_rotated_mse(&w, m, k, &s1, &s2, &minmax);
+        let mse_ls = mq3v2_rotated_mse(&w, m, k, &s1, &s2, &ls);
+        assert!(
+            mse_ls <= mse_minmax + 1e-6,
+            "LS reconstruction MSE {mse_ls} exceeded minmax {mse_minmax}"
+        );
+        assert!(mse_ls < mse_minmax, "expected a strict MSE win on Gaussian");
+        for g in 0..(m * (k / 256)) {
+            let base = g * MQ3V2_GROUP_BYTES;
+            let mut q = [0u8; 256];
+            unpack_mq3v2_payload(&ls[base + 8..base + MQ3V2_GROUP_BYTES], &mut q);
+            assert!(q.iter().all(|&qq| qq <= 7));
+        }
+    }
+
+    #[test]
+    fn mq3v2_ls_matches_minmax_on_degenerate() {
+        let s1 = gen_fwht_signs(7, 256);
+        let s2 = gen_fwht_signs(11, 256);
+        let w = vec![0.0f32; 256];
+        let minmax = quantize_mq3g256v2_with_fit(&w, 1, 256, &s1, &s2, Mq3v2Fit::Minmax, None);
+        let ls = quantize_mq3g256v2_with_fit(&w, 1, 256, &s1, &s2, Mq3v2Fit::Ls, None);
+        assert_eq!(minmax, ls);
+        let s0 = u16::from_le_bytes([ls[0], ls[1]]);
+        let s1b = u16::from_le_bytes([ls[4], ls[5]]);
+        assert_eq!(s0, 0);
+        assert_eq!(s1b, 0);
+        assert!(ls[8..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn mq3v2_uniform_weights_match_unweighted() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.07).sin()).collect();
+        let ones = vec![1.0f32; 256];
+        let a = quantize_mq3g256v2_with_fit(&w, 1, 256, &s1, &s2, Mq3v2Fit::Ls, None);
+        let b = quantize_mq3g256v2_with_fit(&w, 1, 256, &s1, &s2, Mq3v2Fit::Ls, Some(&ones));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn mq3v2_weighted_ls_never_regresses_weighted_mse() {
+        let s1 = gen_fwht_signs(3, 256);
+        let s2 = gen_fwht_signs(9, 256);
+        let mut rng = 0x123456789abcdefu64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (((rng >> 33) as u32) as f32 / (1u32 << 31) as f32) * 2.0 - 1.0
+        };
+        let w: Vec<f32> = (0..256).map(|_| next()).collect();
+        let mut col = vec![0.05f32; 256];
+        for i in 0..32 {
+            col[i] = 8.0;
+        }
+        let unweighted = quantize_mq3g256v2_with_fit(&w, 1, 256, &s1, &s2, Mq3v2Fit::Ls, None);
+        let weighted = quantize_mq3g256v2_with_fit(&w, 1, 256, &s1, &s2, Mq3v2Fit::Ls, Some(&col));
+        let mse_u = mq3v2_rotated_weighted_mse(&w, 1, 256, &s1, &s2, &unweighted, &col);
+        let mse_w = mq3v2_rotated_weighted_mse(&w, 1, 256, &s1, &s2, &weighted, &col);
+        assert!(
+            mse_w <= mse_u + 1e-6,
+            "weighted LS {mse_w} exceeded unweighted {mse_u} on weighted MSE"
+        );
+    }
+
+    fn mq3v2_rotated_weighted_mse(
+        w: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+        blob: &[u8],
+        col_w: &[f32],
+    ) -> f64 {
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[0..256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let s0 = f16_to_f32(u16::from_le_bytes([blob[0], blob[1]]));
+        let z0 = f16_to_f32(u16::from_le_bytes([blob[2], blob[3]]));
+        let s1b = f16_to_f32(u16::from_le_bytes([blob[4], blob[5]]));
+        let z1 = f16_to_f32(u16::from_le_bytes([blob[6], blob[7]]));
+        let mut q = [0u8; 256];
+        unpack_mq3v2_payload(&blob[8..MQ3V2_GROUP_BYTES], &mut q);
+        let mut acc = 0.0f64;
+        for i in 0..256 {
+            let (st, z) = if i < 128 { (s0, z0) } else { (s1b, z1) };
+            let rec = q[i] as f32 * st + z;
+            let d = (group[i] - rec) as f64;
+            acc += col_w[i].max(0.0) as f64 * d * d;
+        }
+        let _ = (m, k);
+        acc
     }
 }
 #[cfg(test)]

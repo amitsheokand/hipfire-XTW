@@ -180,6 +180,12 @@ pub(crate) fn run() {
     let input_dir = args.input.as_str();
     let output_path = args.output.as_str();
     let format = args.format.as_str();
+    if format == "mq3v2" {
+        eprintln!(
+            "MQ3G256V2 fit: {} (minmax | ls | ls-w; unset + imatrix → ls-w)",
+            mq3v2_fit_label()
+        );
+    }
 
     if handle_early_special_formats(&args) {
         return;
@@ -2811,6 +2817,11 @@ pub(crate) fn run() {
                 );
             }
             obj.insert("hipfire_base_format".to_string(), format.to_string().into());
+            if format == "mq3v2" {
+                let fit = mq3v2_fit_label();
+                obj.insert("hipfire_mq3v2_fit".to_string(), fit.into());
+                eprintln!("  MQ3V2 fit: {fit}");
+            }
             metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
         }
     }
@@ -5039,7 +5050,9 @@ fn handle_main_quant(
                         GgufFormat::Mq3V2 => {
                             let m = meta.shape[0];
                             let k = k_dim;
-                            let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+                            let q = quantize_mq3g256v2_named(
+                                &f32_data, m, k, &signs1, &signs2, Some(name),
+                            );
                             (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
                         }
                         GgufFormat::Mq2V2 => {
@@ -5248,7 +5261,9 @@ fn handle_main_quant(
                                 (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                             }
                             "mq3v2" => {
-                                let q = quantize_mq3g256v2(&f32_data, m, k, &s1, &s2);
+                                let q = quantize_mq3g256v2_named(
+                                    &f32_data, m, k, &s1, &s2, Some(name),
+                                );
                                 (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
                             }
                             "mq2v2" => {
@@ -5404,7 +5419,9 @@ fn handle_main_quant(
                                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                                 }
                                 "mq3v2" => {
-                                    let q = quantize_mq3g256v2(&f32_data, m, k, &s1, &s2);
+                                    let q = quantize_mq3g256v2_named(
+                                        &f32_data, m, k, &s1, &s2, Some(name),
+                                    );
                                     (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
                                 }
                                 "mq2v2" => {
@@ -5947,12 +5964,18 @@ fn handle_main_quant(
                                 awq_sidecar_scales = Some(scales.clone());
                                 let mut scaled = f32_data.clone();
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                quantize_mq3g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                quantize_mq3g256v2_named(
+                                    &scaled, m_dim, k_dim, &signs1, &signs2, Some(name),
+                                )
                             } else {
-                                quantize_mq3g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                                quantize_mq3g256v2_named(
+                                    &f32_data, m_dim, k_dim, &signs1, &signs2, Some(name),
+                                )
                             }
                         } else {
-                            quantize_mq3g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                            quantize_mq3g256v2_named(
+                                &f32_data, m_dim, k_dim, &signs1, &signs2, Some(name),
+                            )
                         };
                         (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
                     } else {

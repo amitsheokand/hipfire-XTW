@@ -92,3 +92,15 @@ Artifacts: `~/.hipfire/calib/qwen38-27b-mix/metrics-mix-qkv-v2-vs-pro.json`, `re
 | mq3-pro | 13 184 433 152 | MQ3V2 | lm_head+embed+conv1d Q8, `ssm_out` MQ6 | **0.130304** | 6.775 |
 
 Astrea `metrics` vs `mq4-pro`: **`no_quality_gain`** (KLD +0.0976, PPL +0.444). Report: *quality evidence does not justify promotion yet*. This is the smaller SKU, not another 4.9 bpw knapsack. Local 0.1303 is the number that belongs in this table — do not import Hub WT2 0.130 as a second protocol. Serve stays masked. Product remains published **mq4-pro**. Closing the mq3 gap is L3 (GSQ encoder), not mix-bit at 4.9 bpw. Artifacts: `kldseq/mq3-pro__gfx1201__prefill.kldseq`, `inspect-mq3-pro.json`, `metrics-mq3-pro-vs-mq4-pro.json`, `report-mq3-pro-vs-mq4-pro.json`.
+
+**L3 slice 1 (2026-08-30):** MQ3V2 default encoder is now least-squares + reassign on the same qt=49 wire (`HIPFIRE_MQ3V2_FIT=minmax` reproduces published). Unit tests: pack/unpack, degenerate match, Gaussian MSE never-regresses and is a strict win. Candidate `qwen38-27b.mq3v2.pro.ls.hfq` same 13 184 433 152 B / same census as published mq3-pro; `hipfire_mq3v2_fit=ls`. Same local teacher, 24/24 finite.
+
+| variant | WT2 KLD | PPL |
+|---|---:|---:|
+| mq3-pro (minmax) | 0.130304 | 6.775 |
+| mq3-pro-ls | **0.109235** | **6.610** |
+| mq4-pro | 0.032715 | 6.331 |
+
+Astrea vs mq3-pro: **`quality_improved`** (KLD −0.0211 / −16.2%, recovered 21.6% of the gap to mq4-pro). vs mq4-pro: **`no_quality_gain`**. p99 KLD 2.38→2.53 (mean better, tail slightly worse). Do not Atlas. Do not unmask serve. Do not replace published mq3-pro yet. Gumbel (slice 2) skipped — KLD was not flat. Next L3 lever is imatrix-weighted LS (slice 3). L1/L2/L6/production stay blocked. Artifacts: `kldseq/mq3-pro-ls__gfx1201__prefill.kldseq`, `inspect-mq3-pro-ls.json`, `metrics-mq3-pro-ls-vs-mq3-pro.json`, `metrics-mq3-pro-ls-vs-mq4-pro.json`, charter `docs/plans/2026-08-30-l3-gsq-mq3v2.md`.
+
+**L3 slice 3 (2026-08-30):** imatrix-weighted LS (`hipfire_mq3v2_fit=ls-w`) on the same recipe. `qwen38-27b.mq3v2.pro.ls-w.hfq` 13 184 433 152 B. WT2 KLD **0.108887** PPL **6.599** vs ls 0.109235 / 6.610 — **tie** (inside noise). Column-weighting the post-FWHT grid does not move KLD. L3 encoder plateau. Do not another weighted encode. Gumbel optional, not implied. L1/L2/L6/prod stay blocked. Product remains mq4-pro. Optional later: refresh the published mq3-pro SKU to the unweighted LS encoder (16% vs minmax). Artifact: `kldseq/mq3-pro-ls-w__gfx1201__prefill.kldseq`.
