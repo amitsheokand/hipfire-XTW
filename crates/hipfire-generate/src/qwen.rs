@@ -2145,7 +2145,10 @@ pub fn generate_dflash(
                                 eprintln!(
                                     "[qwen-cache store dflash] fp={:#018x} cached_seq={}",
                                     fp,
-                                    turn.content.as_ref().map(|c| c.token_ids.len()).unwrap_or(0)
+                                    turn.content
+                                        .as_ref()
+                                        .map(|c| c.token_ids.len())
+                                        .unwrap_or(0)
                                         + turn
                                             .reasoning
                                             .as_ref()
@@ -2967,6 +2970,7 @@ pub fn generate_spec(
         // stop on a strict prefix (EOT/stop/forced/budget) and must not keep
         // the unobserved tail in host or GPU state.
         let position_before = position;
+        let window_seed = seed_token;
 
         let mut hit_eos = false;
         let mut think_cap_hit = false;
@@ -3077,107 +3081,27 @@ pub fn generate_spec(
         };
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter via conservative reset + production prefill of the
-        // exact KV-resident prefix (`spec_prefix_realign_plan`). Full-window
+        // target + drafter. Prefer a window-local restore + short replay
+        // (`trim_unobserved_window`) so a mid-window stop does not re-prefill
+        // the entire prompt. Drafters that cannot trim fall back to reset +
+        // full-history prefill (`spec_prefix_realign_plan`). Full-window
         // observe keeps the step's already-committed GPU state.
         //
-        // Capacity-aware: admit BEFORE reset/prefill. Realign is full-history
-        // replay after reset (compact_offset cleared) — never overrun
+        // Capacity-aware: admit BEFORE reset/prefill. Full-history realign
+        // replays after reset (compact_offset cleared) — never overrun
         // physical_cap/ctx_capacity and never silently reconstruct compacted
         // state from an invalid oversize history. Abort/prefill errors share
         // the single fail-closed terminal (no second done/error).
         let keep = consumed.min(committed_tail.len());
         if keep < committed_tail.len() {
-            let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
-            let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
-            if let Err(msg) = spec_prefix_realign_admit(
-                &plan,
-                m.physical_cap,
-                ctx_capacity,
-                compact_offset,
-                m.eviction.is_some(),
-            ) {
-                let ep = production_fail_closed_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
-                drop(guard);
-                return None;
-            }
-            let reset_error = slot
-                .reset_recurrent(gpu)
-                .err()
-                .map(|e| format!("reset_recurrent: {e}"))
-                .or_else(|| {
-                    spec.reset_for_realign(gpu)
-                        .err()
-                        .map(|e| format!("spec.reset_for_realign: {e}"))
-                });
-            if let Some(msg) = reset_error {
-                let ep = production_fail_closed_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("prefix realign reset failed: {msg}"),
-                    "gpu",
-                    true,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-            let id_for_realign = id.to_string();
-            let realign = spec.prefill(
-                gpu,
-                slot,
-                &plan.replay,
-                &plan.replay,
-                0,
-                false,
-                None,
-                &|| check_abort(&id_for_realign),
-            );
-            match realign {
-                Ok(PrefillOutcome::Ready { first_token: _ }) => {
-                    // Prefill argmax is NOT history — host seed/position follow
-                    // the pure plan (processed prefix + unwritten pending seed).
-                    debug_assert_eq!(plan.replay.len(), plan.position);
-                    position = plan.position;
-                    seed_token = plan.seed_token;
-                }
-                Ok(PrefillOutcome::Aborted) => {
-                    // One cancel terminal only — classified by rollback attestation.
-                    let ep = production_fail_closed_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-                    return None;
+            let forward = spec_window_trim_forward(window_seed, &committed_tail, keep);
+            match spec.trim_unobserved_window(gpu, slot, position_before, &forward) {
+                Ok(true) => {
+                    // Host cursor already follows the observed prefix; GPU now
+                    // matches the pending-seed contract for this window.
                 }
                 Err(e) => {
-                    let msg = format!("spec_prefix_realign: {e}");
+                    let msg = format!("spec window trim: {e}");
                     let ep = production_fail_closed_rollback_live(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
@@ -3188,9 +3112,124 @@ pub fn generate_spec(
                         slot,
                         spec.as_mut(),
                     );
-                    emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
+                    emit_fail_closed_error(stdout, Some(id), &msg, "gpu", true, &ep);
                     drop(guard);
                     return None;
+                }
+                Ok(false) => {
+                    let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
+                    let compact_offset =
+                        slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
+                    if let Err(msg) = spec_prefix_realign_admit(
+                        &plan,
+                        m.physical_cap,
+                        ctx_capacity,
+                        compact_offset,
+                        m.eviction.is_some(),
+                    ) {
+                        let ep = production_fail_closed_rollback_live(
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                            slot,
+                            spec.as_mut(),
+                        );
+                        emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
+                        drop(guard);
+                        return None;
+                    }
+                    let reset_error = slot
+                        .reset_recurrent(gpu)
+                        .err()
+                        .map(|e| format!("reset_recurrent: {e}"))
+                        .or_else(|| {
+                            spec.reset_for_realign(gpu)
+                                .err()
+                                .map(|e| format!("spec.reset_for_realign: {e}"))
+                        });
+                    if let Some(msg) = reset_error {
+                        let ep = production_fail_closed_rollback_live(
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                            slot,
+                            spec.as_mut(),
+                        );
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            &format!("prefix realign reset failed: {msg}"),
+                            "gpu",
+                            true,
+                            &ep,
+                        );
+                        drop(guard);
+                        return None;
+                    }
+                    let id_for_realign = id.to_string();
+                    let realign = spec.prefill(
+                        gpu,
+                        slot,
+                        &plan.replay,
+                        &plan.replay,
+                        0,
+                        false,
+                        None,
+                        &|| check_abort(&id_for_realign),
+                    );
+                    match realign {
+                        Ok(PrefillOutcome::Ready { first_token: _ }) => {
+                            // Prefill argmax is NOT history — host seed/position follow
+                            // the pure plan (processed prefix + unwritten pending seed).
+                            debug_assert_eq!(plan.replay.len(), plan.position);
+                            position = plan.position;
+                            seed_token = plan.seed_token;
+                        }
+                        Ok(PrefillOutcome::Aborted) => {
+                            // One cancel terminal only — classified by rollback attestation.
+                            let ep = production_fail_closed_rollback_live(
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                slot,
+                                spec.as_mut(),
+                            );
+                            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+                            return None;
+                        }
+                        Err(e) => {
+                            let msg = format!("spec_prefix_realign: {e}");
+                            let ep = production_fail_closed_rollback_live(
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                slot,
+                                spec.as_mut(),
+                            );
+                            emit_fail_closed_error(
+                                stdout,
+                                Some(id),
+                                &msg,
+                                "validation",
+                                false,
+                                &ep,
+                            );
+                            drop(guard);
+                            return None;
+                        }
+                    }
                 }
             }
         }
@@ -5162,6 +5201,29 @@ pub fn spec_prefix_realign_plan(
         position,
         seed_token: *raw_decode.last().unwrap(),
         replay,
+    }
+}
+
+/// Tokens to GPU-forward after restoring the pre-`step` snapshot, leaving the
+/// last observed emit token as the unwritten pending seed.
+///
+/// `seed` is the token [`Speculator::step`] wrote at `window_start`. `emit` is
+/// the committed tail with that seed already stripped. `keep` is how many
+/// `emit` tokens the emitter observed. Empty when nothing in this window was
+/// observed (`keep == 0`).
+///
+/// Length equals `keep` when `keep > 0`: the seed plus `emit[..keep - 1]`.
+/// Matches the suffix of [`spec_prefix_realign_plan`] past the prefill prompt
+/// on the first decode window.
+pub fn spec_window_trim_forward(seed: u32, emit: &[u32], keep: usize) -> Vec<u32> {
+    let keep = keep.min(emit.len());
+    if keep == 0 {
+        Vec::new()
+    } else {
+        let mut forward = Vec::with_capacity(keep);
+        forward.push(seed);
+        forward.extend_from_slice(&emit[..keep - 1]);
+        forward
     }
 }
 

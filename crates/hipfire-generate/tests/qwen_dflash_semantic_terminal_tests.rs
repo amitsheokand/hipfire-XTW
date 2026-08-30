@@ -624,6 +624,21 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     }
 
     #[test]
+    fn spec_window_trim_forward_matches_first_window_realign_suffix() {
+        let prompt = vec![1u32, 2, 3];
+        let seed = 99u32;
+        let emit = [10u32, 11, 12];
+        let keep = 2usize;
+        let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, seed, &emit[..keep]);
+        let forward = hipfire_generate::qwen::spec_window_trim_forward(seed, &emit, keep);
+        assert_eq!(forward, vec![99, 10]);
+        assert_eq!(forward.as_slice(), &plan.replay[prompt.len()..]);
+        assert_eq!(hipfire_generate::qwen::spec_window_trim_forward(seed, &emit, 0), Vec::<u32>::new());
+        assert_eq!(hipfire_generate::qwen::spec_window_trim_forward(seed, &emit, 1), vec![99]);
+        assert_eq!(hipfire_generate::qwen::spec_window_trim_forward(seed, &emit, 3), vec![99, 10, 11]);
+    }
+
+    #[test]
     fn terminal_marker_mid_window_strict_prefix_realigns() {
         // Spec window emits body + im_end + unobserved tail. Semantic loop
         // consumes only through the terminal marker; host + realign plan must

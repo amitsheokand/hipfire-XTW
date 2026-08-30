@@ -778,6 +778,26 @@ pub trait Speculator {
         self.reset(gpu)
     }
 
+    /// Drop the unobserved tail of the window just committed by [`Self::step`].
+    ///
+    /// `forward` is the processed prefix of this window with the last observed
+    /// token left as the unwritten pending seed. Restore target + drafter to
+    /// the pre-step snapshot and replay only `forward` at `window_start`.
+    ///
+    /// Returns `Ok(true)` when the trim landed. `Ok(false)` means the caller
+    /// must use the conservative reset + full-history prefill. Default is
+    /// `false` (DFlash / n-gram keep the existing realign).
+    fn trim_unobserved_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        forward: &[u32],
+    ) -> Result<bool, String> {
+        let _ = (gpu, target, window_start, forward);
+        Ok(false)
+    }
+
     /// Live post-reset evidence for serve-fault-inject snapshots.
     ///
     /// `None` means the live Speculator does not expose DFlash-style evidence
@@ -1052,6 +1072,18 @@ pub trait MtpDrafter {
         self.mtp_reset(gpu)
     }
 
+    /// Window-local strict-prefix repair after [`Self::mtp_step`]. Default
+    /// `Ok(false)` keeps the daemon's reset + full-history realign.
+    fn mtp_trim_unobserved_window(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        _window_start: usize,
+        _forward: &[u32],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
 
@@ -1233,6 +1265,17 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 
     fn reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.arch.mtp_reset_for_realign(gpu)
+    }
+
+    fn trim_unobserved_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        forward: &[u32],
+    ) -> Result<bool, String> {
+        self.arch
+            .mtp_trim_unobserved_window(gpu, target, window_start, forward)
     }
 
     fn block_size(&self) -> usize {
