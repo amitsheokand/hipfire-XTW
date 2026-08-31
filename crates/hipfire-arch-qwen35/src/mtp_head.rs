@@ -1232,6 +1232,34 @@ mod packed_dtype_tests {
         assert_eq!(mtp_q8_flash_mode_for("never", "gfx1201"), 0);
         assert_eq!(mtp_q8_flash_mode_for("always", "gfx1030"), 2);
     }
+
+    #[test]
+    fn batched_prompt_fill_keeps_q8_mqv2_and_falls_back_elsewhere() {
+        assert!(weight_gemm_batched_supported(DType::MQ4G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ6G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ4G256));
+        assert!(weight_gemm_batched_supported(DType::Q8_0));
+        assert!(!weight_gemm_batched_supported(DType::MQ6G256));
+
+        let mqv2 = [
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+            DType::MQ6G256V2,
+            DType::MQ6G256V2,
+        ];
+        assert!(mtp_prompt_fill_uses_batched(MtpKvMode::Q8, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Asym3, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Fwht4, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(
+            MtpKvMode::Q8,
+            &[
+                DType::MQ6G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2
+            ]
+        ));
+    }
 }
 
 /// Same flash_mode the trunk scratch uses (`Qwen35Scratch` / llama decode).
@@ -2185,12 +2213,32 @@ fn weight_gemm_batched(
         DType::MQ4G256V2 => {
             let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            gpu.gemm_mq4g256v2(&w.buf, rot, y_batched, w.m, w.k, n)
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
         }
         DType::MQ6G256V2 => {
             let rot = rotated_x_scratch.expect("MQ6V2 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            gpu.gemm_mq6g256v2(&w.buf, rot, y_batched, w.m, w.k, n)
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
         }
         DType::F32 => {
             // Fallback: per-row gemv (slow but correct). MTP head loaded via
@@ -2204,6 +2252,34 @@ fn weight_gemm_batched(
         }
         other => panic!("weight_gemm_batched: unsupported dtype {:?}", other),
     }
+}
+
+/// True when [`weight_gemm_batched`] has a non-panicking arm for `dtype`.
+/// Published MQ6G256-v1 sidecars have GEMV but no batched GEMM.
+fn weight_gemm_batched_supported(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Q8_0
+            | DType::HFQ4G256
+            | DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::F32
+    )
+}
+
+/// Prompt-fill may use the chunked batched path only for Q8 MTP KV and
+/// projections [`weight_gemm_batched`] can represent. Asym3/Fwht4 and
+/// MQ6G256-v1 keep the tokenwise GEMV / KV-write path.
+pub(crate) fn mtp_prompt_fill_uses_batched(
+    kv_mode: MtpKvMode,
+    projection_dtypes: &[DType],
+) -> bool {
+    kv_mode == MtpKvMode::Q8
+        && projection_dtypes
+            .iter()
+            .copied()
+            .all(weight_gemm_batched_supported)
 }
 
 /// Batched MTP head block forward (Task 11b).

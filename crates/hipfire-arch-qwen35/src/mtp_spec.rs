@@ -31,8 +31,7 @@
 //! Task 11 territory.
 
 use crate::mtp_head::{
-    self, Qwen35MtpHead, Qwen35MtpHeadBatchedScratch, Qwen35MtpHeadKvCache,
-    Qwen35MtpHeadScratch,
+    self, Qwen35MtpHead, Qwen35MtpHeadBatchedScratch, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch,
 };
 use crate::qwen35::{self, Qwen35Weights};
 use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
@@ -584,7 +583,9 @@ impl MtpSpecState {
         max_n: usize,
         kv_mode: crate::mtp_head::MtpKvMode,
     ) -> HipResult<Self> {
-        Self::new_for_slot_with_kv_mode_and_verify_capacity(gpu, target, head, max_n, max_n, kv_mode)
+        Self::new_for_slot_with_kv_mode_and_verify_capacity(
+            gpu, target, head, max_n, max_n, kv_mode,
+        )
     }
 
     /// Like [`Self::new_for_slot_with_kv_mode`] but allows `verify_capacity`
@@ -1195,8 +1196,6 @@ fn mtp_takeover_kv_repair_forwards(mtp_already_retired: bool, accept_count: usiz
     }
 }
 
-
-
 /// Enqueue the target lm_head over every MTP verify row.
 ///
 /// All MTP entry points share this dispatcher. In particular, MQ V2 must not
@@ -1247,14 +1246,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ4G256 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1266,14 +1258,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ3G256 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq3g256_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1295,14 +1280,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ6G256 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq6g256_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1314,14 +1292,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ4G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_mq4g256v2_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1333,14 +1304,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ6G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_mq6g256v2_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1352,14 +1316,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ5G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_mq5g256v2_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1371,14 +1328,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ3G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_mq3g256v2_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1390,14 +1340,7 @@ fn mtp_trunk_verify_lm_head(
         }
         DType::MQ2G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_mq2g256v2_batched_lmhead(
                 &w_out.buf,
                 &rot,
@@ -1532,9 +1475,8 @@ fn mtp_shared_verify_accept_rollback(
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
         gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
 
-        let use_gpu_accept = !is_external
-            && use_device_token_chain
-            && mtp_gpu_greedy_accept_enabled_from_env();
+        let use_gpu_accept =
+            !is_external && use_device_token_chain && mtp_gpu_greedy_accept_enabled_from_env();
         let accepted = if use_gpu_accept {
             let candidate_device = state.mtp_token_chain.sub_offset(1, drafts_generated);
             let accept_result = state.verify_argmax.sub_offset(0, 2);
@@ -1689,6 +1631,17 @@ pub fn mtp_prefill_committed_boundaries(
     out
 }
 
+/// Temporary batched MTP fill capacity. `None` means allocate nothing
+/// (empty prompt). Otherwise bounded by actual prompt rows, never the
+/// architecture ceiling for a smaller prompt.
+fn mtp_prompt_fill_scratch_rows(prompt_len: usize, prefill_max_batch: usize) -> Option<usize> {
+    if prompt_len == 0 {
+        None
+    } else {
+        Some(prefill_max_batch.min(prompt_len).max(1))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_trunk_and_mtp_cache(
     gpu: &mut Gpu,
@@ -1730,35 +1683,54 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
 where
     F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
 {
-    if prompt_tokens.is_empty() {
+    let Some(chunk_max) =
+        mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
+    else {
         return Ok(TrunkSpinePrefillTimings::default());
-    }
+    };
 
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
     let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
     // Match adaptive margin / AR daemon chunking. Internal forward_prefill_batch
     // also caps at this size; externalizing the loop exposes commit boundaries.
-    let chunk_max = qwen35::prefill_max_batch(gpu).max(1);
-    let mut mtp_prefill_scratch =
+    let use_batched_mtp_fill = mtp_head::mtp_prompt_fill_uses_batched(
+        state.mtp_kv.kv_mode,
+        &[
+            head.weights.eh_proj.gpu_dtype,
+            head.weights.wq.gpu_dtype,
+            head.weights.wk.gpu_dtype,
+            head.weights.wv.gpu_dtype,
+        ],
+    );
+    let mut mtp_prefill_scratch = if use_batched_mtp_fill {
         match Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, chunk_max) {
-            Ok(scratch) => scratch,
+            Ok(scratch) => Some(scratch),
             Err(error) => {
                 let _ = gpu.free_tensor(prompt_hidden);
                 return Err(error);
             }
-        };
-    let widest_k = (2 * dim)
-        .max(head.config.n_ff)
-        .max(dim)
-        .max(head.config.n_head * head.config.head_dim);
-    let mtp_prefill_rot = match gpu.alloc_tensor(&[chunk_max * widest_k], DType::F32) {
-        Ok(tensor) => tensor,
-        Err(error) => {
-            mtp_prefill_scratch.free_gpu(gpu);
-            let _ = gpu.free_tensor(prompt_hidden);
-            return Err(error);
         }
+    } else {
+        None
+    };
+    let mtp_prefill_rot = if use_batched_mtp_fill {
+        let widest_k = (2 * dim)
+            .max(head.config.n_ff)
+            .max(dim)
+            .max(head.config.n_head * head.config.head_dim);
+        match gpu.alloc_tensor(&[chunk_max * widest_k], DType::F32) {
+            Ok(tensor) => Some(tensor),
+            Err(error) => {
+                if let Some(scratch) = mtp_prefill_scratch.take() {
+                    scratch.free_gpu(gpu);
+                }
+                let _ = gpu.free_tensor(prompt_hidden);
+                return Err(error);
+            }
+        }
+    } else {
+        None
     };
 
     let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
@@ -1792,25 +1764,44 @@ where
             trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
 
             let t_mtp_fill = Instant::now();
-            let positions: Vec<i32> = (chunk_start_pos..committed_pos)
-                .map(|position| position as i32)
-                .collect();
-            mtp_head::mtp_head_forward_block_batched(
-                gpu,
-                head,
-                &mut mtp_prefill_scratch,
-                &mut state.mtp_kv,
-                chunk,
-                &chunk_hidden,
-                &positions,
-                chunk.len(),
-                &target.weights,
-                Some(&mtp_prefill_rot),
-                true,
-            )?;
+            if let (Some(scratch), Some(rot)) =
+                (mtp_prefill_scratch.as_mut(), mtp_prefill_rot.as_ref())
+            {
+                let positions: Vec<i32> = (chunk_start_pos..committed_pos)
+                    .map(|position| position as i32)
+                    .collect();
+                mtp_head::mtp_head_forward_block_batched(
+                    gpu,
+                    head,
+                    scratch,
+                    &mut state.mtp_kv,
+                    chunk,
+                    &chunk_hidden,
+                    &positions,
+                    chunk.len(),
+                    &target.weights,
+                    Some(rot),
+                    true,
+                )?;
+            } else {
+                for (i, &token) in chunk.iter().enumerate() {
+                    let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
+                    mtp_head::mtp_head_forward_block_only(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        token,
+                        &hidden_row,
+                        None,
+                        chunk_start_pos + i,
+                        &target.weights,
+                    )?;
+                }
+            }
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
 
-            // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
+            // Committed boundary: trunk + MTP KV now cover [0, committed_pos).
             on_committed_boundary(gpu, target, committed_pos)?;
             off = end;
         }
@@ -1829,8 +1820,12 @@ where
         })
     })();
 
-    let _ = gpu.free_tensor(mtp_prefill_rot);
-    mtp_prefill_scratch.free_gpu(gpu);
+    if let Some(rot) = mtp_prefill_rot {
+        let _ = gpu.free_tensor(rot);
+    }
+    if let Some(scratch) = mtp_prefill_scratch {
+        scratch.free_gpu(gpu);
+    }
     let _ = gpu.free_tensor(prompt_hidden);
     result
 }
@@ -3549,13 +3544,9 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     // Retire-on-accept: any accept_count>0 (or already-retired) skips all
     // MTP-head repair. Zero-accept pre-takeover repairs only last_committed
     // at cur_pos so native MTP stays aligned for the next cycle.
-    let repair_forwards =
-        mtp_takeover_kv_repair_forwards(mtp_already_retired, result.accept_count);
+    let repair_forwards = mtp_takeover_kv_repair_forwards(mtp_already_retired, result.accept_count);
     if repair_forwards > 0 {
-        debug_assert_eq!(
-            repair_forwards, 1,
-            "takeover repair is single-row only"
-        );
+        debug_assert_eq!(repair_forwards, 1, "takeover repair is single-row only");
         assert_eq!(
             result.advance, 1,
             "spec_step_mtp_compressed_serial_with_takeover_candidates: zero-accept must advance by bonus only (advance={})",
@@ -3585,8 +3576,6 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     Ok(result)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3611,6 +3600,17 @@ mod tests {
             mtp_prefill_committed_boundaries(40, 0, qwen35::PREFILL_MAX_BATCH),
             vec![40]
         );
+    }
+
+    #[test]
+    fn mtp_prompt_fill_scratch_rows_track_prompt_not_arch_ceiling() {
+        assert_eq!(mtp_prompt_fill_scratch_rows(0, 384), None);
+        assert_eq!(mtp_prompt_fill_scratch_rows(1, 384), Some(1));
+        assert_eq!(mtp_prompt_fill_scratch_rows(383, 384), Some(383));
+        assert_eq!(mtp_prompt_fill_scratch_rows(384, 384), Some(384));
+        assert_eq!(mtp_prompt_fill_scratch_rows(385, 384), Some(384));
+        assert_eq!(mtp_prompt_fill_scratch_rows(1, 256), Some(1));
+        assert_eq!(mtp_prompt_fill_scratch_rows(512, 256), Some(256));
     }
 
     #[test]
@@ -3780,12 +3780,18 @@ mod tests {
         assert!(!mtp_external_candidates_within_capacity(&[], 4));
         assert!(mtp_external_candidates_within_capacity(&[1], 4));
         assert!(mtp_external_candidates_within_capacity(&[1, 2, 3, 4], 4));
-        assert!(!mtp_external_candidates_within_capacity(&[1, 2, 3, 4, 5], 4));
+        assert!(!mtp_external_candidates_within_capacity(
+            &[1, 2, 3, 4, 5],
+            4
+        ));
         assert!(!mtp_external_candidates_within_capacity(&[], 0));
         // verify_capacity vs max_n: external window may be larger than max_n.
         // e.g., max_n=2, verify_capacity=5 allows 5 candidates.
         assert!(mtp_external_candidates_within_capacity(&[1, 2, 3, 4, 5], 5));
-        assert!(!mtp_external_candidates_within_capacity(&[1, 2, 3, 4, 5, 6], 5));
+        assert!(!mtp_external_candidates_within_capacity(
+            &[1, 2, 3, 4, 5, 6],
+            5
+        ));
     }
 
     #[test]
