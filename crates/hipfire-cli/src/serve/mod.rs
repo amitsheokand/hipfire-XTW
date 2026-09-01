@@ -1143,6 +1143,54 @@ pub(crate) fn daemon_health(shared: &ServeShared) -> (&'static str, u16) {
 }
 
 impl ServeRuntime {
+    /// Same overlay order as the daemon loader (`HIPFIRE_CHAT_TEMPLATE_FILE`,
+    /// then `~/.hipfire/templates/{basename}.j2`). Serve preflight used to read
+    /// only the HFQ-embedded template, so a Sharp sidecar would 413/count with
+    /// a different prompt than generation.
+    fn serve_preflight_chat_template(model_path: &Path, embedded: Option<String>) -> Option<String> {
+        if let Some(config_path) = hipfire_runtime::config::get().chat_template_file.as_deref() {
+            if !config_path.is_empty() {
+                match fs::read_to_string(config_path) {
+                    Ok(s) => {
+                        eprintln!("[chat_template] using configured template {config_path}");
+                        return Some(s);
+                    }
+                    Err(e) => eprintln!(
+                        "[chat_template] configured template {config_path} failed to read ({e}); falling through"
+                    ),
+                }
+            }
+        }
+        if let Some(home) = env::var_os("HOME") {
+            let basename = model_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !basename.is_empty() {
+                let per_model = Path::new(&home)
+                    .join(".hipfire")
+                    .join("templates")
+                    .join(format!("{basename}.j2"));
+                if per_model.is_file() {
+                    match fs::read_to_string(&per_model) {
+                        Ok(s) => {
+                            eprintln!(
+                                "[chat_template] using per-model override {}",
+                                per_model.display()
+                            );
+                            return Some(s);
+                        }
+                        Err(e) => eprintln!(
+                            "[chat_template] per-model file {} failed to read ({e}); falling through",
+                            per_model.display()
+                        ),
+                    }
+                }
+            }
+        }
+        embedded
+    }
+
     /// Drop cached model identity so the next request full-reloads after daemon death.
     pub(crate) fn poison_model_state(&mut self) {
         self.current_path = None;
@@ -1295,7 +1343,8 @@ impl ServeRuntime {
                     self.tokenizer =
                         hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                             .ok();
-                    self.chat_template = hfq.chat_template();
+                    self.chat_template =
+                        Self::serve_preflight_chat_template(&path, hfq.chat_template());
                 }
                 Err(_) => {
                     self.tokenizer = None;
