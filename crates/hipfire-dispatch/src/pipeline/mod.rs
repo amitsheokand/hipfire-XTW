@@ -848,18 +848,38 @@ pub fn run_moe_decode(
     }
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
-    // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
-    // ports master's `moe_ffn_decode_impl` CPU-fallback per-expert loop
+    // Fires when neither GPU path is available. The k==8 indexed fast path
+    // (`use_gpu_topk`) plus the k==2 indexed path below (`use_k2_indexed`,
+    // uniform MQ4V2 routed experts — Fuse) cover the indexed dtypes; every
+    // other (k, dtype) combination runs the generic per-expert loop here.
     // (origin/master qwen35.rs, the `else` arm of `if use_gpu_topk`) so MoE
-    // layers outside the {k=8, MQ4G256|MQ5G256|MQ6G256|ParoQ4G128-routed} fast path
-    // run instead of hard-panicking. #393 deleted this; restoring it keeps the
-    // dispatch migration behavior-preserving.
+    // layers outside the indexed fast paths run instead of hard-panicking.
+    // #393 deleted this; restoring it keeps the dispatch migration
+    // behavior-preserving.
     //
-    // The fallback is self-contained: it does softmax → CPU top-K + renorm →
+    // The fallback is self-contained: it does gate → CPU top-K + renorm →
     // shared-expert down → generic per-expert routed loop, then returns. It
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
-    // k=8 + an indexable routed dtype).
-    if !res.use_gpu_topk {
+    // an indexable routed dtype + a supported k).
+    //
+    // k==2 indexed admission: uniform MQ4G256V2 routed experts (both
+    // projections), no per-expert tier tags, no AWQ sidecars, no deferred
+    // combine. The indexed GEMV/combine kernels take k_top as a runtime
+    // parameter, so the k==8 arms serve k==2 unchanged except gate_up (whose
+    // non-batched launcher bakes K_TOP=8 into its grid — k==2 takes the
+    // batched launcher with batch=1) and routing (GPU top-2, no D2H).
+    // HIPFIRE_MOE_K2_FORCE_FALLBACK=1 forces the CPU path for A/B parity
+    // validation of the indexed route.
+    let use_k2_indexed = p.k == 2
+        && res.routed_indexable_mq4v2
+        && p.expert_dtype_tags.is_none()
+        && p.expert_down_awq_ptrs.is_none()
+        && !p.defer_routed_combine
+        && hipfire_config::developer_var("HIPFIRE_MOE_K2_FORCE_FALLBACK")
+            .ok()
+            .as_deref()
+            != Some("1");
+    if !res.use_gpu_topk && !use_k2_indexed {
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
@@ -908,7 +928,26 @@ pub fn run_moe_decode(
             // Research-only: faster on gfx1100, but its routing drift can
             // change greedy trajectories and trigger an attractor.
             && gfx1100_router_mode.as_deref() == Some("approx"));
-    if router_shared_fuse {
+    if use_k2_indexed {
+        // k==2 indexed (Fuse): gate + top-2 stay on device; indices/weights
+        // remain in device buffers for the indexed GEMVs below — no D2H.
+        // Same gate/topk split as the CPU fallback's k==2 arm (Phase 3a).
+        if matches!(
+            p.router_activation,
+            crate::families::moe::RouterActivation::SqrtSoftplus
+        ) {
+            hip!(gpu.moe_router_sqrtsoftplus_f32(p.router_logits))?;
+        } else {
+            hip!(gpu.softmax_f32(p.router_logits))?;
+        }
+        hip!(gpu.moe_topk_renorm_k2(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else if router_shared_fuse {
         let shared_x_rot = unsafe {
             GpuTensor {
                 buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
@@ -1248,15 +1287,34 @@ pub fn run_moe_decode(
             // the misread is silent — fluent text, wrong numbers. Match on the
             // gate_up dtype (not only the coupled flag) so a split pair still
             // selects the V2 gate decoder.
-            hip!(gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                xr,
-                p.gate_batch,
-                p.up_batch,
-                2 * p.mi,
-                gate_up_k,
-            ))?;
+            //
+            // k==2 takes the batched launcher with batch=1: the non-batched
+            // launcher bakes K_TOP=8 into its grid, while the batched twin
+            // takes k_top as a runtime parameter (same kernel family, same
+            // per-row math — the N=1 slice is bit-identical).
+            if use_k2_indexed {
+                hip!(gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    xr,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * p.mi,
+                    gate_up_k,
+                    p.k,
+                    1,
+                ))?;
+            } else {
+                hip!(gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    xr,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * p.mi,
+                    gate_up_k,
+                ))?;
+            }
         } else if res.routed_indexable_mq6v2 || p.dtypes.routed_gate_up == DType::MQ6G256V2 {
             // qt47. MUST precede HFQ4/HFQ6 arms: dual-half f16 header is
             // incompatible with V1 MQ6 f32 scale/zero; same 200 B stride so a
