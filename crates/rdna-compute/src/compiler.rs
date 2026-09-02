@@ -941,6 +941,25 @@ impl KernelCompiler {
         Self::rocm_root_flags_with(root, Self::win_short_path_if_needed)
     }
 
+    /// Resolve the ROCm device-library (bitcode) directory for the JIT
+    /// command, if one is discoverable. See the call site in
+    /// `hipcc_passthrough` for the policy.
+    fn device_lib_path(root: &Path) -> Option<String> {
+        if let Ok(dir) = hipfire_config::developer_var("HIPFIRE_ROCM_DEVICE_LIB_PATH") {
+            let p = Path::new(&dir);
+            if p.is_dir() {
+                return Some(Self::win_short_path_if_needed(&dir));
+            }
+        }
+        let candidate = root.join("amdgcn").join("bitcode");
+        if candidate.is_dir() {
+            return Some(Self::win_short_path_if_needed(
+                &candidate.to_string_lossy(),
+            ));
+        }
+        None
+    }
+
     /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
     fn direct_hipcc_args(
         arch: &str,
@@ -995,6 +1014,17 @@ impl KernelCompiler {
         if let Some(root) = selected_root.as_ref() {
             if hipfire_config::rocm::is_complete_root(root) {
                 passthrough.extend(Self::rocm_root_flags(root));
+            }
+            // Device-library path for split installs (notably Nix, where the
+            // `clr` package carries no `amdgcn/bitcode` and clang fails every
+            // libm-using kernel with "cannot find ROCm device library").
+            // Explicit `HIPFIRE_ROCM_DEVICE_LIB_PATH` wins; otherwise use
+            // `<root>/amdgcn/bitcode` when it exists (standard layout — the
+            // same bitcode clang would resolve via `--rocm-path` anyway, so
+            // complete installs see no behavior change). Absent everywhere ⇒
+            // no flag (today's behavior, including today's failure mode).
+            if let Some(dir) = Self::device_lib_path(root) {
+                passthrough.push(format!("--rocm-device-lib-path={dir}"));
             }
         }
         if let Some(candidate) =
