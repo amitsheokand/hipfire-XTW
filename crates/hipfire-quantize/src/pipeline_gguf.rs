@@ -393,6 +393,43 @@ pub(crate) fn run_gguf_pipeline(
     let mut total_bytes_in: u64 = 0;
     let mut total_bytes_out: u64 = 0;
 
+    // Detect Qwen3.5 linear attention (DeltaNet) dimensions to undo llama.cpp's
+    // convert_hf_to_gguf.py V-head reordering (which permuted grouped V-heads
+    // to tiled order for ggml broadcast).
+    let qwen35_reorder_params = if arch_id == 5 || arch_id == 6 {
+        let read_meta_u = |key: &str| -> Option<usize> {
+            for prefix in &["qwen35moe", "qwen35", "qwen2", "qwen"] {
+                if let Some(val) = gguf.metadata.get(&format!("{prefix}.{key}")) {
+                    match val {
+                        crate::gguf_input::MetaValue::U32(v) => return Some(*v as usize),
+                        crate::gguf_input::MetaValue::U64(v) => return Some(*v as usize),
+                        crate::gguf_input::MetaValue::I32(v) => return Some(*v as usize),
+                        crate::gguf_input::MetaValue::I64(v) => return Some(*v as usize),
+                        _ => {}
+                    }
+                }
+            }
+            None
+        };
+        let num_k_heads = read_meta_u("ssm.group_count").unwrap_or(0);
+        let inner_size = read_meta_u("ssm.inner_size").unwrap_or(0);
+        let state_size = read_meta_u("ssm.state_size").unwrap_or(128);
+        let num_v_heads = if state_size != 0 { inner_size / state_size } else { 0 };
+        if num_k_heads > 0 && num_v_heads > 0 && num_k_heads != num_v_heads {
+            let num_v_per_k = num_v_heads / num_k_heads;
+            let head_k_dim = state_size;
+            let head_v_dim = state_size;
+            eprintln!(
+                "[hipfire-quantize] Qwen3.5 linear_attn V-head un-reorder enabled: k_heads={num_k_heads}, v_heads={num_v_heads}, v_per_k={num_v_per_k}, head_dim={state_size}"
+            );
+            Some((num_k_heads, num_v_heads, num_v_per_k, head_k_dim, head_v_dim))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     for info in &gguf.tensors {
         // Fuse4 stacked MoE experts are 3-D ggml (K, M, E). Copy each expert
         // slab as hipfire [M, K] and fuse gate||up into [2*mi, hidden].
@@ -639,7 +676,7 @@ pub(crate) fn run_gguf_pipeline(
         // GGUF ggml 2-D weights are (ne0=K innermost, ne1=M). Hipfire GEMV is
         // [M, K] with the same inner stride — relabel, do not permute bytes.
         // conv1d is [kernel, channels], not a GEMV; leave it alone.
-        let (gemm_m, gemm_k) = if arch_id == 6 && is_2d && !is_norm && !is_conv {
+        let (gemm_m, gemm_k) = if (arch_id == 5 || arch_id == 6) && is_2d && !is_norm && !is_conv {
             let k = info.shape[0];
             let m = info.shape[1];
             shape = vec![m as u32, k as u32];
@@ -651,6 +688,124 @@ pub(crate) fn run_gguf_pipeline(
         };
         let k_dim = if is_2d { gemm_k } else { n_elements };
 
+        let mut f32_data = gguf_input::tensor_to_f32(info, raw);
+
+        // Qwen3.5 / Fuse-2 GGUF transformations:
+        // 1. Recover A_log: llama.cpp's convert_hf_to_gguf.py bakes ssm_a = -exp(A_log)
+        //    (all negative). Invert it to recover the original A_log = ln(-ssm_a) so
+        //    hipfire's fused_sigmoid_alpha_gate kernel computes sp * (-expf(a_log)).
+        if (arch_id == 5 || arch_id == 6) && info.name.contains("ssm_a") {
+            for v in &mut f32_data {
+                *v = (-*v).max(1e-12).ln();
+            }
+        }
+
+        // 2. Invert _reorder_v_heads: llama.cpp permutes V-heads from grouped (HF/PyTorch)
+        //    to tiled (GGML) order for ggml binary broadcasting. Reorder back to grouped
+        //    so hipfire's DeltaNet kernels receive the correct head layout.
+        if let Some((num_k_heads, num_v_heads, num_v_per_k, head_k_dim, head_v_dim)) = qwen35_reorder_params {
+            if info.name.contains("ssm_a") || info.name.contains("ssm_dt") {
+                if f32_data.len() == num_v_heads {
+                    let mut grouped = vec![0.0f32; num_v_heads];
+                    for k in 0..num_k_heads {
+                        for v in 0..num_v_per_k {
+                            grouped[k * num_v_per_k + v] = f32_data[v * num_k_heads + k];
+                        }
+                    }
+                    f32_data = grouped;
+                }
+            } else if info.name.contains("ssm_alpha") || info.name.contains("ssm_beta") {
+                if info.shape.len() == 2 && info.shape[1] == num_v_heads {
+                    let row_len = info.shape[0];
+                    let mut grouped = vec![0.0f32; f32_data.len()];
+                    for k in 0..num_k_heads {
+                        for v in 0..num_v_per_k {
+                            let src_idx = v * num_k_heads + k;
+                            let dst_idx = k * num_v_per_k + v;
+                            grouped[dst_idx * row_len..(dst_idx + 1) * row_len]
+                                .copy_from_slice(&f32_data[src_idx * row_len..(src_idx + 1) * row_len]);
+                        }
+                    }
+                    f32_data = grouped;
+                }
+            } else if info.name.contains("attn_gate") {
+                let v_rows = num_v_heads * head_v_dim;
+                if info.shape.len() == 2 && info.shape[1] == v_rows {
+                    let row_len = info.shape[0];
+                    let slice_len = head_v_dim * row_len;
+                    let mut grouped = vec![0.0f32; f32_data.len()];
+                    for k in 0..num_k_heads {
+                        for v in 0..num_v_per_k {
+                            let src_idx = v * num_k_heads + k;
+                            let dst_idx = k * num_v_per_k + v;
+                            grouped[dst_idx * slice_len..(dst_idx + 1) * slice_len]
+                                .copy_from_slice(&f32_data[src_idx * slice_len..(src_idx + 1) * slice_len]);
+                        }
+                    }
+                    f32_data = grouped;
+                }
+            } else if info.name.contains("attn_qkv") {
+                let qk_rows = 2 * num_k_heads * head_k_dim;
+                let v_rows = num_v_heads * head_v_dim;
+                if info.shape.len() == 2 && info.shape[1] == qk_rows + v_rows {
+                    let row_len = info.shape[0];
+                    let qk_len = qk_rows * row_len;
+                    let slice_len = head_v_dim * row_len;
+                    let mut grouped_v = vec![0.0f32; v_rows * row_len];
+                    let v_data = &f32_data[qk_len..];
+                    for k in 0..num_k_heads {
+                        for v in 0..num_v_per_k {
+                            let src_idx = v * num_k_heads + k;
+                            let dst_idx = k * num_v_per_k + v;
+                            grouped_v[dst_idx * slice_len..(dst_idx + 1) * slice_len]
+                                .copy_from_slice(&v_data[src_idx * slice_len..(src_idx + 1) * slice_len]);
+                        }
+                    }
+                    f32_data[qk_len..].copy_from_slice(&grouped_v);
+                }
+            } else if info.name.contains("ssm_conv1d") {
+                let qk_channels = 2 * num_k_heads * head_k_dim;
+                let v_channels = num_v_heads * head_v_dim;
+                if info.shape.len() == 2 && info.shape[1] == qk_channels + v_channels {
+                    let kernel_len = info.shape[0];
+                    let qk_len = qk_channels * kernel_len;
+                    let slice_len = head_v_dim * kernel_len;
+                    let mut grouped_v = vec![0.0f32; v_channels * kernel_len];
+                    let v_data = &f32_data[qk_len..];
+                    for k in 0..num_k_heads {
+                        for v in 0..num_v_per_k {
+                            let src_idx = v * num_k_heads + k;
+                            let dst_idx = k * num_v_per_k + v;
+                            grouped_v[dst_idx * slice_len..(dst_idx + 1) * slice_len]
+                                .copy_from_slice(&v_data[src_idx * slice_len..(src_idx + 1) * slice_len]);
+                        }
+                    }
+                    f32_data[qk_len..].copy_from_slice(&grouped_v);
+                }
+            } else if info.name.contains("ssm_out") {
+                let value_dim = num_v_heads * head_v_dim;
+                if info.shape.len() == 2 && info.shape[0] == value_dim {
+                    let row_len = value_dim;
+                    let n_rows = info.shape[1];
+                    let col_slice_len = head_v_dim;
+                    let mut grouped = vec![0.0f32; f32_data.len()];
+                    for r in 0..n_rows {
+                        let row_src = &f32_data[r * row_len..(r + 1) * row_len];
+                        let row_dst = &mut grouped[r * row_len..(r + 1) * row_len];
+                        for k in 0..num_k_heads {
+                            for v in 0..num_v_per_k {
+                                let src_idx = v * num_k_heads + k;
+                                let dst_idx = k * num_v_per_k + v;
+                                row_dst[dst_idx * col_slice_len..(dst_idx + 1) * col_slice_len]
+                                    .copy_from_slice(&row_src[src_idx * col_slice_len..(src_idx + 1) * col_slice_len]);
+                            }
+                        }
+                    }
+                    f32_data = grouped;
+                }
+            }
+        }
+
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
         let (data, quant_type, group_size, label) = if is_norm || !is_2d || is_conv {
@@ -658,7 +813,6 @@ pub(crate) fn run_gguf_pipeline(
             // baked as (1+w) in llama.cpp GGUF (`convert_hf_to_gguf.py`); the
             // qwen35 loader skips its safetensors-path +1.0 when source=gguf.
             // Do not subtract 1.0 here or load-time skip would under-scale.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
@@ -666,7 +820,6 @@ pub(crate) fn run_gguf_pipeline(
             (f16_bytes, QuantType::F16, 0u32, "F16")
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -677,7 +830,6 @@ pub(crate) fn run_gguf_pipeline(
             // Product tier lift and/or explicit --fixed-tier / HIPFIRE_FIXED_TIER
             // entry. Codec overrides (e.g. attn_full:mq6v2) apply even when the
             // ProductTier does not lift that class; missing override => Q8.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             if let Some(dt) = crate::model_filter::fixed_tier_dtype_for(&out_name) {
                 let m = gemm_m;
@@ -779,7 +931,6 @@ pub(crate) fn run_gguf_pipeline(
             (bytes, quant_type, group_size, "BQ1G128 (passthrough)")
         } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
             // K-map promote to 6-bit
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Mq4
@@ -874,7 +1025,6 @@ pub(crate) fn run_gguf_pipeline(
             // K-map says override (lm_head when --lm-head-format set).
             // GGUF pipeline has no AWQ wiring (AWQ is safetensors-only today),
             // so this is a plain quantize on the carried target format.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             match override_fmt {
                 GgufFormat::Mq6 => {
@@ -1010,7 +1160,6 @@ pub(crate) fn run_gguf_pipeline(
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Hfq4 => {
@@ -1156,7 +1305,6 @@ pub(crate) fn run_gguf_pipeline(
             // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
             // This branch fires for the rare ragged dim; ignores --format
             // (no G128 variant of mq4/mq6 exists).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
