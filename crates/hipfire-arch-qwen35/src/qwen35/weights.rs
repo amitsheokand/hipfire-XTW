@@ -246,6 +246,12 @@ pub struct MoeFfnWeights {
     /// Fuse4 MoE norm after routed experts: `mlp.moe_norm.weight [hidden]`.
     /// `None` for standard A3B / dense. Stored as F16/F32 GpuTensor.
     pub moe_norm: Option<GpuTensor>,
+    /// Fuse GGUF `ffn_moe_norm` is a converted all-ones coding_norm with
+    /// llama.cpp's Gemma +1 bake → constant 2.0. RMSNorm then L2-normalizes
+    /// a ~1e-3 expert residual up to unit scale (×2 × 0.018421 ≈ 0.037 per
+    /// layer) and poisons the 4B host. Skip the normalize; keep the static
+    /// scale. `HIPFIRE_FUSE_FORCE_MOE_NORM=1` restores llama.cpp RMSNorm.
+    pub moe_norm_skip_rmsnorm: bool,
     /// Fuse GGUF pads originally-dense host layers (0–2, 27–31 on Fuse-2)
     /// with an all-zero `ffn_gate_inp`. Softmax of those logits is uniform,
     /// so top-2 would fire untrained experts. When true, run shared SwiGLU
@@ -1048,6 +1054,7 @@ impl PendingEpMoeFfn {
             shared_expert,
             shared_expert_gate: shared_gate_scalar,
             moe_norm: None,
+            moe_norm_skip_rmsnorm: false,
             router_dead: false,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,

@@ -122,6 +122,17 @@ fn fuse_skip_moe_norm() -> bool {
     })
 }
 
+/// Restore llama.cpp RMSNorm even when `moe_norm` is a uniform bake.
+fn fuse_force_moe_norm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FUSE_FORCE_MOE_NORM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 /// Diagnostic: leave the attn residual unchanged (no shared/routed FFN).
 fn fuse_skip_ffn() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -989,7 +1000,9 @@ fn moe_ffn_decode_fuse(
                 }
             }
         }
-        if !fuse_skip_moe_norm() {
+        let skip_rmsnorm = fuse_skip_moe_norm()
+            || (ffn.moe_norm_skip_rmsnorm && !fuse_force_moe_norm());
+        if !skip_rmsnorm {
             gpu.rmsnorm_f32(&y_moe, moe_norm, &y_moe, config.norm_eps)?;
         }
         gpu.scale_f32(&y_moe, fuse_moe_norm_scale())?;

@@ -1484,6 +1484,7 @@ fn paro_load_moe_ffn(
         shared_expert,
         shared_expert_gate,
         moe_norm: None,
+        moe_norm_skip_rmsnorm: false,
         router_dead: false,
         expert_gate_up_ptrs,
         expert_down_ptrs,
@@ -4805,6 +4806,7 @@ pub(crate) fn load_moe_ffn(
         qwen35_tensor_name_candidates,
     )?;
     // Fuse4 optional moe_norm (RMSNorm after routed experts)
+    let mut moe_norm_skip_rmsnorm = false;
     let moe_norm = {
         let name = format!("{p}.mlp.moe_norm.weight");
         let candidates = qwen35_tensor_name_candidates(&name);
@@ -4814,7 +4816,41 @@ pub(crate) fn load_moe_ffn(
             // Qwen35 attn/ffn norms add +1.0; that would double moe_norm.
             let (info, data) = qwen35_tensor_data_vec(hfq, &name)
                 .unwrap_or_else(|| panic!("tensor not found: {name}"));
-            Some(dequant_norm(gpu, info.quant_type, &data, &[config.dim], 0.0)?)
+            let f32_data: Vec<f32> = match info.quant_type {
+                1 => data
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+                2 => data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                16 => data
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect(),
+                other => panic!("expected F16/F32/BF16 for moe_norm, got qt={other}"),
+            };
+            assert_eq!(
+                f32_data.len(),
+                config.dim,
+                "moe_norm length {} != hidden {}",
+                f32_data.len(),
+                config.dim
+            );
+            if let Some(&first) = f32_data.first() {
+                if f32_data.iter().all(|v| (v - first).abs() <= 1e-3) {
+                    moe_norm_skip_rmsnorm = true;
+                    if layer_idx == 3 {
+                        eprintln!(
+                            "[hipfire] Fuse moe_norm is uniform {first:.4} (GGUF ones+1 bake); \
+                             skipping RMSNorm so tiny expert residuals are not L2-amplified. \
+                             HIPFIRE_FUSE_FORCE_MOE_NORM=1 restores llama.cpp RMSNorm."
+                        );
+                    }
+                }
+            }
+            Some(gpu.upload_f32(&f32_data, &[config.dim])?)
         } else {
             None
         }
@@ -4980,6 +5016,7 @@ pub(crate) fn load_moe_ffn(
         shared_expert,
         shared_expert_gate,
         moe_norm,
+        moe_norm_skip_rmsnorm,
         router_dead,
         expert_gate_up_ptrs,
         expert_down_ptrs,

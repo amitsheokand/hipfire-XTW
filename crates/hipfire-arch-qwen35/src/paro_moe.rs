@@ -210,6 +210,7 @@ pub(crate) fn paro_load_moe_ffn(
         shared_expert,
         shared_expert_gate,
         moe_norm: None,
+        moe_norm_skip_rmsnorm: false,
         router_dead: false,
         expert_gate_up_ptrs,
         expert_down_ptrs,
