@@ -209,6 +209,7 @@ pub(crate) fn paro_load_moe_ffn(
         packed_expert_owners: None,
         shared_expert,
         shared_expert_gate,
+        moe_norm: None,
         expert_gate_up_ptrs,
         expert_down_ptrs,
         expert_down_awq_ptrs: None,

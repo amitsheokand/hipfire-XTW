@@ -394,18 +394,240 @@ pub(crate) fn run_gguf_pipeline(
     let mut total_bytes_out: u64 = 0;
 
     for info in &gguf.tensors {
+        // Fuse4 stacked MoE experts are 3-D ggml (K, M, E). Copy each expert
+        // slab as hipfire [M, K] and fuse gate||up into [2*mi, hidden].
+        if arch_id == 6 && info.shape.len() == 3 && info.name.contains("ffn_gate_exps") {
+            let layer_idx = info
+                .name
+                .strip_prefix("blk.")
+                .and_then(|r| r.split('.').next())
+                .unwrap_or("0");
+            // GGUF ggml layout: ne[0]=K (hidden, innermost), ne[1]=M (mi), ne[2]=experts.
+            // Hipfire gate/up is [mi, hidden] with hidden innermost — a linear copy.
+            let n_experts = info.shape[2];
+            let k_in = info.shape[0];
+            let m_out = info.shape[1];
+            let up_name = format!("blk.{layer_idx}.ffn_up_exps.weight");
+            let up_info = gguf
+                .tensors
+                .iter()
+                .find(|t| t.name == up_name)
+                .unwrap_or_else(|| panic!("Fuse: missing {up_name} for layer {layer_idx}"));
+            assert_eq!(k_in, up_info.shape[0]);
+            assert_eq!(m_out, up_info.shape[1]);
+            assert_eq!(n_experts, up_info.shape[2]);
+            let f32_gate_all = gguf_input::tensor_to_f32(info, gguf.tensor_data(info));
+            let f32_up_all = gguf_input::tensor_to_f32(up_info, gguf.tensor_data(up_info));
+            let expert_elems = k_in * m_out;
+            for ei in 0..n_experts {
+                let gate_slice = &f32_gate_all[ei * expert_elems..(ei + 1) * expert_elems];
+                let up_slice = &f32_up_all[ei * expert_elems..(ei + 1) * expert_elems];
+                let mut fused = Vec::with_capacity(2 * expert_elems);
+                fused.extend_from_slice(gate_slice);
+                fused.extend_from_slice(up_slice);
+                let hf_name =
+                    format!("model.layers.{layer_idx}.mlp.experts.{ei}.gate_up_proj.weight");
+                let hf_m = (2 * m_out) as u32;
+                let hf_k = k_in as u32;
+                // Quantize this expert slice with the same policy as 2-D weights.
+                // Re-use the per-tensor format selection (Base / Promote6 / Override).
+                let kmap_level = kmap.get(&hf_name).copied().unwrap_or(QuantLevel::Base);
+                let is_fused_mq = matches!(
+                    format,
+                    GgufFormat::Mq4
+                        | GgufFormat::Mq4V2
+                        | GgufFormat::Mq4C
+                        | GgufFormat::Mq6
+                        | GgufFormat::Mq6V2
+                        | GgufFormat::Mq5
+                        | GgufFormat::Mq5V2
+                        | GgufFormat::Mq3
+                        | GgufFormat::Mq3V2
+                        | GgufFormat::Mq2
+                        | GgufFormat::Mq2V2
+                        | GgufFormat::Mq2Lloyd
+                        | GgufFormat::Mq2LloydAnchored
+                        | GgufFormat::Mq3Lloyd
+                        | GgufFormat::Mq4Lloyd
+                        | GgufFormat::Mfp4
+                        | GgufFormat::Mfp4P
+                        | GgufFormat::Mfp4E8
+                        | GgufFormat::Mfp3E8
+                        | GgufFormat::Mfp2E8
+                );
+                // For now, respect kmap and product tier same as 2-D path: if Q8 or embed, use Q8.
+                // Fuse experts are 2048x2560 (k=2560 not divisible by 256? Actually 2560%256==0 yes)
+                // so MQ4 is fine.
+                let (data, quant_type, group_size) = if kmap_level == QuantLevel::Q8 {
+                    let q = quantize_q8f16(&fused);
+                    (q, QuantType::Q8F16, 32u32)
+                } else if kmap_level == QuantLevel::Promote6 && (hf_k as usize) % 256 == 0 {
+                    match format {
+                        GgufFormat::Mq4
+                        | GgufFormat::Mq4V2
+                        | GgufFormat::Mq4C
+                        | GgufFormat::Mq3
+                        | GgufFormat::Mq2
+                        | GgufFormat::Mq2Lloyd
+                        | GgufFormat::Mq2LloydAnchored
+                        | GgufFormat::Mq3Lloyd
+                        | GgufFormat::Mq4Lloyd
+                        | GgufFormat::Mq5
+                        | GgufFormat::Mq6 => {
+                            let q = quantize_mq6g256(&fused, &signs1, &signs2);
+                            (q, QuantType::MQ6G256, 256u32)
+                        }
+                        _ => {
+                            let m_us = hf_m as usize;
+                            let k_us = hf_k as usize;
+                            let q = quantize_mq6g256v2(&fused, m_us, k_us, &signs1, &signs2);
+                            (q, QuantType::MQ6G256V2, 256u32)
+                        }
+                    }
+                } else if (hf_k as usize) % 256 == 0 {
+                    match format {
+                        GgufFormat::Hfq4 => {
+                            let q = quantize_hfq4g256(&fused);
+                            (q, QuantType::HFQ4G256, 256u32)
+                        }
+                        GgufFormat::Hfq6 => {
+                            let q = quantize_hfq6g256(&fused);
+                            (q, QuantType::HFQ6G256, 256u32)
+                        }
+                        GgufFormat::Mq4 => {
+                            let q = quantize_mq4g256(&fused, &signs1, &signs2);
+                            (q, QuantType::MQ4G256, 256u32)
+                        }
+                        GgufFormat::Mq4V2 => {
+                            let q = quantize_mq4g256v2(
+                                &fused,
+                                hf_m as usize,
+                                hf_k as usize,
+                                &signs1,
+                                &signs2,
+                            );
+                            (q, QuantType::MQ4G256V2, 256u32)
+                        }
+                        GgufFormat::Mq6 => {
+                            let q = quantize_mq6g256(&fused, &signs1, &signs2);
+                            (q, QuantType::MQ6G256, 256u32)
+                        }
+                        _ => {
+                            // Default for qwen35moe is MQ4V2 (thin CLI maps mq4->mq4v2)
+                            let q = quantize_mq4g256v2(
+                                &fused,
+                                hf_m as usize,
+                                hf_k as usize,
+                                &signs1,
+                                &signs2,
+                            );
+                            (q, QuantType::MQ4G256V2, 256u32)
+                        }
+                    }
+                } else {
+                    // Fallback to Q8 if K not 256-aligned (shouldn't happen for 2560)
+                    let q = quantize_q8f16(&fused);
+                    (q, QuantType::Q8F16, 32u32)
+                };
+                total_params += (hf_m as u64) * (hf_k as u64);
+                total_bytes_out += data.len() as u64;
+                hfq_tensors.push(HfqTensor {
+                    name: hf_name,
+                    shape: vec![hf_m, hf_k],
+                    quant_type,
+                    group_size,
+                    data,
+                    spilled_len: 0,
+                });
+            }
+            continue;
+        }
+        // Handle Fuse down_exps separately (skip gate's up counterpart already fused)
+        if arch_id == 6 && info.shape.len() == 3 && info.name.contains("ffn_up_exps") {
+            // Already fused with gate_exps above — skip to avoid double-counting
+            continue;
+        }
+        if arch_id == 6 && info.shape.len() == 3 && info.name.contains("ffn_down_exps") {
+            let layer_idx = info
+                .name
+                .strip_prefix("blk.")
+                .and_then(|r| r.split('.').next())
+                .unwrap_or("0");
+            let n_experts = info.shape[2];
+            // GGUF (K=mi, M=hidden, E): already hipfire down [hidden, mi].
+            let k_in = info.shape[0];
+            let m_out = info.shape[1];
+            let f32_all = gguf_input::tensor_to_f32(info, gguf.tensor_data(info));
+            let expert_elems = k_in * m_out;
+            for ei in 0..n_experts {
+                let slice = &f32_all[ei * expert_elems..(ei + 1) * expert_elems];
+                let hf_name =
+                    format!("model.layers.{layer_idx}.mlp.experts.{ei}.down_proj.weight");
+                let hf_m = m_out as u32;
+                let hf_k = k_in as u32;
+                let kmap_level = kmap.get(&hf_name).copied().unwrap_or(QuantLevel::Base);
+                let (data, quant_type, group_size) = if kmap_level == QuantLevel::Q8 {
+                    let q = quantize_q8f16(slice);
+                    (q, QuantType::Q8F16, 32u32)
+                } else if (hf_k as usize) % 256 == 0 {
+                    match format {
+                        GgufFormat::Hfq4 => {
+                            let q = quantize_hfq4g256(slice);
+                            (q, QuantType::HFQ4G256, 256u32)
+                        }
+                        GgufFormat::Mq4 => {
+                            let q = quantize_mq4g256(slice, &signs1, &signs2);
+                            (q, QuantType::MQ4G256, 256u32)
+                        }
+                        GgufFormat::Mq4V2 => {
+                            let q = quantize_mq4g256v2(
+                                slice,
+                                hf_m as usize,
+                                hf_k as usize,
+                                &signs1,
+                                &signs2,
+                            );
+                            (q, QuantType::MQ4G256V2, 256u32)
+                        }
+                        _ => {
+                            let q = quantize_mq4g256v2(
+                                slice,
+                                hf_m as usize,
+                                hf_k as usize,
+                                &signs1,
+                                &signs2,
+                            );
+                            (q, QuantType::MQ4G256V2, 256u32)
+                        }
+                    }
+                } else {
+                    let q = quantize_q8f16(slice);
+                    (q, QuantType::Q8F16, 32u32)
+                };
+                total_params += (hf_m as u64) * (hf_k as u64);
+                total_bytes_out += data.len() as u64;
+                hfq_tensors.push(HfqTensor {
+                    name: hf_name,
+                    shape: vec![hf_m, hf_k],
+                    quant_type,
+                    group_size,
+                    data,
+                    spilled_len: 0,
+                });
+            }
+            continue;
+        }
         let raw = gguf.tensor_data(info);
         let n_elements = info.numel();
         total_params += n_elements as u64;
         total_bytes_in += raw.len() as u64;
 
-        let shape: Vec<u32> = info.shape.iter().map(|&s| s as u32).collect();
+        let mut shape: Vec<u32> = info.shape.iter().map(|&s| s as u32).collect();
 
         // Tensor classification (uses the original GGUF name).
         let is_norm = gguf_is_norm_tensor(&info.name);
         let is_embed = gguf_is_embed_tensor(&info.name);
         let is_2d = info.shape.len() == 2;
-        let k_dim = if is_2d { info.shape[0] } else { n_elements };
 
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
@@ -413,9 +635,25 @@ pub(crate) fn run_gguf_pipeline(
         let out_name =
             gguf_to_safetensors_name(&info.name, arch_id).unwrap_or_else(|| info.name.clone());
 
+        let is_conv = out_name.contains("conv1d") || info.name.contains("conv1d");
+        // GGUF ggml 2-D weights are (ne0=K innermost, ne1=M). Hipfire GEMV is
+        // [M, K] with the same inner stride — relabel, do not permute bytes.
+        // conv1d is [kernel, channels], not a GEMV; leave it alone.
+        let (gemm_m, gemm_k) = if arch_id == 6 && is_2d && !is_norm && !is_conv {
+            let k = info.shape[0];
+            let m = info.shape[1];
+            shape = vec![m as u32, k as u32];
+            (m, k)
+        } else if is_2d {
+            (info.shape[0], info.shape[1])
+        } else {
+            (0, n_elements)
+        };
+        let k_dim = if is_2d { gemm_k } else { n_elements };
+
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
-        let (data, quant_type, group_size, label) = if is_norm || !is_2d {
+        let (data, quant_type, group_size, label) = if is_norm || !is_2d || is_conv {
             // Norms and 1D tensors always F16 (primary gate)
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
@@ -439,8 +677,8 @@ pub(crate) fn run_gguf_pipeline(
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             if let Some(dt) = crate::model_filter::fixed_tier_dtype_for(&out_name) {
-                let m = info.shape[0] as usize;
-                let k = info.shape[1] as usize;
+                let m = gemm_m;
+                let k = gemm_k;
                 if k % 256 != 0 && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2") {
                     eprintln!(
                         "error: fixed-tier dtype {dt} requires K%256==0 for {out_name} (K={k})"
@@ -556,8 +794,8 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 }
                 GgufFormat::Mq6V2 | GgufFormat::Mq5V2 | GgufFormat::Mq3V2 | GgufFormat::Mq2V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
                 }
@@ -567,52 +805,52 @@ pub(crate) fn run_gguf_pipeline(
                 }
                 GgufFormat::Hfp4 => {
                     // No HFP6 variant in v1. Promote6 for HFP4 stays at HFP4G32 (4.25 bpw).
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_hfp4g32_2d(&f32_data, m, k);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
                 GgufFormat::Mfp4 => {
                     // No MFP6 variant. Promote6 for MFP4 stays at MFP4G32 (4.25 bpw).
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
                 GgufFormat::Mfp4Lloyd => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
                 }
                 GgufFormat::Mfp4P => {
                     // No MFP6 variant. Promote6 for mfp4+P stays at MFP4G32P (4.25 bpw).
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_p_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
                 }
                 GgufFormat::Mfp4E8 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                 }
                 GgufFormat::Mfp4E8Soa => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                 }
                 GgufFormat::Mfp3E8 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp3g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
                 }
                 GgufFormat::Mfp2E8 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
@@ -649,14 +887,14 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 }
                 GgufFormat::Mq4V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                 }
                 GgufFormat::Mq4C => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                 }
@@ -665,26 +903,26 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::MQ5G256, 256u32, "MQ5G256")
                 }
                 GgufFormat::Mq6V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
                 }
                 GgufFormat::Mq5V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
                 }
                 GgufFormat::Mq3V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
                 }
                 GgufFormat::Mq2V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
                 }
@@ -717,42 +955,42 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                 }
                 GgufFormat::Hfp4 => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
                 GgufFormat::Mfp4 => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
                 GgufFormat::Mfp4Lloyd => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
                 }
                 GgufFormat::Mfp4P => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_mfp4g32_p_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
                 }
                 GgufFormat::Mfp4E8 => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                 }
                 GgufFormat::Mfp4E8Soa => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                 }
                 GgufFormat::Mfp3E8 => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
                 }
                 GgufFormat::Mfp2E8 => {
-                    let m = info.shape[0] as usize;
+                    let m = gemm_m;
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
@@ -785,14 +1023,14 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 }
                 GgufFormat::Mq4V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                 }
                 GgufFormat::Mq4C => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                 }
@@ -805,26 +1043,26 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 }
                 GgufFormat::Mq6V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
                 }
                 GgufFormat::Mq5V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
                 }
                 GgufFormat::Mq3V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
                 }
                 GgufFormat::Mq2V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
                 }
@@ -853,50 +1091,50 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                 }
                 GgufFormat::Hfp4 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_hfp4g32_2d(&f32_data, m, k);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
                 GgufFormat::Mfp4 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
                 GgufFormat::Mfp4Lloyd => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
                 }
                 GgufFormat::Mfp4P => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_p_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
                 }
                 GgufFormat::Mfp4E8 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
                 }
                 GgufFormat::Mfp4E8Soa => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                 }
                 GgufFormat::Mfp3E8 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp3g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
                 }
                 GgufFormat::Mfp2E8 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    let m = gemm_m;
+                    let k = gemm_k;
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
@@ -926,7 +1164,7 @@ pub(crate) fn run_gguf_pipeline(
             "  {label:>9}: {} → {} {:?} ({} src={:?}, {:.1} KB → {:.1} KB)",
             info.name,
             out_name,
-            info.shape,
+            shape,
             n_elements,
             info.dtype,
             raw.len() as f64 / 1024.0,

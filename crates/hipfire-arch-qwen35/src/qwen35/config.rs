@@ -880,9 +880,19 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         }
     }
 
-    let layer_types: Vec<LayerType> = raw
-        .layer_types
-        .as_ref()
+    let layer_types_raw: Option<Vec<String>> = raw.layer_types.clone().or_else(|| {
+        // Fuse GGUF wrap puts layer_types on the outer HFQ config after
+        // cloning `text_config`; the VL wrapper would otherwise default
+        // every layer to FullAttention and panic on missing q_proj.
+        config.get("layer_types").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+        })
+    });
+    let layer_types: Vec<LayerType> = layer_types_raw
         .map(|arr| {
             arr.iter()
                 .map(|s| match s.as_str() {

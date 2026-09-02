@@ -116,6 +116,25 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
         _ => {}
     }
     // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
+    // Special-case 1-D bias / state tensors that lack a ".weight" suffix
+    // (e.g. ssm_a, ssm_dt.bias) for qwen35moe before the generic ".weight" path.
+    if arch_id == 6 {
+        if let Some(rest) = gguf_name.strip_prefix("blk.") {
+            if let Some(dot) = rest.find('.') {
+                let layer_idx = &rest[..dot];
+                let tail = &rest[dot + 1..];
+                match tail {
+                    "ssm_a" => {
+                        return Some(format!("model.layers.{layer_idx}.linear_attn.A_log"))
+                    }
+                    "ssm_dt.bias" => {
+                        return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias"))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     if let Some(rest) = gguf_name.strip_prefix("blk.") {
         // rest = "{N}.<slot>.weight"
         let dot = rest.find('.')?;
@@ -151,6 +170,55 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
                 }
                 _ => {}
             }
+        }
+        // Qwen35MoE (Fuse4) hybrid: DeltaNet (SSM) + MoE. GGUF uses
+        // llama.cpp naming (attn_qkv/attn_gate/ssm_* and stacked
+        // ffn_*_exps). Map to hipfire's HF naming.
+        if arch_id == 6 {
+            let translated = match slot {
+                "attn_norm" => "input_layernorm".to_string(),
+                "post_attention_norm" => "post_attention_layernorm".to_string(),
+                "ffn_norm" => "post_attention_layernorm".to_string(),
+                "attn_q" => "self_attn.q_proj".to_string(),
+                "attn_k" => "self_attn.k_proj".to_string(),
+                "attn_v" => "self_attn.v_proj".to_string(),
+                "attn_output" => "self_attn.o_proj".to_string(),
+                "attn_q_norm" => "self_attn.q_norm".to_string(),
+                "attn_k_norm" => "self_attn.k_norm".to_string(),
+                // LinearAttention (DeltaNet) — map llama.cpp SSM names to HF linear_attn
+                "ssm_a" => return Some(format!("model.layers.{layer_idx}.linear_attn.A_log")),
+                "ssm_dt" => return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias")),
+                "ssm_conv1d" => "linear_attn.conv1d".to_string(),
+                "ssm_alpha" => "linear_attn.in_proj_a".to_string(),
+                "ssm_beta" => "linear_attn.in_proj_b".to_string(),
+                "ssm_norm" => "linear_attn.norm".to_string(),
+                "ssm_out" => "linear_attn.out_proj".to_string(),
+                "attn_qkv" => "linear_attn.in_proj_qkv".to_string(),
+                "attn_gate" => "linear_attn.in_proj_z".to_string(),
+                // MoE shared expert (host FFN) — always present on Fuse
+                "ffn_up_shexp" => "mlp.shared_expert.up_proj".to_string(),
+                "ffn_gate_shexp" => "mlp.shared_expert.gate_proj".to_string(),
+                "ffn_down_shexp" => "mlp.shared_expert.down_proj".to_string(),
+                "ffn_gate_inp_shexp" => return Some(format!(
+                    "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+                )),
+                // MoE norm after routed experts
+                "ffn_moe_norm" => return Some(format!(
+                    "model.layers.{layer_idx}.mlp.moe_norm.weight"
+                )),
+                "ffn_gate_inp" => return Some(format!(
+                    "model.layers.{layer_idx}.mlp.gate.weight"
+                )),
+                // Routed experts are 3-D stacked [hidden, inter, 8] — handled
+                // as split per-expert tensors in pipeline_gguf; keep raw name
+                // so the splitter can find them. Return None to signal raw.
+                "ffn_up_exps" | "ffn_gate_exps" | "ffn_down_exps" => return None,
+                "ffn_gate" => "mlp.gate_proj".to_string(),
+                "ffn_up" => "mlp.up_proj".to_string(),
+                "ffn_down" => "mlp.down_proj".to_string(),
+                other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
+            };
+            return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
         }
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
@@ -756,9 +824,263 @@ pub(crate) fn config_json_from_gguf(
     if arch_id == 13 {
         apply_gemma4_fields(gguf, prefix, &mut cfg);
     }
+    if arch_id == 6 && arch_str == "qwen35moe" {
+        apply_qwen35moe_fields(gguf, prefix, &mut cfg);
+    }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
     serde_json::Value::Object(cfg)
+}
+
+fn apply_qwen35moe_fields(
+    gguf: &gguf_input::GgufFile,
+    prefix: &str,
+    cfg: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let read_u = |k: &str| -> Option<u64> {
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::U8(x) => Some(*x as u64),
+            gguf_input::MetaValue::I8(x) => Some(*x as u64),
+            gguf_input::MetaValue::U16(x) => Some(*x as u64),
+            gguf_input::MetaValue::I16(x) => Some(*x as u64),
+            gguf_input::MetaValue::U32(x) => Some(*x as u64),
+            gguf_input::MetaValue::I32(x) => Some(*x as u64),
+            gguf_input::MetaValue::U64(x) => Some(*x),
+            gguf_input::MetaValue::I64(x) => Some(*x as u64),
+            _ => None,
+        })
+    };
+    // MoE topology
+    if let Some(v) = read_u(&format!("{prefix}.expert_count")) {
+        cfg.insert("num_experts".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = read_u(&format!("{prefix}.expert_used_count")) {
+        cfg.insert("num_experts_per_tok".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = read_u(&format!("{prefix}.expert_feed_forward_length")) {
+        cfg.insert("moe_intermediate_size".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = read_u(&format!("{prefix}.expert_shared_feed_forward_length")) {
+        cfg.insert(
+            "shared_expert_intermediate_size".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    // Qwen3.5 hybrid SSM params — hipfire's Qwen35Config expects these
+    if let Some(v) = read_u(&format!("{prefix}.ssm.conv_kernel")) {
+        cfg.insert("linear_conv_kernel_dim".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = read_u(&format!("{prefix}.ssm.state_size")) {
+        cfg.insert("linear_value_head_dim".to_string(), serde_json::Value::from(v));
+        cfg.insert("linear_key_head_dim".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(inner) = read_u(&format!("{prefix}.ssm.inner_size")) {
+        if let Some(state) = read_u(&format!("{prefix}.ssm.state_size")) {
+            if state != 0 {
+                let value_heads = inner / state;
+                cfg.insert(
+                    "linear_num_value_heads".to_string(),
+                    serde_json::Value::from(value_heads),
+                );
+            }
+        }
+        cfg.insert("_fuse_ssm_inner_size".to_string(), serde_json::Value::from(inner));
+    }
+    if let Some(v) = read_u(&format!("{prefix}.ssm.group_count")) {
+        cfg.insert("linear_num_key_heads".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = read_u(&format!("{prefix}.ssm.time_step_rank")) {
+        cfg.insert("linear_time_step_rank".to_string(), serde_json::Value::from(v));
+    }
+    // mrope for Fuse VL text wrapper — hipfire's Qwen35Config uses these for
+    // the VL text path (is_vl_text + mrope_section). Fuse carries the same
+    // qwen35moe.rope.* fields as the VL models. Config::from_hfq derives
+    // is_vl_text from text_config+vision_config, not is_vl_text, so we must
+    // set those wrappers. Q 8192 = 2* n_heads*head_dim (16*256*2) is the VL
+    // doubled-Q for mrope, handled by the loader when is_vl_text is true.
+    if let Some(v) = gguf.metadata.get(&format!("{prefix}.rope.dimension_sections")) {
+        if let crate::gguf_input::MetaValue::Array(arr) = v {
+            let secs: Vec<u64> = arr
+                .iter()
+                .filter_map(|x| match x {
+                    crate::gguf_input::MetaValue::U32(u) => Some(*u as u64),
+                    crate::gguf_input::MetaValue::I32(i) => Some(*i as u64),
+                    crate::gguf_input::MetaValue::U64(u) => Some(*u),
+                    _ => None,
+                })
+                .collect();
+            if secs.len() >= 3 {
+                // Build rope_parameters.mrope_section for Config::from_hfq
+                let mut rope_params = serde_json::Map::new();
+                // Preserve existing rope_params if already present
+                if let Some(existing) = cfg.get("rope_parameters").and_then(|v| v.as_object()) {
+                    rope_params = existing.clone();
+                }
+                rope_params.insert(
+                    "mrope_section".to_string(),
+                    serde_json::Value::Array(secs[..3].iter().map(|&x| serde_json::Value::from(x)).collect()),
+                );
+                rope_params.insert("mrope_interleaved".to_string(), serde_json::Value::Bool(true));
+                if let Some(freq) = gguf.metadata.get(&format!("{prefix}.rope.freq_base")).and_then(|v| match v {
+                    crate::gguf_input::MetaValue::F32(f) => Some(*f as f64),
+                    _ => None,
+                }) {
+                    rope_params.insert("rope_theta".to_string(), serde_json::Value::from(freq));
+                }
+                if let Some(cnt) = read_u(&format!("{prefix}.rope.dimension_count")) {
+                    let head_dim = cfg.get("head_dim").and_then(|x| x.as_u64()).unwrap_or(256);
+                    if head_dim != 0 {
+                        let partial = cnt as f64 / head_dim as f64;
+                        rope_params.insert("partial_rotary_factor".to_string(), serde_json::Value::from(partial));
+                    }
+                }
+                cfg.insert("rope_parameters".to_string(), serde_json::Value::Object(rope_params));
+                // is_vl_text is derived from text_config + vision_config presence
+                // Clone current cfg as text_config and add empty vision_config to trigger VL path
+                let mut text_config = cfg.clone();
+                // Remove the wrappers we are about to add to avoid recursion
+                text_config.remove("text_config");
+                text_config.remove("vision_config");
+                cfg.insert("text_config".to_string(), serde_json::Value::Object(text_config));
+                cfg.insert("vision_config".to_string(), serde_json::Value::Object(serde_json::Map::new()));
+            }
+        }
+    } else {
+        if let Some(v) = read_u(&format!("{prefix}.rope.dimension_count")) {
+            let head_dim = cfg.get("head_dim").and_then(|x| x.as_u64()).unwrap_or(256);
+            if head_dim != 0 {
+                let partial = v as f64 / head_dim as f64;
+                cfg.insert("partial_rotary_factor".to_string(), serde_json::Value::from(partial));
+            }
+        }
+        if let Some(v) = gguf.metadata.get(&format!("{prefix}.rope.freq_base")) {
+            if let crate::gguf_input::MetaValue::F32(f) = v {
+                cfg.insert("rope_theta".to_string(), serde_json::Value::from(*f as f64));
+            }
+        }
+    }
+    // Q 8192 = 2 * n_heads * head_dim (16*256*2). layer_driver always loads
+    // doubled Q; keep n_heads=16 / head_dim=256 (O is 4096). Tensor-shape
+    // derivation at the end of this function confirms that geometry.
+    // Layer types: Fuse uses full_attention_interval =4 → every 4th layer is full
+    if let Some(interval) = read_u(&format!("{prefix}.full_attention_interval")) {
+        if let Some(n_layers) = cfg.get("num_hidden_layers").and_then(|v| v.as_u64()) {
+            let mut layer_types: Vec<String> = Vec::with_capacity(n_layers as usize);
+            for i in 0..n_layers {
+                if interval > 0 && i % interval == 0 {
+                    // Note: GGUF data shows full attention at layers 3,7,11,... not 0,4,8
+                    // but interval 4 is close. Use actual tensor presence to refine
+                    // at load time; this is a placeholder that loader will override
+                    // if block metadata mismatches.
+                    layer_types.push("full_attention".to_string());
+                } else {
+                    layer_types.push("linear_attention".to_string());
+                }
+            }
+            // Correct to observed pattern from Fuse GGUF tensor table:
+            // layers with attn_q present are full attention. Build from tensor list
+            // if available — more accurate than interval.
+            let mut full_layers = std::collections::HashSet::new();
+            for t in &gguf.tensors {
+                if t.name.contains("attn_q.weight") {
+                    if let Some(rest) = t.name.strip_prefix("blk.") {
+                        if let Some(dot) = rest.find('.') {
+                            if let Ok(idx) = rest[..dot].parse::<u64>() {
+                                full_layers.insert(idx);
+                            }
+                        }
+                    }
+                }
+            }
+            if !full_layers.is_empty() {
+                layer_types = (0..n_layers)
+                    .map(|i| {
+                        if full_layers.contains(&i) {
+                            "full_attention".to_string()
+                        } else {
+                            "linear_attention".to_string()
+                        }
+                    })
+                    .collect();
+            }
+            cfg.insert(
+                "layer_types".to_string(),
+                serde_json::Value::Array(
+                    layer_types
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+            if let Some(tc) = cfg.get_mut("text_config").and_then(|v| v.as_object_mut()) {
+                tc.insert(
+                    "layer_types".to_string(),
+                    serde_json::Value::Array(
+                        layer_types.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+        }
+    }
+    // Head dim from tensor shapes, not from guessing 32×256 vs 16×512.
+    // Full-attn Q is VL-doubled: Q_out = n_heads * head_dim * 2 (8192),
+    // O_in = n_heads * head_dim (4096), K/V = n_kv_heads * head_dim (1024).
+    // layer_driver always loads Q as n_heads*head_dim*2; do not bump n_heads.
+    let dim = cfg
+        .get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2560) as usize;
+    let other_dim = |shape: &[usize]| -> Option<usize> {
+        shape.iter().copied().find(|&d| d != dim)
+    };
+    let mut q_out = None;
+    let mut o_in = None;
+    let mut k_out = None;
+    for t in &gguf.tensors {
+        if q_out.is_none() && t.name.contains("attn_q.weight") {
+            q_out = other_dim(&t.shape);
+        }
+        if o_in.is_none() && (t.name.contains("attn_output.weight") || t.name.contains("attn_o.weight")) {
+            o_in = other_dim(&t.shape);
+        }
+        if k_out.is_none() && t.name.contains("attn_k.weight") {
+            k_out = other_dim(&t.shape);
+        }
+    }
+    if let (Some(o_in), Some(k_out)) = (o_in, k_out) {
+        let n_kv = cfg
+            .get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4) as usize;
+        if n_kv > 0 && k_out % n_kv == 0 {
+            let head_dim = k_out / n_kv;
+            if head_dim > 0 && o_in % head_dim == 0 {
+                let n_heads = o_in / head_dim;
+                cfg.insert("head_dim".to_string(), serde_json::Value::from(head_dim as u64));
+                cfg.insert(
+                    "num_attention_heads".to_string(),
+                    serde_json::Value::from(n_heads as u64),
+                );
+                if let Some(tc) = cfg.get_mut("text_config").and_then(|v| v.as_object_mut()) {
+                    tc.insert("head_dim".to_string(), serde_json::Value::from(head_dim as u64));
+                    tc.insert(
+                        "num_attention_heads".to_string(),
+                        serde_json::Value::from(n_heads as u64),
+                    );
+                }
+                if let Some(q_out) = q_out {
+                    if q_out != n_heads * head_dim * 2 {
+                        eprintln!(
+                            "[qwen35moe] attn_q out={q_out} vs 2*n_heads*head_dim={} \
+                             (n_heads={n_heads} head_dim={head_dim} o_in={o_in} k_out={k_out})",
+                            n_heads * head_dim * 2
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Translate gemma4-specific GGUF metadata into the `text_config` fields the

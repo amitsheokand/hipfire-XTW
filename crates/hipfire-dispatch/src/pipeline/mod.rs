@@ -1915,6 +1915,9 @@ fn run_moe_decode_cpu_fallback(
     };
 
     // ── 3. Shared-expert down (identical to the GPU-top-K shared-down block) ──
+    // Honor skip_shared (EP rank>0, Fuse4 routed-only). The GPU-top-K path
+    // already gates this; k!=8 CPU fallback used to ignore the flag.
+    if !p.skip_shared {
     if p.shared_down_w.dtype == DType::MQ4G256 {
         hip!(gpu.ensure_mq_signs())?;
         let x_rot_alias = unsafe {
@@ -2035,6 +2038,7 @@ fn run_moe_decode_cpu_fallback(
             arch: "",
             quant: "",
         });
+    }
     }
 
     // ── 4. Per-expert routed loop (master's generic `weight_gemv` arm) ────────

@@ -85,6 +85,20 @@ use rdna_compute::GpuTensor;
 /// Non-owning borrow of the scratch buffers `moe_ffn_decode_impl` needs.
 /// Callers construct one of these from either a `Qwen35Scratch` (preallocated,
 /// hipGraph-capturable) or from tensors they own locally (heap path).
+/// Fuse4 `ffn_moe_norm` scale from the llama.cpp `build_layer_ffn_fuse4` patch.
+const FUSE4_MOE_NORM_SCALE: f32 = 0.018421;
+
+/// Diagnostic: skip routed experts + moe_norm; residual += y_shared only.
+fn fuse_shared_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FUSE_SHARED_ONLY")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 struct MoeScratchRef<'a> {
     router_logits: &'a GpuTensor,
     scalar_buf: &'a GpuTensor,
@@ -107,6 +121,11 @@ struct MoeScratchRef<'a> {
     // the MoE FFN is byte-deterministic under hipGraph replay; see
     // task #100 root-cause notes in `forward_scratch`.
     down_expanded: &'a GpuTensor,
+    /// Fuse4 workspace: y_shared / host_hidden / y_moe. `None` on the heap
+    /// decode path (allocated inside `moe_ffn_decode_fuse`).
+    fuse_y_shared: Option<&'a GpuTensor>,
+    fuse_host_hidden: Option<&'a GpuTensor>,
+    fuse_y_moe: Option<&'a GpuTensor>,
 }
 
 impl<'a> MoeScratchRef<'a> {
@@ -131,6 +150,9 @@ impl<'a> MoeScratchRef<'a> {
             topk_indices: s.moe_topk_indices.as_ref().expect("MoE scratch"),
             topk_weights: s.moe_topk_weights.as_ref().expect("MoE scratch"),
             down_expanded: s.moe_down_expanded.as_ref().expect("MoE scratch"),
+            fuse_y_shared: Some(&s.o),
+            fuse_host_hidden: Some(&s.x_rot),
+            fuse_y_moe: Some(&s.tmp),
         }
     }
 }
@@ -183,6 +205,9 @@ fn moe_ffn_decode(
         topk_indices: &topk_indices,
         topk_weights: &topk_weights,
         down_expanded: &down_expanded,
+        fuse_y_shared: None,
+        fuse_host_hidden: None,
+        fuse_y_moe: None,
     };
     let result = moe_ffn_decode_impl(
         gpu, ffn, x_norm, x_residual, config, &refs, false, None, false, false,
@@ -582,6 +607,12 @@ fn moe_ffn_decode_impl(
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
     let n_exp = config.num_experts;
+    // Fuse4 MoE (moe_norm present) — full host_hidden+routed+norm path.
+    // When moe_norm is present we cannot use the stock 256-expert dispatch
+    // (k=8 vs k=2, and the routed input is host_hidden = x + y_shared, not x_norm).
+    // Keep the stock path for A3B (moe_norm None), and take the Fuse branch below
+    // after the MoeParams setup. The branch is gated on ffn.moe_norm.is_some().
+    let is_fuse = ffn.moe_norm.is_some();
     // SP2: if a layer's experts span >1 quant tier (e.g. a re-quant overlay
     // bumped some experts), expose the per-expert tier tables so dispatch
     // buckets by tier. The common case (a uniform layer — or paged mode where
@@ -716,6 +747,15 @@ fn moe_ffn_decode_impl(
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
     };
+    if is_fuse {
+        if ep_routed_out.is_some() {
+            return Err(HipError::new(
+                0,
+                "Fuse4 MoE does not support EP routed_out (single-GPU host_hidden path)",
+            ));
+        }
+        return moe_ffn_decode_fuse(gpu, ffn, x_norm, x_residual, config, s);
+    }
     // Build one DispatchCtx per token (the family threads it through every
     // inner GEMV — no internal DispatchCtx::new reconstructions).
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
@@ -732,6 +772,183 @@ fn moe_ffn_decode_impl(
             s.topk_indices,
             s.topk_weights,
         );
+    }
+    Ok(())
+}
+
+fn moe_ffn_decode_fuse(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'_>,
+) -> HipResult<()> {
+    // Fuse4: y_shared = SwiGLU(shared)(x_norm) with no sigmoid gate;
+    // host_hidden = x + y_shared; y_moe = RMSNorm(routed(host_hidden), moe_norm)
+    // * 0.018421; x = host_hidden + y_moe.
+    //
+    // Do not call MoeFamily with k=0 (decode-k-out-of-range). moe_norm is F32
+    // on device (dequant_norm); a host F16 reinterpret of that buffer garbles.
+    let hidden = config.dim;
+    let smi = config.shared_expert_intermediate_size;
+    let heap_y_shared;
+    let heap_host;
+    let heap_y_moe;
+    let y_shared_src: &GpuTensor;
+    let host_src: &GpuTensor;
+    let y_moe_src: &GpuTensor;
+    if let (Some(ys), Some(hh), Some(ym)) =
+        (s.fuse_y_shared, s.fuse_host_hidden, s.fuse_y_moe)
+    {
+        heap_y_shared = None;
+        heap_host = None;
+        heap_y_moe = None;
+        y_shared_src = ys;
+        host_src = hh;
+        y_moe_src = ym;
+    } else {
+        heap_y_shared = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+        heap_host = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+        heap_y_moe = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+        y_shared_src = heap_y_shared.as_ref().unwrap();
+        host_src = heap_host.as_ref().unwrap();
+        y_moe_src = heap_y_moe.as_ref().unwrap();
+    }
+    let y_shared = y_shared_src.sub_offset(0, hidden);
+    let host_hidden = host_src.sub_offset(0, hidden);
+    let y_moe = y_moe_src.sub_offset(0, hidden);
+    let gate = s.gate_buf.sub_offset(0, smi);
+    let up = s.up_buf.sub_offset(0, smi);
+    let hidden_act = s.ffn_hidden.sub_offset(0, smi);
+
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    let gemv = hipfire_runtime::llama::gemv_family();
+    gemv.run_auto(&ctx, gpu, &ffn.shared_expert.gate.dispatch_ref(), x_norm, &gate)
+        .map_err(HipError::from)?;
+    gemv.run_auto(&ctx, gpu, &ffn.shared_expert.up.dispatch_ref(), x_norm, &up)
+        .map_err(HipError::from)?;
+    gpu.silu_mul_f32(&gate, &up, &hidden_act)?;
+    gemv.run_auto(
+        &ctx,
+        gpu,
+        &ffn.shared_expert.down.dispatch_ref(),
+        &hidden_act,
+        &y_shared,
+    )
+    .map_err(HipError::from)?;
+    gpu.add_f32(x_residual, &y_shared, &host_hidden)?;
+    if fuse_shared_only() {
+        gpu.add_f32(x_residual, &y_shared, x_residual)?;
+        if let Some(t) = heap_y_shared {
+            gpu.free_tensor(t)?;
+        }
+        if let Some(t) = heap_host {
+            gpu.free_tensor(t)?;
+        }
+        if let Some(t) = heap_y_moe {
+            gpu.free_tensor(t)?;
+        }
+        return Ok(());
+    }
+
+    gpu.hip.memset(&y_moe.buf, 0, hidden * 4)?;
+    let routed_experts: Vec<(
+        hipfire_dispatch::families::gemv::WeightRef<'_>,
+        hipfire_dispatch::families::gemv::WeightRef<'_>,
+    )> = ffn
+        .experts
+        .iter()
+        .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
+        .collect();
+    let routed_moe_params = hipfire_dispatch::families::moe::MoeParams {
+        dtypes: hipfire_dispatch::families::moe::MoeDtypes {
+            router: ffn.router.gpu_dtype,
+            shared_gate: ffn.shared_expert_gate.gpu_dtype,
+            shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+            shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+            shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+            experts_all_gate_up_mq4: ffn
+                .experts
+                .iter()
+                .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)),
+            routed_gate_up: ffn
+                .experts
+                .first()
+                .map(|e| e.gate_up.gpu_dtype)
+                .unwrap_or(DType::MQ4G256V2),
+            routed_down: ffn
+                .experts
+                .first()
+                .map(|e| e.down.gpu_dtype)
+                .unwrap_or(DType::MQ4G256V2),
+            routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
+            has_paro_shared: ffn.paro_shared.is_some(),
+            per_expert_gate_up: None,
+            per_expert_down: None,
+        },
+        batch_size: 1,
+        hidden,
+        mi: config.moe_intermediate_size,
+        smi,
+        k: config.num_experts_per_tok,
+        n_exp: config.num_experts,
+        norm_topk_prob: config.norm_topk_prob,
+        x_rot_prerotated: false,
+        defer_routed_combine: false,
+        layer_idx: ffn.layer_idx,
+        x_norm: &host_hidden,
+        x_residual: &y_moe,
+        routed_out: None,
+        skip_shared: true,
+        router: ffn.router.dispatch_ref(),
+        shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
+        shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
+        shared_up_w: ffn.shared_expert.up.dispatch_ref(),
+        shared_down_w: ffn.shared_expert.down.dispatch_ref(),
+        expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
+        expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
+        routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
+        routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
+        routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+        routed_experts: &routed_experts,
+        routed_gate_up_paro: None,
+        routed_down_paro: None,
+        router_logits: s.router_logits,
+        scalar_buf: s.scalar_buf,
+        x_rot_local: s.x_rot_local,
+        gate_up_buf: s.gate_up_buf,
+        gate_buf: s.gate_buf,
+        up_buf: s.up_buf,
+        ffn_hidden: s.ffn_hidden,
+        ffn_out: s.ffn_out,
+        gate_batch: s.gate_batch,
+        up_batch: s.up_batch,
+        rot_batch: s.rot_batch,
+        topk_indices: s.topk_indices,
+        topk_weights: s.topk_weights,
+        down_expanded: s.down_expanded,
+    };
+    hipfire_runtime::llama::moe_family()
+        .run(&ctx, gpu, &routed_moe_params)
+        .map_err(HipError::from)?;
+
+    if let Some(moe_norm) = &ffn.moe_norm {
+        gpu.rmsnorm_f32(&y_moe, moe_norm, &y_moe, config.norm_eps)?;
+        gpu.scale_f32(&y_moe, FUSE4_MOE_NORM_SCALE)?;
+    }
+    gpu.add_f32(&host_hidden, &y_moe, x_residual)?;
+
+    if let Some(t) = heap_y_shared {
+        gpu.free_tensor(t)?;
+    }
+    if let Some(t) = heap_host {
+        gpu.free_tensor(t)?;
+    }
+    if let Some(t) = heap_y_moe {
+        gpu.free_tensor(t)?;
     }
     Ok(())
 }
@@ -3127,6 +3344,15 @@ fn moe_ffn_dispatch(
 ) -> HipResult<()> {
     let exact_v2_prerotated = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
         && ffn_gate_side_mq4v2_prerotated_for_moe(ffn);
+    // Fuse4 needs the unrotated post-FFN-norm activation as shared/routed
+    // input. The prerotated residual path would feed x (not rmsnorm(x)).
+    if ffn.moe_norm.is_some() {
+        gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
+        let r = moe_ffn_decode_with_scratch(gpu, ffn, &s.tmp, x, config, s);
+        r?;
+        trace_finite_if_enabled(gpu, "moe_ffn", x)?;
+        return Ok(());
+    }
     let r = if ffn_gate_side_mq4_for_moe(ffn) || exact_v2_prerotated {
         gpu.fused_rmsnorm_rotate_mq(
             x,

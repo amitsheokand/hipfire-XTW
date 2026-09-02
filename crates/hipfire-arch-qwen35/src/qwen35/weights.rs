@@ -243,6 +243,9 @@ pub struct MoeFfnWeights {
     pub(crate) packed_expert_owners: Option<PackedExpertOwners>,
     pub shared_expert: SharedExpertWeights,
     pub shared_expert_gate: WeightTensor, // [1, hidden] — row-vector projecting to scalar
+    /// Fuse4 MoE norm after routed experts: `mlp.moe_norm.weight [hidden]`.
+    /// `None` for standard A3B / dense. Stored as F16/F32 GpuTensor.
+    pub moe_norm: Option<GpuTensor>,
     /// Device-side array of `unsigned long long` pointers, one per
     /// expert's `gate_up.buf`. Indexed at runtime by the GPU top-K
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
@@ -1039,6 +1042,7 @@ impl PendingEpMoeFfn {
             packed_expert_owners: self.packed_owners,
             shared_expert,
             shared_expert_gate: shared_gate_scalar,
+            moe_norm: None,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
             expert_down_awq_ptrs: awq_ptrs,
@@ -1345,6 +1349,9 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     ffn.shared_expert.gate.free_all(gpu);
     ffn.shared_expert.up.free_all(gpu);
     ffn.shared_expert.down.free_all(gpu);
+    if let Some(t) = ffn.moe_norm {
+        let _ = gpu.free_tensor(t);
+    }
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
     // Non-owning pointer table — free the buffer only; the per-expert scales it

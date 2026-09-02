@@ -1423,6 +1423,7 @@ fn paro_load_moe_ffn(
         packed_expert_owners: None,
         shared_expert,
         shared_expert_gate,
+        moe_norm: None,
         expert_gate_up_ptrs,
         expert_down_ptrs,
         // ParoQuant routed experts use shared per-layer Givens sidecars, not
@@ -4741,6 +4742,21 @@ pub(crate) fn load_moe_ffn(
         config.dim,
         qwen35_tensor_name_candidates,
     )?;
+    // Fuse4 optional moe_norm (RMSNorm after routed experts)
+    let moe_norm = {
+        let name = format!("{p}.mlp.moe_norm.weight");
+        let candidates = qwen35_tensor_name_candidates(&name);
+        let found = candidates.iter().any(|n| hfq.find_tensor_info(n).is_some());
+        if found {
+            // Fuse llama.cpp RMSNorm uses the tensor as gamma as-is.
+            // Qwen35 attn/ffn norms add +1.0; that would double moe_norm.
+            let (info, data) = qwen35_tensor_data_vec(hfq, &name)
+                .unwrap_or_else(|| panic!("tensor not found: {name}"));
+            Some(dequant_norm(gpu, info.quant_type, &data, &[config.dim], 0.0)?)
+        } else {
+            None
+        }
+    };
     let owns_orig = |x: usize| {
         ep_shard
             .as_ref()
@@ -4893,6 +4909,7 @@ pub(crate) fn load_moe_ffn(
         packed_expert_owners,
         shared_expert,
         shared_expert_gate,
+        moe_norm,
         expert_gate_up_ptrs,
         expert_down_ptrs,
         expert_down_awq_ptrs,
