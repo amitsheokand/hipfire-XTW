@@ -272,12 +272,30 @@ pub(crate) fn run_gguf_pipeline(
     // Strict validation before worker threads — same parser as CLI.
     crate::model_filter::validate_env_fixed_tier_or_exit();
     let config_json = config_json_from_gguf(&gguf, &arch_str, arch_id);
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "architecture": arch_str,
         "source": "gguf",
         "config": config_json,
         "gguf_meta": gguf_meta_to_json(&gguf.metadata),
     });
+    // Carry the GGUF chat template into `tokenizer_config.chat_template` —
+    // the ONLY key the runtime populates `LoadedModel::chat_template` from.
+    // Without it the model serves template-less under a generic ChatML
+    // scaffold, which makes Fuse-family models meta-chatter ("The user is
+    // asking…") and open unclosed <think> spans. The native template frames
+    // thinking correctly (empty think block when disabled).
+    if let Some(crate::gguf_input::MetaValue::String(tpl)) =
+        gguf.metadata.get("tokenizer.chat_template")
+    {
+        if !tpl.is_empty() {
+            eprintln!(
+                "[hipfire-quantize] embedding GGUF chat template into tokenizer_config ({} bytes)",
+                tpl.len()
+            );
+            metadata["tokenizer_config"] =
+                serde_json::json!({ "chat_template": tpl });
+        }
+    }
     let metadata_json = serde_json::to_string(&metadata)?;
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(
