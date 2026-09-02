@@ -981,31 +981,15 @@ fn moe_ffn_decode_fuse(
         .map_err(HipError::from)?;
 
     if let Some(moe_norm) = &ffn.moe_norm {
-        if hipfire_config::developer_var("HIPFIRE_FUSE_DEBUG")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                if let Ok(y) = gpu.download_f32(&y_moe) {
-                    let mean_sq = y.iter().map(|v| v * v).sum::<f32>() / y.len() as f32;
-                    let max_abs = y.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-                    eprintln!(
-                        "[fuse-debug] layer {} y_moe pre-norm rms={:.5} maxabs={:.5}",
-                        ffn.layer_idx,
-                        mean_sq.sqrt(),
-                        max_abs
-                    );
-                }
-            }
-        }
         let skip_rmsnorm = fuse_skip_moe_norm()
             || (ffn.moe_norm_skip_rmsnorm && !fuse_force_moe_norm());
         if !skip_rmsnorm {
             gpu.rmsnorm_f32(&y_moe, moe_norm, &y_moe, config.norm_eps)?;
         }
-        gpu.scale_f32(&y_moe, fuse_moe_norm_scale())?;
+        let scale = fuse_moe_norm_scale();
+        if (scale - 1.0f32).abs() > 1e-6 {
+            gpu.scale_f32(&y_moe, scale)?;
+        }
     }
     gpu.add_f32(&host_hidden, &y_moe, x_residual)?;
 
@@ -1830,10 +1814,14 @@ pub fn forward_scratch(
     }
     // MoE models require `experimental.graph.moe` in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
+    // For non-k=8 models (e.g. Fuse-2 with k=2), CPU top-k fallback does D2H,
+    // which is not capture-compatible (causes hipError 906). Disable graph for k != 8.
+    let is_standard_k8 = config.num_experts == 0 || config.num_experts_per_tok == 8;
     let use_graph = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
+        && is_standard_k8
         && (config.num_experts == 0 || allow_moe);
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
