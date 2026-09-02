@@ -1978,6 +1978,18 @@ pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SHARED_SILU_MQ_ROTATE_SRC: &st
 pub const MOE_TOPK_RENORM_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_topk_renorm_k8.hip");
 
+/// k=2 companion of MOE_TOPK_RENORM_K8_SRC for Fuse-family decode routing.
+/// Same gate-then-topk split (softmax_f32 or moe_router_sqrtsoftplus first);
+/// single general rescan path, n_exp up to 1024.
+pub const MOE_TOPK_RENORM_K2_SRC: &str =
+    include_str!("../../../kernels/src/moe_topk_renorm_k2.hip");
+
+/// Fuse4 router gate: in-place sqrt(softplus(x - 2)). Runs before
+/// MOE_TOPK_RENORM_K2_SRC on sqrtsoftplus models (op order bit-matches the
+/// CPU reference in hipfire-dispatch).
+pub const MOE_ROUTER_SQRTSOFTPLUS_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_sqrtsoftplus.hip");
+
 /// Batched companion of MOE_TOPK_RENORM_K8_SRC for the prefill path.
 /// Same per-block algorithm; one workgroup per token row.
 pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =

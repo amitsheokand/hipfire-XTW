@@ -631,6 +631,48 @@ impl Gpu {
         )
     }
 
+    /// In-place Fuse4 router gate: `x[i] = sqrt(softplus(x[i] - 2))`.
+    /// Runs BEFORE `moe_topk_renorm_k2` on sqrtsoftplus models — the same
+    /// gate-then-topk split the k=8 path uses with `softmax_f32`. Op order
+    /// bit-matches the CPU reference in hipfire-dispatch; see the kernel
+    /// header note.
+    pub fn moe_router_sqrtsoftplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_router_sqrtsoftplus",
+            kernels::MOE_ROUTER_SQRTSOFTPLUS_SRC,
+            "moe_router_sqrtsoftplus",
+        )?;
+
+        let n = x.shape.iter().product::<usize>() as i32;
+        let x_ptr = x.buf.as_ptr();
+        let n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+
+        // Graph-safe launch via launch_maybe_blob (same rationale as
+        // softmax_f32 above: no stack-borne kernargs under capture).
+        self.launch_maybe_blob(
+            "moe_router_sqrtsoftplus",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
     /// Batched temperature-scaled softmax, out-of-place. For each of `rows`
     /// rows of width `vocab`, writes `probs[r] = softmax(logits[r] / temp)`
     /// into `probs` and leaves `logits` untouched.

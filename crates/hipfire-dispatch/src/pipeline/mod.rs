@@ -1883,7 +1883,10 @@ fn run_moe_decode_cpu_fallback(
         .ok()
         .as_deref()
         == Some("1");
-    if !sqrtsoftplus {
+    // The k==8 arm below expects pre-softmaxed probs (softmax applied
+    // here); the k==2 GPU arm gates itself (softmax or sqrtsoftplus per
+    // model metadata), and the generic host arm gates after download.
+    if k != 2 && !sqrtsoftplus {
         hip!(gpu.softmax_f32(p.router_logits))?;
     }
     let (topk_indices, topk_weights): (Vec<usize>, Vec<f32>) = if k == 8 {
@@ -1903,6 +1906,78 @@ fn run_moe_decode_cpu_fallback(
             .map(|&f| i32::from_ne_bytes(f.to_ne_bytes()) as usize)
             .collect();
         (idx_usize, wts)
+    } else if k == 2 && n_exp <= 1024 {
+        // GPU-native top-2 (k=2 models: Fuse today). Gate + top-2 + renorm
+        // stay on device; a single tiny [2] D2H feeds the host expert loop
+        // below — replacing the [n_exp] download + host select. Bit-exact
+        // with the host path by construction (same gated-buffer inputs,
+        // direct-division renorm); HIPFIRE_MOE_K2_PARITY=1 replays the host
+        // select alongside and reports the first mismatches.
+        if sqrtsoftplus {
+            hip!(gpu.moe_router_sqrtsoftplus_f32(p.router_logits))?;
+        } else {
+            hip!(gpu.softmax_f32(p.router_logits))?;
+        }
+        hip!(gpu.moe_topk_renorm_k2(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            n_exp,
+            p.norm_topk_prob
+        ))?;
+        // topk_indices is i32 values stored in an F32 GpuTensor (same 4 B/elem);
+        // download as f32 bits and reinterpret.
+        let idx_f32 = hip!(gpu.download_f32(p.topk_indices))?;
+        let wts = hip!(gpu.download_f32(p.topk_weights))?;
+        let sel: Vec<usize> = idx_f32
+            .iter()
+            .map(|&f| i32::from_ne_bytes(f.to_ne_bytes()) as usize)
+            .collect();
+        if fuse_debug {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                eprintln!(
+                    "[fuse-debug] layer {} k={} topk={:?} w={:?} ssp={} gpu-topk",
+                    p.layer_idx, k, sel, wts, sqrtsoftplus
+                );
+            }
+        }
+        if hipfire_config::developer_var("HIPFIRE_MOE_K2_PARITY")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            // Replay the host select on the device-gated scores and compare.
+            let gated = hip!(gpu.download_f32(p.router_logits))?;
+            let mut idx: Vec<usize> = (0..n_exp).collect();
+            idx.select_nth_unstable_by(1, |&a, &b| {
+                gated[b].partial_cmp(&gated[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut ref_sel: Vec<usize> = idx.into_iter().take(2).collect();
+            ref_sel.sort_by(|&a, &b| {
+                gated[b].partial_cmp(&gated[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut ref_wts: Vec<f32> = ref_sel.iter().map(|&i| gated[i]).collect();
+            if p.norm_topk_prob {
+                let sum: f32 = ref_wts.iter().sum();
+                if sum > 0.0 {
+                    for w in ref_wts.iter_mut() {
+                        *w /= sum;
+                    }
+                }
+            }
+            static M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if (sel != ref_sel || wts != ref_wts)
+                && M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4
+            {
+                eprintln!(
+                    "[moe-k2-parity] MISMATCH layer {} ssp={} gpu=({:?},{:?}) host=({:?},{:?})",
+                    p.layer_idx, sqrtsoftplus, sel, wts, ref_sel, ref_wts
+                );
+            }
+        }
+        (sel, wts)
     } else {
         // Original [n_exp] D2H path for non-k8 models (not capture-eligible).
         let mut probs = hip!(gpu.download_f32(p.router_logits))?;
