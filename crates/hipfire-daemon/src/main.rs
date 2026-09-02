@@ -2145,6 +2145,7 @@ fn main() {
                     }
                 }
                 let system = msg.get("system").and_then(|v| v.as_str());
+                let raw_requested = msg.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
 
@@ -3200,6 +3201,7 @@ fn main() {
                         enable_thinking_jinja,
                         logprobs_top_k,
                         request_seed,
+                        raw_requested,
                     );
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {

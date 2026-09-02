@@ -405,6 +405,9 @@ struct RunArgs {
     #[arg(long)]
     /// Buffer visible output instead of streaming it.
     no_stream: bool,
+    #[arg(long, visible_alias = "no-chatml")]
+    /// Send prompt directly without chat template or ChatML scaffolding.
+    raw: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1935,6 +1938,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let host = config_string(&resolved, "serve.host")?;
     let port = config_u64(&resolved, "serve.port")? as u16;
     let force_local = process_truthy("HIPFIRE_LOCAL")
+        || args.raw
         || args.image.is_some()
         || args.kv_mode.is_some()
         || args.kv_backend.is_some()
@@ -1958,6 +1962,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             max_tokens,
             args.json,
             args.no_stream,
+            args.raw,
         );
     }
 
@@ -2072,7 +2077,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let _ = apply_http_reasoning_request(
+    apply_http_reasoning_request(
         &serde_json::json!({}),
         &resolved,
         &mut request,
@@ -2080,11 +2085,17 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         effort_native,
         &supported_efforts,
     )?;
+    if args.raw {
+        request["raw"] = serde_json::Value::Bool(true);
+        request["thinking_enabled"] = serde_json::Value::Bool(false);
+        request["assistant_prefix"] = serde_json::Value::String("plain".to_string());
+    }
 
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
     let done = engine.generate(&request, |event| {
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
+        let ev_type = event.get("type").and_then(serde_json::Value::as_str);
+        if ev_type == Some("token") || ev_type == Some("reasoning") {
             if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
                 content.push_str(text);
                 if stream {
@@ -2139,6 +2150,7 @@ fn run_via_http(
     max_tokens: u64,
     json: bool,
     no_stream: bool,
+    raw: bool,
 ) -> Result<()> {
     let mut messages = Vec::new();
     if let Some(system) = system {
@@ -2150,6 +2162,9 @@ fn run_via_http(
         "messages": messages,
         "max_tokens": max_tokens,
     });
+    if raw {
+        body["raw"] = serde_json::Value::Bool(true);
+    }
     insert_optional_f64(&mut body, "temperature", temperature);
     insert_optional_f64(&mut body, "top_p", top_p);
     insert_optional_u64(&mut body, "top_k", top_k);

@@ -1127,6 +1127,7 @@ pub fn generate(
     // attempt-key + counter entropy) so two requests with the same prompt
     // no longer replay the identical draw sequence at temp>0.
     request_seed: u32,
+    raw_requested: bool,
 ) {
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
@@ -2253,12 +2254,23 @@ pub fn generate(
     // Plain branch (which dropped the system prompt and lost the Jinja
     // template). The cold-reset further down (`jinja_active && seq_pos > 0`)
     // re-prefills this full render from position 0.
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
-    let mut started_in_think = matches!(
-        assistant_prefix,
-        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-    );
-    let new_tokens = if try_jinja {
+    let raw_prompt = raw_requested
+        || hipfire_config::developer_var("HIPFIRE_RAW_PROMPT")
+            .ok()
+            .as_deref()
+            == Some("1");
+    let try_jinja = !raw_prompt && jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = if raw_prompt {
+        hipfire_engine::emit::render_tail_opens_think(prompt)
+    } else {
+        matches!(
+            assistant_prefix,
+            hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+        )
+    };
+    let new_tokens = if raw_prompt {
+        tokenizer.encode(prompt)
+    } else if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
@@ -2359,6 +2371,10 @@ pub fn generate(
         .build_with_user_tokens(&q_tokens)
     };
 
+    if hipfire_config::developer_var("HIPFIRE_FUSE_DEBUG").ok().as_deref() == Some("1") {
+        eprintln!("[fuse-debug] rendered prompt ({} tokens): {:?}", new_tokens.len(), tokenizer.decode(&new_tokens));
+    }
+
     // ── Prompt cache (LCP-based) — Qwen3.5/3.6 only ──────────────────────
     //
     // Mirrors V4F's prefix-cache (daemon.rs ~5390). Eligible when:
@@ -2400,7 +2416,8 @@ pub fn generate(
     // `build_cached_history_jinja` (verbatim assistant-turn splice through the
     // model's trained template) instead of the ChatScaffold `build_cached_history`,
     // so the LCP forward-extension cache now works under HIPFIRE_JINJA_CHAT too.
-    let cache_eligible = !cache_kill_switch
+    let cache_eligible = !raw_prompt
+        && !cache_kill_switch
         && messages_history.is_some()
         && m.eviction.is_none()
         && !pflash_active
@@ -2847,7 +2864,7 @@ pub fn generate(
     // from position 0 rather than appending to the prior turn's dirty
     // DeltaNet/KV/checkpoint state. Uses `crate::common::free_checkpoints` (NOT a bare
     // `.clear()`) so the checkpoint GPU buffers are freed rather than leaked.
-    if jinja_active && !cache_eligible && m.seq_pos > 0 {
+    if (raw_prompt || jinja_active) && !cache_eligible && m.seq_pos > 0 {
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
@@ -3471,6 +3488,20 @@ pub fn generate(
             top_k,
             min_p,
         };
+        if hipfire_config::developer_var("HIPFIRE_FUSE_DEBUG").ok().as_deref() == Some("1") {
+            if let Ok(l) = gpu.download_f32(&scratch.logits) {
+                let mut indexed: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                eprintln!("[fuse-debug] top 10 logits after prefill:");
+                for (id, val) in &indexed[..10] {
+                    let text = tokenizer.decode(&[*id as u32]);
+                    eprintln!("  id={:<6} logit={:<8.3} text={:?}", id, val, text);
+                }
+                if let Some(pos) = indexed.iter().position(|(id, _)| *id == 11751) {
+                    eprintln!("  Paris (11751): rank={} logit={:.3}", pos, indexed[pos].1);
+                }
+            }
+        }
         // Grammar-gated sample: GPU fast path when the matcher is free
         // (the common case — no tool_call mid-flight); CPU slow path when
         // the matcher is constraining, so we can apply the token mask to
