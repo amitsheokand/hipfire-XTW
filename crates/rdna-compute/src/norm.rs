@@ -3986,6 +3986,45 @@ impl Gpu {
         result
     }
 
+    /// HIP-graphs-safe variant of `scale_f32`. Same kernel, blob launch so
+    /// kernarg pointers survive stream capture (mirrors `add_f32_graph_safe`).
+    #[cfg(feature = "deltanet")]
+    pub fn scale_f32_graph_safe(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
+        let n = x.numel();
+        let xp = x.buf.as_ptr();
+        let nv = n as i32;
+        let sv = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise1_bytes(n);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "scale_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "scale_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(nv);
+                b.push_f32(sv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Fused `y[i] += c * x[i]` with a CPU-supplied scalar. Merges the
     /// (scale_f32 + add_inplace_f32) pair used by the MoE routed-expert
     /// epilogue — one kernel launch instead of two.

@@ -1112,6 +1112,12 @@ pub struct Qwen35Weights {
     /// grouped-i8 MQ4 shortcut is model-level unsafe for these promoted A3B
     /// checkpoints, even in layers whose local routed experts remain MQ4.
     pub moe_has_mq6: bool,
+    /// True when every MoE layer can run the k==2 indexed decode path with no
+    /// host round-trip (uniform MQ4G256V2 routed experts, no tier tags/AWQ).
+    /// Gates AR hipGraph capture for k==2 models (the CPU-topK fallback's D2H
+    /// is capture-incompatible). Computed once at load; dead-router layers
+    /// are exempt (their routed experts never execute).
+    pub moe_k2_indexable: bool,
 
     /// Weight pager (MAD-93 v0.1). `Some` only when the model was loaded
     /// with `Qwen35Config::paged_experts == true`. The forward path uses

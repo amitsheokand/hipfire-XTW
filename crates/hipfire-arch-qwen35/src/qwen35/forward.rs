@@ -507,6 +507,42 @@ pub(crate) fn layers_have_mq6_moe(layers: &[LayerWeights]) -> bool {
     })
 }
 
+/// True when every MoE layer's routed path can run device-indexed at k==2
+/// with no host round-trip: live layers carry uniform MQ4G256V2 routed
+/// experts (representative experts[0], no tier-tag table, no AWQ sidecars);
+/// dead-router layers are exempt (their routed experts never execute — they
+/// may even be unloaded). Mirrors the `use_k2_indexed` admission in
+/// hipfire-dispatch `run_moe_decode`; the two must stay in lockstep or the
+/// AR graph admits a layer whose decode falls back to D2H under capture
+/// (hipError 906).
+pub(crate) fn layers_k2_indexable(layers: &[LayerWeights]) -> bool {
+    layers.iter().all(|layer| {
+        let ffn = match layer {
+            LayerWeights::DeltaNetMoe(l) => &l.ffn,
+            LayerWeights::FullAttnMoe(l) => &l.ffn,
+            _ => return true,
+        };
+        if ffn.router_dead {
+            return true;
+        }
+        let (gate_up, down) = if let Some(global) = ffn.global_expert_dtypes.as_ref() {
+            match global.first() {
+                Some(&(g, d)) => (g, d),
+                None => return false,
+            }
+        } else {
+            match ffn.experts.first() {
+                Some(e) => (e.gate_up.gpu_dtype, e.down.gpu_dtype),
+                None => return false,
+            }
+        };
+        gate_up == DType::MQ4G256V2
+            && down == DType::MQ4G256V2
+            && ffn.expert_dtype_tags.is_none()
+            && ffn.expert_down_awq_ptrs.is_none()
+    })
+}
+
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
 /// be populated (done automatically by `Qwen35Scratch::new` when config
 /// indicates a MoE model). Safe to call under hipGraph stream capture.
@@ -885,9 +921,9 @@ fn moe_ffn_decode_fuse(
         &y_shared,
     )
     .map_err(HipError::from)?;
-    gpu.add_f32(x_residual, &y_shared, &host_hidden)?;
+    gpu.add_f32_graph_safe(x_residual, &y_shared, &host_hidden)?;
     if fuse_shared_only() || ffn.router_dead {
-        gpu.add_f32(x_residual, &y_shared, x_residual)?;
+        gpu.add_f32_graph_safe(x_residual, &y_shared, x_residual)?;
         if let Some(t) = heap_y_shared {
             gpu.free_tensor(t)?;
         }
@@ -900,7 +936,14 @@ fn moe_ffn_decode_fuse(
         return Ok(());
     }
 
-    gpu.hip.memset(&y_moe.buf, 0, hidden * 4)?;
+    // Capture-safe zero (async on the capture stream under hipGraph, sync
+    // otherwise): the legacy-stream sync memset faults with hipError 906
+    // inside stream capture.
+    if let Some(stream) = gpu.active_stream.as_ref() {
+        gpu.hip.memset_async(&y_moe.buf, 0, hidden * 4, stream)?;
+    } else {
+        gpu.hip.memset(&y_moe.buf, 0, hidden * 4)?;
+    }
     let routed_experts: Vec<(
         hipfire_dispatch::families::gemv::WeightRef<'_>,
         hipfire_dispatch::families::gemv::WeightRef<'_>,
@@ -990,10 +1033,10 @@ fn moe_ffn_decode_fuse(
         }
         let scale = config.moe_norm_scale;
         if (scale - 1.0f32).abs() > 1e-6 {
-            gpu.scale_f32(&y_moe, scale)?;
+            gpu.scale_f32_graph_safe(&y_moe, scale)?;
         }
     }
-    gpu.add_f32(&host_hidden, &y_moe, x_residual)?;
+    gpu.add_f32_graph_safe(&host_hidden, &y_moe, x_residual)?;
 
     if let Some(t) = heap_y_shared {
         gpu.free_tensor(t)?;
@@ -1816,14 +1859,20 @@ pub fn forward_scratch(
     }
     // MoE models require `experimental.graph.moe` in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    // For non-k=8 models (e.g. Fuse-2 with k=2), CPU top-k fallback does D2H,
-    // which is not capture-compatible (causes hipError 906). Disable graph for k != 8.
-    let is_standard_k8 = config.num_experts == 0 || config.num_experts_per_tok == 8;
+    // k==8 takes the indexed path unconditionally; k==2 takes it when the
+    // loader certified every live MoE layer indexable
+    // (`weights.moe_k2_indexable` — uniform MQ4V2 routed, no tags/AWQ, so
+    // decode never falls back to the capture-incompatible D2H top-K).
+    // Anything else (non-indexable k!=8) keeps the CPU fallback and must
+    // stay off-graph (hipError 906 under capture).
+    let is_indexable_k = config.num_experts == 0
+        || config.num_experts_per_tok == 8
+        || (config.num_experts_per_tok == 2 && weights.moe_k2_indexable);
     let use_graph = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
-        && is_standard_k8
+        && is_indexable_k
         && (config.num_experts == 0 || allow_moe);
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 

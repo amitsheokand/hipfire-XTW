@@ -9,6 +9,7 @@ use super::config::f16_lm_head_mode_from_config;
 use super::config::F16LmHeadMode;
 use super::config::Qwen35Config;
 use super::forward::layers_have_mq6_moe;
+use super::forward::layers_k2_indexable;
 use super::weights::dtype_from_quant_type;
 use super::weights::mixed_expert_tag;
 use super::weights::DeltaNetLayerWeights;
@@ -2519,6 +2520,7 @@ pub fn load_weights(
         output_norm,
         output,
         moe_has_mq6: layers_have_mq6_moe(&layers),
+        moe_k2_indexable: layers_k2_indexable(&layers),
         layers,
         pager: None,
         lm_head_aliases_embd,
@@ -3953,6 +3955,7 @@ pub fn load_weights_dense_tp_rank(
             output_norm,
             output,
             moe_has_mq6: false,
+            moe_k2_indexable: layers_k2_indexable(&layers),
             layers,
             pager: None,
             lm_head_aliases_embd,
