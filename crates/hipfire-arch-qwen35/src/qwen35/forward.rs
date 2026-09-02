@@ -121,6 +121,20 @@ fn fuse_force_moe_norm() -> bool {
     })
 }
 
+/// Shared Fuse `moe_norm` skip policy for decode (`moe_ffn_decode_fuse`)
+/// and batched prefill. Skip sources (OR): file header truth (`config`,
+/// stamped by the quantizer for Fuse-family GGUFs) → load-time per-layer
+/// uniformity scan (`ffn_flag`, fallback for pre-header artifacts) →
+/// diag env. `fuse_force_moe_norm` restores llama.cpp RMSNorm for diagnosis.
+pub(crate) fn fuse_moe_norm_skip_rmsnorm(
+    config: &Qwen35Config,
+    ffn_flag: bool,
+) -> bool {
+    config.moe_norm_skip_rmsnorm
+        || fuse_skip_moe_norm()
+        || (ffn_flag && !fuse_force_moe_norm())
+}
+
 /// Diagnostic: leave the attn residual unchanged (no shared/routed FFN).
 fn fuse_skip_ffn() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -969,15 +983,8 @@ fn moe_ffn_decode_fuse(
     hipfire_runtime::llama::moe_family()
         .run(&ctx, gpu, &routed_moe_params)
         .map_err(HipError::from)?;
-
     if let Some(moe_norm) = &ffn.moe_norm {
-        // Skip sources (OR): file header truth (`config`, stamped by the
-        // quantizer for Fuse-family GGUFs) → load-time per-layer uniformity
-        // scan (`ffn`, fallback for pre-header artifacts) → diag env.
-        // `fuse_force_moe_norm` restores llama.cpp RMSNorm for diagnosis.
-        let skip_rmsnorm = config.moe_norm_skip_rmsnorm
-            || fuse_skip_moe_norm()
-            || (ffn.moe_norm_skip_rmsnorm && !fuse_force_moe_norm());
+        let skip_rmsnorm = fuse_moe_norm_skip_rmsnorm(config, ffn.moe_norm_skip_rmsnorm);
         if !skip_rmsnorm {
             gpu.rmsnorm_f32(&y_moe, moe_norm, &y_moe, config.norm_eps)?;
         }

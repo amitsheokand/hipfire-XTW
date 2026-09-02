@@ -1138,6 +1138,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_multirow_r8" => Some(vec![read(0), read(8), write(16)]),
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
+        "moe_topk_renorm_k8_batched" => Some(vec![read(0), write(8), write(16)]),
+        "moe_topk_renorm_k2_batched" => Some(vec![read(0), write(8), write(16)]),
         "moe_topk_renorm_k2" => Some(vec![read(0), write(8), write(16)]),
         "moe_router_sqrtsoftplus" => Some(vec![write(0)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
@@ -1513,6 +1515,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "softmax_f32" => Some(16),
         "moe_router_sqrtsoftplus" => Some(16),
         "moe_topk_renorm_k2" => Some(32),
+        "moe_topk_renorm_k2_batched" => Some(32),
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"

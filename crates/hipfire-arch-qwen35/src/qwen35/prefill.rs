@@ -15,6 +15,7 @@ use super::config::TreeVerifyCtx;
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
 use super::forward::forward_scratch_with_hidden;
+use super::forward::fuse_moe_norm_skip_rmsnorm;
 use super::forward::kv_cache_attention_dispatch;
 use super::forward::moe_ffn_has_mq3_experts_uniform;
 use super::forward::moe_ffn_has_mq3_structural;
@@ -2076,6 +2077,11 @@ struct MoePrefillDtypes {
     /// fails admission and silently drops to the per-token prefill fallback (the
     /// merged kernel never fires — observed as ~decode-speed prefill).
     routed_mixed_merged: bool,
+    /// Fuse4 `ffn_moe_norm` post-norm is present: the layer takes the Fuse
+    /// batched branch (shared-only accumulation + routed norm tail) instead
+    /// of the A3B sigmoid-gated accumulation. Set from
+    /// `ffn.moe_norm.is_some()` — the same gate the decode path uses.
+    has_moe_norm: bool,
 }
 
 impl MoePrefillDtypes {
@@ -2092,6 +2098,7 @@ impl MoePrefillDtypes {
             expert_gate_up_uniform: true,
             expert_down_uniform: true,
             routed_mixed_merged: false,
+            has_moe_norm: false,
         }
     }
 
@@ -2113,6 +2120,7 @@ impl MoePrefillDtypes {
                 expert_gate_up_uniform: global.iter().all(|(g, _)| *g == first.0),
                 expert_down_uniform: global.iter().all(|(_, d)| *d == first.1),
                 routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
+                has_moe_norm: ffn.moe_norm.is_some(),
             });
         }
         let first = ffn.experts.first()?;
@@ -2133,12 +2141,13 @@ impl MoePrefillDtypes {
                 .iter()
                 .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
             routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
+            has_moe_norm: ffn.moe_norm.is_some(),
         })
     }
 }
 
 fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
-    k_top == 8 && num_experts <= 1024
+    (k_top == 8 || k_top == 2) && num_experts <= 1024
 }
 
 /// Routed-expert dtypes the batched-prefill grouped-GEMM path (Path 2) serves
@@ -2259,7 +2268,12 @@ fn moe_ffn_batched_admissible_for_dtypes(
     let shared_gate_ok = matches!(
         dtypes.shared_expert_scalar_gate,
         DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
-    );
+    )
+    // Fuse4 scalar gate is F16 (present but unused — Fuse has no sigmoid
+    // shared gate; the Fuse body branch skips it). Admitted only with
+    // moe_norm, so no other model can ride this exception into a body
+    // that would panic on F16.
+    || (dtypes.has_moe_norm && dtypes.shared_expert_scalar_gate == DType::F16);
     // Graded (mixed-dtype) routed experts are served by the merged grouped-WMMA
     // prefill kernel, so the per-expert *uniform* requirement is waived for the
     // routed experts; the router + shared expert still go through their own
@@ -2330,6 +2344,32 @@ fn moe_ffn_batched_admissible_for_dtypes(
         && dtypes.shared_expert_gate == dtypes.shared_expert_up
         && matches!(dtypes.shared_expert_gate, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
         && matches!(dtypes.shared_expert_down, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
+    {
+        return true;
+    }
+
+    // Fuse4 MoE (ffn_moe_norm present): Q8 router, F16 scalar gate (present
+    // but UNUSED — Fuse has no sigmoid shared gate), shared gate/up fused
+    // MQ4V2 or MQ6 (exact equality: one fused layout per launch), shared
+    // down MQ4V2 or MQ6, uniform MQ4V2 routed experts. The body serves these
+    // in a dedicated Fuse branch (no-sigmoid shared accumulation, routed
+    // norm tail), so this arm is self-contained and needs no admit_mq6.
+    // `routed_ok` above already established per-projection uniformity.
+    if dtypes.has_moe_norm
+        && dtypes.router == DType::Q8_0
+        && dtypes.shared_expert_scalar_gate == DType::F16
+        && dtypes.shared_expert_gate == dtypes.shared_expert_up
+        && matches!(
+            dtypes.shared_expert_gate,
+            DType::MQ4G256V2 | DType::MQ6G256
+        )
+        && matches!(
+            dtypes.shared_expert_down,
+            DType::MQ4G256V2 | DType::MQ6G256
+        )
+        && dtypes.expert_gate_up == DType::MQ4G256V2
+        && dtypes.expert_down == DType::MQ4G256V2
+        && !dtypes.routed_mixed_merged
     {
         return true;
     }
@@ -2972,6 +3012,18 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     let smi = config.shared_expert_intermediate_size;
     let k_top = config.num_experts_per_tok;
     let n_exp = config.num_experts;
+    // Fuse4 MoE (moe_norm present): shared expert has no sigmoid gate and
+    // accumulates into host_hidden (not x_batch); routed output is normed +
+    // scaled before joining the residual. Same gate the decode path uses.
+    // Dead-router Fuse layers (dense GGUF pads) run shared-only.
+    let is_fuse = ffn.moe_norm.is_some();
+    let fuse_dead = is_fuse && ffn.router_dead;
+    if is_fuse && routed_out.is_some() {
+        return Err(HipError::new(
+            0,
+            "Fuse4 MoE does not support EP routed_out (single-GPU host_hidden path)",
+        ));
+    }
 
     let router_logits = pbs.moe_router_logits_batch.as_ref().expect("moe scratch");
     let shared_scalar = pbs.moe_shared_scalar_batch.as_ref().expect("moe scratch");
@@ -3044,6 +3096,12 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // byte-for-byte. The x input still differs per dtype (Q8/F32 read
     // x_norm_batch; MQ4 reads x_rot_batch), exactly as before. The three keys
     // are registered ArchPredicate::Always, so run_key never rejects.
+    // Dead-router Fuse layers skip routing entirely (decode never runs it),
+    // and live Fuse layers route on host_hidden (computed in step 5 below —
+    // decode routes the same buffer), so the A3B router GEMM runs only
+    // off the Fuse path.
+    if !is_fuse {
+    if !fuse_dead {
     {
         use hipfire_dispatch::families::gemm::GemmParams;
         let ctx = DispatchCtx::new(gpu);
@@ -3089,8 +3147,14 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             .run_key(key, &ctx, gpu, &params)
             .map_err(HipError::from)?;
     }
+    }
+    }
     // DIAG: dump MoE router logits (batched)
     dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");
+    // Fuse has no sigmoid shared gate (decode never reads shared_expert_gate
+    // or shared_scalar); skip the scalar GEMM. Dead-router Fuse layers skip
+    // the router too (decode never runs it there).
+    if !is_fuse {
     // #397 Ship 5.2 slice1: route the shared-expert-gate GEMM through
     // GemmFamily::run_key. Same dtype-routed dispatcher-entry keys as the router
     // match above (Q8/F32 read x_norm_batch, MQ4 reads x_rot_batch) → identical
@@ -3118,6 +3182,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             ffn.shared_expert_gate.k,
             n,
         )?;
+    }
     }
     // Fused gate+up dispatch for the shared expert — halves the kernel
     // launch count vs back-to-back gemm_hfq*g256 (~75µs/launch × 40
@@ -3308,27 +3373,59 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         ),
     }
 
-    // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
+    // ── 3. Gate + top-K + renorm, batched over N tokens ──
     //
     // Same Path B split as the decode call site: split the fused
-    // softmax+topk+renorm into gpu.softmax_f32 + moe_topk_renorm_k8_batched
-    // so prefill activations match the CPU-reference softmax math
-    // exactly. router_logits is allocated 1D as [n × n_exp]; alias it
-    // into a 2D view so gpu.softmax_f32 takes rows = n.
-    let router_logits_2d = GpuTensor {
-        buf: unsafe { router_logits.buf.alias() },
-        shape: vec![n, n_exp],
-        dtype: DType::F32,
-    };
-    gpu.softmax_f32(&router_logits_2d)?;
-    gpu.moe_topk_renorm_k8_batched(
-        router_logits,
-        topk_indices,
-        topk_weights,
-        n_exp,
-        config.norm_topk_prob,
-        n,
-    )?;
+    // gate+topk+renorm into a gate kernel + topk+renorm kernel so prefill
+    // activations match the CPU-reference gate math exactly.
+    // Softmax models run gpu.softmax_f32 over the [N × n_exp] row view;
+    // sqrtsoftplus models (Fuse, first-class `router_activation` metadata)
+    // run the in-place elementwise gate over the flat buffer (it is
+    // position-independent, so the flat [N·n_exp] span is equivalent).
+    // Top-K is k-selected: k=8 keeps moe_topk_renorm_k8_batched, k=2 uses
+    // the k2-batched twin (admission guarantees k ∈ {2, 8} here).
+    // Live Fuse layers route in step 5 (the router reads host_hidden,
+    // computed there) and dead Fuse layers never route — this A3B step
+    // runs only off the Fuse path.
+    if !is_fuse {
+    if matches!(
+        config.router_activation,
+        hipfire_dispatch::families::moe::RouterActivation::SqrtSoftplus
+    ) {
+        gpu.moe_router_sqrtsoftplus_f32(router_logits)?;
+    } else {
+        let router_logits_2d = GpuTensor {
+            buf: unsafe { router_logits.buf.alias() },
+            shape: vec![n, n_exp],
+            dtype: DType::F32,
+        };
+        gpu.softmax_f32(&router_logits_2d)?;
+    }
+    if k_top == 8 {
+        gpu.moe_topk_renorm_k8_batched(
+            router_logits,
+            topk_indices,
+            topk_weights,
+            n_exp,
+            config.norm_topk_prob,
+            n,
+        )?;
+    } else if k_top == 2 {
+        gpu.moe_topk_renorm_k2_batched(
+            router_logits,
+            topk_indices,
+            topk_weights,
+            n_exp,
+            config.norm_topk_prob,
+            n,
+        )?;
+    } else {
+        panic!(
+            "prefill_moe_ffn_body_batched: unsupported k_top {k_top} \
+             — moe_prefill_topk_shape_supported admits 8 and 2"
+        );
+    }
+    } // !is_fuse (Fuse routes in step 5 on host_hidden)
 
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
     //
@@ -3383,6 +3480,148 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // atomicAdd; each (bid, row) writes a unique cell.)
     // Per-projection dispatch: MQ4 → HFQ4 kernel, MQ6 → HFQ6 sister
     // (shipped via feat/hfq6-sigmoid-scaled-batched).
+    //
+    // Fuse4 replaces this step: no sigmoid gate anywhere in Fuse math —
+    // the shared down is a plain GEMM into a y_shared temp, then
+    // host_hidden = x_batch + y_shared feeds the routed block (and dead
+    // layers stop here with a shared-only add). Temps are [n × dim] F32,
+    // allocated per prefill call (prefill-paced, negligible next to the
+    // GEMMs) and freed at each exit below.
+    let y_shared_t = if is_fuse {
+        Some(gpu.alloc_tensor(&[n * dim], DType::F32)?)
+    } else {
+        None
+    };
+    let host_hidden_t = if is_fuse {
+        Some(gpu.alloc_tensor(&[n * dim], DType::F32)?)
+    } else {
+        None
+    };
+    let y_moe_t = if is_fuse {
+        Some(gpu.alloc_tensor(&[n * dim], DType::F32)?)
+    } else {
+        None
+    };
+    if is_fuse {
+        let y_shared = y_shared_t.as_ref().expect("fuse temp");
+        match ffn.shared_expert.down.gpu_dtype {
+            DType::MQ4G256V2 => run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
+                &ffn.shared_expert.down.buf,
+                ffn.shared_expert.down.gpu_dtype,
+                shared_rot,
+                y_shared,
+                ffn.shared_expert.down.m,
+                ffn.shared_expert.down.k,
+                n,
+            )?,
+            DType::MQ6G256 => run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq6G256BatchedLmhead,
+                &ffn.shared_expert.down.buf,
+                ffn.shared_expert.down.gpu_dtype,
+                shared_rot,
+                y_shared,
+                ffn.shared_expert.down.m,
+                ffn.shared_expert.down.k,
+                n,
+            )?,
+            other => panic!(
+                "prefill_moe_ffn_body_batched: unsupported Fuse shared_expert.down dtype {other:?} \
+                 — Fuse admission covers MQ4G256V2 and MQ6G256"
+            ),
+        }
+        // host_hidden = x_batch + y_shared (first n rows).
+        let x_rows = pbs.x_batch.sub_offset(0, n * dim);
+        let host_hidden = host_hidden_t.as_ref().expect("fuse temp");
+        gpu.add_f32(&x_rows, y_shared, host_hidden)?;
+        if fuse_dead {
+            // Dead-router Fuse layer: shared-only add, no routing/routed/norm.
+            gpu.add_f32(&x_rows, y_shared, &x_rows)?;
+            free_fuse_temps(gpu, y_shared_t, host_hidden_t, y_moe_t)?;
+            return Ok(());
+        }
+        // Fuse router on host_hidden (mirrors decode, which routes the same
+        // x_norm=&host_hidden buffer — NOT rmsnorm(x)). Admission guarantees
+        // a Q8 router on the Fuse path.
+        {
+            use hipfire_dispatch::families::gemm::GemmParams;
+            let ctx = DispatchCtx::new(gpu);
+            if ffn.router.gpu_dtype != DType::Q8_0 {
+                panic!(
+                    "prefill_moe_ffn_body_batched: Fuse router dtype {:?} — \
+                     Fuse admission requires Q8_0",
+                    ffn.router.gpu_dtype
+                );
+            }
+            let host_hidden = host_hidden_t.as_ref().expect("fuse temp");
+            let w = WeightRef {
+                buf: &ffn.router.buf,
+                dtype: ffn.router.gpu_dtype,
+                m: ffn.router.m,
+                k: ffn.router.k,
+                row_stride: ffn.router.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w,
+                x: host_hidden,
+                y: router_logits,
+                batch_size: n,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(HipError::from)?;
+        }
+        dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");
+        // Fuse gate + top-K (step 3 runs only off the Fuse path — the router
+        // logits did not exist until the block above). Same gate/topk split
+        // as decode; k ∈ {2, 8} by admission.
+        if matches!(
+            config.router_activation,
+            hipfire_dispatch::families::moe::RouterActivation::SqrtSoftplus
+        ) {
+            gpu.moe_router_sqrtsoftplus_f32(router_logits)?;
+        } else {
+            let router_logits_2d = GpuTensor {
+                buf: unsafe { router_logits.buf.alias() },
+                shape: vec![n, n_exp],
+                dtype: DType::F32,
+            };
+            gpu.softmax_f32(&router_logits_2d)?;
+        }
+        if k_top == 8 {
+            gpu.moe_topk_renorm_k8_batched(
+                router_logits,
+                topk_indices,
+                topk_weights,
+                n_exp,
+                config.norm_topk_prob,
+                n,
+            )?;
+        } else if k_top == 2 {
+            gpu.moe_topk_renorm_k2_batched(
+                router_logits,
+                topk_indices,
+                topk_weights,
+                n_exp,
+                config.norm_topk_prob,
+                n,
+            )?;
+        } else {
+            panic!(
+                "prefill_moe_ffn_body_batched: unsupported Fuse k_top {k_top} \
+                 — moe_prefill_topk_shape_supported admits 8 and 2"
+            );
+        }
+    } else {
     match ffn.shared_expert.down.gpu_dtype {
         DType::MQ4G256 => gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
             &ffn.shared_expert.down.buf,
@@ -3528,7 +3767,23 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                          — admit predicate should have rejected this layer"
         ),
     }
+    } // end non-Fuse shared-down (Fuse took the plain-GEMM branch above)
 
+    // Fuse: routed experts consume FWHT(host_hidden) — re-rotate x_rot_batch
+    // from host_hidden now that the shared block is done with it. Mirrors
+    // decode, which rotates x_norm=&host_hidden into its local x_rot.
+    // Non-Fuse layers already hold FWHT(x_norm_batch) from step 1.
+    if is_fuse {
+        let host_hidden = host_hidden_t.as_ref().expect("fuse temp");
+        rotate_x_mq_batched_for(
+            gpu,
+            &ffn.experts[0].gate_up,
+            host_hidden,
+            &pbs.x_rot_batch,
+            dim,
+            n,
+        )?;
+    }
     // ── 6. Routed experts: delegated to MoeFamily::run_prefill (Ship 4.2) ──
     let down_m = ffn.experts[0].down.m;
     let down_k = ffn.experts[0].down.k;
@@ -3634,12 +3889,67 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         paro_gate_up,
         paro_down,
         down_awq_scale,
-        routed_out,
+        // Fuse: the grouped combine accumulates into the zeroed y_moe temp
+        // (the `+=` combine needs a zero base) instead of x_batch; the norm
+        // tail below joins it to the residual. EP+Fuse is rejected above.
+        routed_out: if is_fuse {
+            let y_moe = y_moe_t.as_ref().expect("fuse temp");
+            let bytes = n * dim * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y_moe.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y_moe.buf, 0, bytes)?;
+            }
+            Some(y_moe)
+        } else {
+            routed_out
+        },
     };
     hipfire_runtime::llama::moe_family()
         .run_prefill(ctx, gpu, &moe_prefill_params)
         .map_err(HipError::from)?;
 
+    // Fuse tail: y_moe = RMSNorm(routed, moe_norm) * scale (RMSNorm skipped
+    // for uniform bakes — same policy as decode), then x_batch += y_moe.
+    if is_fuse {
+        let y_moe = y_moe_t.as_ref().expect("fuse temp");
+        let moe_norm = ffn.moe_norm.as_ref().expect("is_fuse implies moe_norm");
+        if !fuse_moe_norm_skip_rmsnorm(config, ffn.moe_norm_skip_rmsnorm) {
+            gpu.rmsnorm_batched(y_moe, moe_norm, y_moe, n, dim, config.norm_eps)?;
+        }
+        let scale = config.moe_norm_scale;
+        if (scale - 1.0).abs() > 1e-6 {
+            gpu.scale_f32(y_moe, scale)?;
+        }
+        let x_rows = pbs.x_batch.sub_offset(0, n * dim);
+        // x_batch = host_hidden + y_moe (decode overwrites its residual the
+        // same way: x = host_hidden + y_moe with host_hidden = x + y_shared —
+        // the shared contribution must reach x_batch here, not just the
+        // routing buffers).
+        let host_hidden = host_hidden_t.as_ref().expect("fuse temp");
+        gpu.add_f32(host_hidden, y_moe, &x_rows)?;
+        free_fuse_temps(gpu, y_shared_t, host_hidden_t, y_moe_t)?;
+    }
+
+    Ok(())
+}
+
+/// Free the Fuse prefill `[n × dim]` temps (all `None` off the Fuse path).
+fn free_fuse_temps(
+    gpu: &mut Gpu,
+    y_shared: Option<GpuTensor>,
+    host_hidden: Option<GpuTensor>,
+    y_moe: Option<GpuTensor>,
+) -> HipResult<()> {
+    if let Some(t) = y_shared {
+        gpu.free_tensor(t)?;
+    }
+    if let Some(t) = host_hidden {
+        gpu.free_tensor(t)?;
+    }
+    if let Some(t) = y_moe {
+        gpu.free_tensor(t)?;
+    }
     Ok(())
 }
 

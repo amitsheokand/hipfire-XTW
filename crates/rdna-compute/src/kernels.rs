@@ -1995,6 +1995,11 @@ pub const MOE_ROUTER_SQRTSOFTPLUS_SRC: &str =
 pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_topk_renorm_k8_batched.hip");
 
+/// Batched companion of MOE_TOPK_RENORM_K2_SRC for k=2 prefill routing.
+/// Same per-block algorithm; one workgroup per token row.
+pub const MOE_TOPK_RENORM_K2_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_topk_renorm_k2_batched.hip");
+
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an
 /// expert-pointers table. hipGraph-capture-safe replacement for the
