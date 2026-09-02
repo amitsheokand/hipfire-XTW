@@ -654,7 +654,10 @@ pub(crate) fn run_gguf_pipeline(
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
         let (data, quant_type, group_size, label) = if is_norm || !is_2d || is_conv {
-            // Norms and 1D tensors always F16 (primary gate)
+            // Norms and 1D tensors always F16. Qwen3.5 GemmaRMSNorm is already
+            // baked as (1+w) in llama.cpp GGUF (`convert_hf_to_gguf.py`); the
+            // qwen35 loader skips its safetensors-path +1.0 when source=gguf.
+            // Do not subtract 1.0 here or load-time skip would under-scale.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
                 .iter()

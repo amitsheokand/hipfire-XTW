@@ -53,13 +53,42 @@ use hipfire_runtime::weight_backend::ParoBackend;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
-/// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
-/// and both final-norm paths so the four former hardcoded `1.0` sites cannot drift apart.
+/// qwen2/llama use `0.0`. Safetensors/HFQ stores raw Gemma `w`; load bakes `+1.0`.
+/// GGUF already has llama.cpp's conversion-time bake (`data_torch + 1`), so a
+/// GGUF→HFQ file must skip the second `+1.0` or every Gemma RMSNorm doubles.
 const QWEN35_NORM_BIAS: f32 = 1.0;
 
 const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
+
+fn hfq_source_is_gguf(metadata_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|v| {
+            v.get("source")
+                .and_then(|s| s.as_str())
+                .map(|s| s == "gguf")
+        })
+        .unwrap_or(false)
+}
+
+fn qwen35_norm_bias_for_hfq(hfq: &HfqFile) -> f32 {
+    if hfq_source_is_gguf(&hfq.metadata_json) {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[hipfire] GGUF-sourced Qwen3.5 HFQ: GemmaRMSNorm already baked \
+                 (+1 at llama.cpp convert); skipping load-time +1.0"
+            );
+        }
+        0.0
+    } else {
+        QWEN35_NORM_BIAS
+    }
+}
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
@@ -130,7 +159,13 @@ fn load_norm_weight(
 ) -> HipResult<GpuTensor> {
     let (info, data) =
         qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
-    dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
+    dequant_norm(
+        gpu,
+        info.quant_type,
+        &data,
+        shape,
+        qwen35_norm_bias_for_hfq(hfq),
+    )
 }
 
 fn load_weight_tensor_raw(
@@ -2693,13 +2728,14 @@ impl WeightSource for ParoSource<'_> {
     }
 }
 
-/// Construct an `HfqBackend` with qwen35's defaults baked in: `QWEN35_NORM_BIAS`,
+/// Construct an `HfqBackend` with qwen35's defaults baked in: GemmaRMSNorm
+/// bias (skipped for GGUF-sourced HFQ — llama.cpp already baked `+1`),
 /// the qwen35 tensor-name resolver, and the standard pread+awq weight reader.
 fn qwen35_hfq_backend<'a>(hfq: &'a HfqFile, gpu: &'a mut Gpu, layer: usize) -> HfqBackend<'a> {
     HfqBackend {
         hfq,
         gpu,
-        norm_bias: QWEN35_NORM_BIAS,
+        norm_bias: qwen35_norm_bias_for_hfq(hfq),
         candidates: qwen35_tensor_name_candidates,
         read_proj: load_weight_tensor,
         layer,
@@ -4920,4 +4956,18 @@ pub(crate) fn load_moe_ffn(
         global_expert_dtypes: None,
         ep_dummy_buffers,
     })
+}
+
+#[cfg(test)]
+mod gguf_norm_bias_tests {
+    use super::{hfq_source_is_gguf, QWEN35_NORM_BIAS};
+
+    #[test]
+    fn gguf_source_skips_gemma_bake() {
+        assert!(hfq_source_is_gguf(r#"{"source":"gguf","config":{}}"#));
+        assert!(!hfq_source_is_gguf(r#"{"source":"safetensors","config":{}}"#));
+        assert!(!hfq_source_is_gguf("{}"));
+        assert!(!hfq_source_is_gguf("not json"));
+        assert_eq!(QWEN35_NORM_BIAS, 1.0);
+    }
 }
