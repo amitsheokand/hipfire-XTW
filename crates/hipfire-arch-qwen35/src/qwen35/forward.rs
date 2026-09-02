@@ -99,6 +99,29 @@ fn fuse_shared_only() -> bool {
     })
 }
 
+fn fuse_moe_norm_scale() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FUSE_MOE_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|x: &f32| x.is_finite() && *x >= 0.0)
+            .unwrap_or(FUSE4_MOE_NORM_SCALE)
+    })
+}
+
+/// Diagnostic: skip `ffn_moe_norm` RMSNorm; still scale `y_moe` (default 0.018421).
+/// Isolates RMSNorm amplification of a near-zero expert residual.
+fn fuse_skip_moe_norm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FUSE_SKIP_MOE_NORM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 /// Diagnostic: leave the attn residual unchanged (no shared/routed FFN).
 fn fuse_skip_ffn() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -947,8 +970,29 @@ fn moe_ffn_decode_fuse(
         .map_err(HipError::from)?;
 
     if let Some(moe_norm) = &ffn.moe_norm {
-        gpu.rmsnorm_f32(&y_moe, moe_norm, &y_moe, config.norm_eps)?;
-        gpu.scale_f32(&y_moe, FUSE4_MOE_NORM_SCALE)?;
+        if hipfire_config::developer_var("HIPFIRE_FUSE_DEBUG")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                if let Ok(y) = gpu.download_f32(&y_moe) {
+                    let mean_sq = y.iter().map(|v| v * v).sum::<f32>() / y.len() as f32;
+                    let max_abs = y.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                    eprintln!(
+                        "[fuse-debug] layer {} y_moe pre-norm rms={:.5} maxabs={:.5}",
+                        ffn.layer_idx,
+                        mean_sq.sqrt(),
+                        max_abs
+                    );
+                }
+            }
+        }
+        if !fuse_skip_moe_norm() {
+            gpu.rmsnorm_f32(&y_moe, moe_norm, &y_moe, config.norm_eps)?;
+        }
+        gpu.scale_f32(&y_moe, fuse_moe_norm_scale())?;
     }
     gpu.add_f32(&host_hidden, &y_moe, x_residual)?;
 

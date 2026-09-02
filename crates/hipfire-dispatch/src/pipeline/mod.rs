@@ -1869,7 +1869,22 @@ fn run_moe_decode_cpu_fallback(
     // For k != 8 (no current production model) we fall back to the original
     // [n_exp] D2H path — that case cannot reach a graph capture site anyway
     // because `use_gpu_topk` requires `k == 8`.
-    hip!(gpu.softmax_f32(p.router_logits))?;
+    //
+    // Fuse4 original routing is `sqrt(softplus(logits - 2))` with L1-renorm,
+    // not softmax. The GGUF llama.cpp patch used softmax as an approximation.
+    // `HIPFIRE_FUSE_SQRTSOFTPLUS=1` restores the original gate on the k!=8
+    // CPU-top-K path (Fuse is k=2; A3B k=8 never lands here).
+    let fuse_sqrtsoftplus = hipfire_config::developer_var("HIPFIRE_FUSE_SQRTSOFTPLUS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let fuse_debug = hipfire_config::developer_var("HIPFIRE_FUSE_DEBUG")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if !fuse_sqrtsoftplus {
+        hip!(gpu.softmax_f32(p.router_logits))?;
+    }
     let (topk_indices, topk_weights): (Vec<usize>, Vec<f32>) = if k == 8 {
         hip!(gpu.moe_topk_renorm_k8(
             p.router_logits,
@@ -1889,7 +1904,18 @@ fn run_moe_decode_cpu_fallback(
         (idx_usize, wts)
     } else {
         // Original [n_exp] D2H path for non-k8 models (not capture-eligible).
-        let probs = hip!(gpu.download_f32(p.router_logits))?;
+        let mut probs = hip!(gpu.download_f32(p.router_logits))?;
+        if fuse_sqrtsoftplus {
+            for p in &mut probs {
+                let x = *p - 2.0;
+                let sp = if x > 0.0 {
+                    x + (1.0 + (-x).exp()).ln()
+                } else {
+                    (1.0 + x.exp()).ln()
+                };
+                *p = sp.sqrt();
+            }
+        }
         let mut indices: Vec<usize> = (0..n_exp).collect();
         indices.select_nth_unstable_by(k - 1, |&a, &b| {
             probs[b]
@@ -1909,6 +1935,16 @@ fn run_moe_decode_cpu_fallback(
                 for w in wts.iter_mut() {
                     *w /= sum;
                 }
+            }
+        }
+        if fuse_debug {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                eprintln!(
+                    "[fuse-debug] layer {} k={} topk={:?} w={:?} ssp={}",
+                    p.layer_idx, k, sel, wts, fuse_sqrtsoftplus
+                );
             }
         }
         (sel, wts)
