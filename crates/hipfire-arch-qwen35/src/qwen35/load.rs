@@ -4805,8 +4805,11 @@ pub(crate) fn load_moe_ffn(
         config.dim,
         qwen35_tensor_name_candidates,
     )?;
-    // Fuse4 optional moe_norm (RMSNorm after routed experts)
-    let mut moe_norm_skip_rmsnorm = false;
+    // Fuse4 optional moe_norm (RMSNorm after routed experts). The file
+    // header (`moe_norm_skip_rmsnorm`, stamped by the quantizer for
+    // Fuse-family GGUFs) is authoritative; the per-layer uniformity scan
+    // below stays as fallback for pre-header artifacts and safetensors.
+    let mut moe_norm_skip_rmsnorm = config.moe_norm_skip_rmsnorm;
     let moe_norm = {
         let name = format!("{p}.mlp.moe_norm.weight");
         let candidates = qwen35_tensor_name_candidates(&name);

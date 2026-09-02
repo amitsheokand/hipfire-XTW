@@ -1861,7 +1861,7 @@ fn run_moe_decode_cpu_fallback(
         });
     }
 
-    // ── 1+2. softmax → top-K + renorm ─────────────────────────────────────────
+    // ── 1+2. gate activation → top-K + renorm ─────────────────────────────
     // For k==8 we use the same two GPU kernels as the fast path
     // (`softmax_f32` + `moe_topk_renorm_k8`) so this code is capture-safe
     // under hipGraph.  Only a tiny [k] D2H follows (32 bytes for A3B k=8)
@@ -1870,19 +1870,20 @@ fn run_moe_decode_cpu_fallback(
     // [n_exp] D2H path — that case cannot reach a graph capture site anyway
     // because `use_gpu_topk` requires `k == 8`.
     //
-    // Fuse4 original routing is `sqrt(softplus(logits - 2))` with L1-renorm,
-    // not softmax. The GGUF llama.cpp patch used softmax as an approximation.
-    // `HIPFIRE_FUSE_SQRTSOFTPLUS=1` restores the original gate on the k!=8
-    // CPU-top-K path (Fuse is k=2; A3B k=8 never lands here).
-    let fuse_sqrtsoftplus = hipfire_config::developer_var("HIPFIRE_FUSE_SQRTSOFTPLUS")
-        .ok()
-        .as_deref()
-        == Some("1");
+    // The gate activation is first-class model metadata (`MoeParams::
+    // router_activation`, stamped by the quantizer from the source GGUF):
+    // Fuse4's original routing is `sqrt(softplus(logits - 2))` with L1-renorm,
+    // not softmax (the GGUF llama.cpp patch used softmax as an approximation).
+    // Softmax models (A3B k=8 and friends) never land here.
+    let sqrtsoftplus = matches!(
+        p.router_activation,
+        crate::families::moe::RouterActivation::SqrtSoftplus
+    );
     let fuse_debug = hipfire_config::developer_var("HIPFIRE_FUSE_DEBUG")
         .ok()
         .as_deref()
         == Some("1");
-    if !fuse_sqrtsoftplus {
+    if !sqrtsoftplus {
         hip!(gpu.softmax_f32(p.router_logits))?;
     }
     let (topk_indices, topk_weights): (Vec<usize>, Vec<f32>) = if k == 8 {
@@ -1905,7 +1906,7 @@ fn run_moe_decode_cpu_fallback(
     } else {
         // Original [n_exp] D2H path for non-k8 models (not capture-eligible).
         let mut probs = hip!(gpu.download_f32(p.router_logits))?;
-        if fuse_sqrtsoftplus {
+        if sqrtsoftplus {
             for p in &mut probs {
                 let x = *p - 2.0;
                 let sp = if x > 0.0 {
@@ -1943,7 +1944,7 @@ fn run_moe_decode_cpu_fallback(
             if n < 8 {
                 eprintln!(
                     "[fuse-debug] layer {} k={} topk={:?} w={:?} ssp={}",
-                    p.layer_idx, k, sel, wts, fuse_sqrtsoftplus
+                    p.layer_idx, k, sel, wts, sqrtsoftplus
                 );
             }
         }

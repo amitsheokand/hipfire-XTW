@@ -384,6 +384,36 @@ impl MoeResolution {
 
 // ── Dispatch parameters ────────────────────────────────
 
+/// Router gate activation producing the per-expert scores that top-K
+/// selection + renorm consume. First-class model metadata (GGUF header /
+/// HF config `router_activation`), NOT an env toggle.
+///
+/// - `Softmax`: Qwen convention (A3B and friends). Scores = softmax(logits).
+/// - `SqrtSoftplus`: Fuse4 original gate — scores = sqrt(softplus(logits - 2))
+///   with L1 renorm, NOT softmax. The GGUF llama.cpp convert patch baked a
+///   softmax approximation; the runtime restores the original gate from this
+///   flag on every routing path (decode CPU fallback today, GPU top-K and
+///   batched prefill as k=2 paths land).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterActivation {
+    Softmax,
+    SqrtSoftplus,
+}
+
+impl RouterActivation {
+    /// Parse a header/config string. Unknown/absent ⇒ `Softmax` (the Qwen
+    /// default), so pre-header artifacts and A3B-family configs behave exactly
+    /// as before. Never panics — load-time parsing must be total.
+    pub fn from_header_str(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "sqrtsoftplus" || v == "sqrt_softplus" || v == "ssp" => {
+                Self::SqrtSoftplus
+            }
+            _ => Self::Softmax,
+        }
+    }
+}
+
 /// Everything the MoE decode executor arm reads, marshaled by the model from
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
@@ -400,6 +430,10 @@ pub struct MoeParams<'a> {
     pub k: usize,
     pub n_exp: usize,
     pub norm_topk_prob: bool,
+    /// Router gate activation (first-class model metadata — see
+    /// [`RouterActivation`]). The executor applies this BEFORE top-K on every
+    /// routing path; models that don't set it resolve to `Softmax`.
+    pub router_activation: RouterActivation,
     pub x_rot_prerotated: bool,
     /// Single-GPU lowered-decode experiment: leave the atomic-free routed
     /// output expanded so the architecture layer can combine it into the

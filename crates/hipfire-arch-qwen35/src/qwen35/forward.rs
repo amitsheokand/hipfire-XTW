@@ -85,8 +85,6 @@ use rdna_compute::GpuTensor;
 /// Non-owning borrow of the scratch buffers `moe_ffn_decode_impl` needs.
 /// Callers construct one of these from either a `Qwen35Scratch` (preallocated,
 /// hipGraph-capturable) or from tensors they own locally (heap path).
-/// Fuse4 `ffn_moe_norm` scale from the llama.cpp `build_layer_ffn_fuse4` patch.
-const FUSE4_MOE_NORM_SCALE: f32 = 0.018421;
 
 /// Diagnostic: skip routed experts + moe_norm; residual += y_shared only.
 fn fuse_shared_only() -> bool {
@@ -99,18 +97,8 @@ fn fuse_shared_only() -> bool {
     })
 }
 
-fn fuse_moe_norm_scale() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_FUSE_MOE_SCALE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|x: &f32| x.is_finite() && *x >= 0.0)
-            .unwrap_or(FUSE4_MOE_NORM_SCALE)
-    })
-}
-
-/// Diagnostic: skip `ffn_moe_norm` RMSNorm; still scale `y_moe` (default 0.018421).
+/// Diagnostic: skip `ffn_moe_norm` RMSNorm; still scale `y_moe`
+/// (model-config `moe_norm_scale`).
 /// Isolates RMSNorm amplification of a near-zero expert residual.
 fn fuse_skip_moe_norm() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -726,6 +714,7 @@ fn moe_ffn_decode_impl(
         k,
         n_exp,
         norm_topk_prob: config.norm_topk_prob,
+        router_activation: config.router_activation,
         x_rot_prerotated,
         defer_routed_combine,
         layer_idx: ffn.layer_idx,
@@ -939,6 +928,7 @@ fn moe_ffn_decode_fuse(
         k: config.num_experts_per_tok,
         n_exp: config.num_experts,
         norm_topk_prob: config.norm_topk_prob,
+        router_activation: config.router_activation,
         x_rot_prerotated: false,
         defer_routed_combine: false,
         layer_idx: ffn.layer_idx,
@@ -981,12 +971,17 @@ fn moe_ffn_decode_fuse(
         .map_err(HipError::from)?;
 
     if let Some(moe_norm) = &ffn.moe_norm {
-        let skip_rmsnorm = fuse_skip_moe_norm()
+        // Skip sources (OR): file header truth (`config`, stamped by the
+        // quantizer for Fuse-family GGUFs) → load-time per-layer uniformity
+        // scan (`ffn`, fallback for pre-header artifacts) → diag env.
+        // `fuse_force_moe_norm` restores llama.cpp RMSNorm for diagnosis.
+        let skip_rmsnorm = config.moe_norm_skip_rmsnorm
+            || fuse_skip_moe_norm()
             || (ffn.moe_norm_skip_rmsnorm && !fuse_force_moe_norm());
         if !skip_rmsnorm {
             gpu.rmsnorm_f32(&y_moe, moe_norm, &y_moe, config.norm_eps)?;
         }
-        let scale = fuse_moe_norm_scale();
+        let scale = config.moe_norm_scale;
         if (scale - 1.0f32).abs() > 1e-6 {
             gpu.scale_f32(&y_moe, scale)?;
         }

@@ -1106,6 +1106,44 @@ fn apply_qwen35moe_fields(
             }
         }
     }
+    // Fuse4 MoE routing/norm metadata (first-class `Qwen35Config` fields, not
+    // env). Fuse-family GGUFs route k=2 experts with sqrt(softplus(x-2)) (NOT
+    // softmax), post-norm routed output with `ffn_moe_norm` at the llama.cpp
+    // 0.018421 scale, and ship `ffn_moe_norm` as a uniform ones+1 bake (skip
+    // its RMSNorm). A3B-family qwen35moe GGUFs (k=8, no moe_norm) keep the
+    // Qwen defaults and are untouched.
+    //
+    // Detection: k=2 (`expert_used_count`) AND `ffn_moe_norm` tensors present.
+    // Keys are mirrored into `text_config` (the runtime parses the inner blob
+    // when the VL wrapper is present, which it is for these GGUFs).
+    let expert_used = read_u(&format!("{prefix}.expert_used_count"));
+    let has_moe_norm = gguf
+        .tensors
+        .iter()
+        .any(|t| t.name.contains("moe_norm"));
+    if expert_used == Some(2) && has_moe_norm {
+        eprintln!(
+            "[hipfire-quantize] Fuse4 MoE detected (k=2 + ffn_moe_norm): \
+             stamping router_activation=sqrtsoftplus, moe_norm_scale=0.018421, \
+             moe_norm_skip_rmsnorm=true"
+        );
+        for (k, v) in [
+            (
+                "router_activation",
+                serde_json::Value::String("sqrtsoftplus".to_string()),
+            ),
+            (
+                "moe_norm_scale",
+                serde_json::Value::from(0.018421f64),
+            ),
+            ("moe_norm_skip_rmsnorm", serde_json::Value::Bool(true)),
+        ] {
+            cfg.insert(k.to_string(), v.clone());
+            if let Some(tc) = cfg.get_mut("text_config").and_then(|v| v.as_object_mut()) {
+                tc.insert(k.to_string(), v);
+            }
+        }
+    }
 }
 
 /// Translate gemma4-specific GGUF metadata into the `text_config` fields the

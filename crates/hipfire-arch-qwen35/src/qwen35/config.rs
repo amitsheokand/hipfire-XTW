@@ -143,6 +143,16 @@ pub struct Qwen35Config {
     /// softmax + top-K selection. Qwen convention (matches HF
     /// `modeling_qwen3_5_moe.py`). DeepSeek-v1 uses false.
     pub norm_topk_prob: bool,
+    /// Router gate activation (first-class model metadata — stamped by the
+    /// quantizer for Fuse-family GGUFs, `"softmax"` default). Threaded into
+    /// every MoE routing path via `MoeParams::router_activation`.
+    pub router_activation: hipfire_dispatch::families::moe::RouterActivation,
+    /// Post-routed-expert norm scale (`ffn_moe_norm` llama.cpp scale for
+    /// Fuse4; 1.0 identity otherwise). Replaces `HIPFIRE_FUSE_MOE_SCALE`.
+    pub moe_norm_scale: f32,
+    /// `ffn_moe_norm` is a uniform bake: skip its RMSNorm (the loader's
+    /// per-layer uniformity scan ORs in as fallback for pre-header files).
+    pub moe_norm_skip_rmsnorm: bool,
 
     // Per-layer type dispatch
     pub layer_types: Vec<LayerType>,
@@ -814,6 +824,21 @@ struct RawQwen35Config {
     // for Qwen3.5-MoE / A3B to match the HF reference.
     #[serde(default = "default_norm_topk")]
     norm_topk_prob: bool,
+    /// Router gate activation producing top-K scores. `"softmax"` (Qwen
+    /// convention, the default) or `"sqrtsoftplus"` (Fuse4 original gate).
+    /// Stamped by the quantizer for Fuse-family GGUFs; absent ⇒ softmax.
+    #[serde(default)]
+    router_activation: Option<String>,
+    /// Post-routed-expert norm scale (Fuse4 `ffn_moe_norm` llama.cpp scale).
+    /// Absent ⇒ 1.0 (identity). Fuse-family GGUFs stamp 0.018421.
+    #[serde(default)]
+    moe_norm_scale: Option<f32>,
+    /// `ffn_moe_norm` is a uniform ones+1 bake, not a learned gamma: skip
+    /// the RMSNorm (still apply `moe_norm_scale`). Stamped by the quantizer
+    /// for Fuse-family GGUFs; the loader's per-layer uniformity scan remains
+    /// as fallback for pre-header artifacts. Absent ⇒ false.
+    #[serde(default)]
+    moe_norm_skip_rmsnorm: bool,
 }
 
 fn default_norm_eps() -> f32 {
@@ -932,6 +957,12 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         shared_expert_intermediate_size: raw.shared_expert_intermediate_size,
         has_shared_expert,
         norm_topk_prob: raw.norm_topk_prob,
+        router_activation:
+            hipfire_dispatch::families::moe::RouterActivation::from_header_str(
+                raw.router_activation.as_deref(),
+            ),
+        moe_norm_scale: raw.moe_norm_scale.unwrap_or(1.0),
+        moe_norm_skip_rmsnorm: raw.moe_norm_skip_rmsnorm,
         // MAD-93 v0.1: defaults off; runtime opts in (e.g. via CLI flag in
         // a follow-up commit). When false, no behavior change vs main.
         paged_experts: false,
@@ -1176,6 +1207,56 @@ mod tests {
         assert!(cfg.norm_topk_prob);
         // layer_types absent → all FullAttention, length n_layers.
         assert_eq!(cfg.layer_types, vec![LayerType::FullAttention; 2]);
+    }
+
+    #[test]
+    fn fuse_moe_metadata_parsed() {
+        // Fuse-family headers stamp router_activation / moe_norm_scale /
+        // moe_norm_skip_rmsnorm (quantizer, from source GGUF). Absent keys
+        // keep Qwen defaults (softmax, identity scale, run the RMSNorm).
+        let inner = serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000,
+            "router_activation": "sqrtsoftplus",
+            "moe_norm_scale": 0.018421,
+            "moe_norm_skip_rmsnorm": true
+        });
+        let cfg = from_config_value(&inner).expect("fuse header parse");
+        assert_eq!(
+            cfg.router_activation,
+            hipfire_dispatch::families::moe::RouterActivation::SqrtSoftplus
+        );
+        assert!((cfg.moe_norm_scale - 0.018421).abs() < 1e-6);
+        assert!(cfg.moe_norm_skip_rmsnorm);
+
+        let plain = serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000
+        });
+        let cfg = from_config_value(&plain).expect("plain parse");
+        assert_eq!(
+            cfg.router_activation,
+            hipfire_dispatch::families::moe::RouterActivation::Softmax
+        );
+        assert_eq!(cfg.moe_norm_scale, 1.0);
+        assert!(!cfg.moe_norm_skip_rmsnorm);
+        // Unknown activation strings fail closed to softmax, never error.
+        let weird = serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "vocab_size": 1000,
+            "router_activation": "gelu"
+        });
+        let cfg = from_config_value(&weird).expect("unknown activation parse");
+        assert_eq!(
+            cfg.router_activation,
+            hipfire_dispatch::families::moe::RouterActivation::Softmax
+        );
     }
 
     #[test]
