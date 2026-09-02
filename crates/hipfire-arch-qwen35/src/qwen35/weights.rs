@@ -246,6 +246,11 @@ pub struct MoeFfnWeights {
     /// Fuse4 MoE norm after routed experts: `mlp.moe_norm.weight [hidden]`.
     /// `None` for standard A3B / dense. Stored as F16/F32 GpuTensor.
     pub moe_norm: Option<GpuTensor>,
+    /// Fuse GGUF pads originally-dense host layers (0–2, 27–31 on Fuse-2)
+    /// with an all-zero `ffn_gate_inp`. Softmax of those logits is uniform,
+    /// so top-2 would fire untrained experts. When true, run shared SwiGLU
+    /// only (same residual as `HIPFIRE_FUSE_SHARED_ONLY` on that layer).
+    pub router_dead: bool,
     /// Device-side array of `unsigned long long` pointers, one per
     /// expert's `gate_up.buf`. Indexed at runtime by the GPU top-K
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
@@ -1043,6 +1048,7 @@ impl PendingEpMoeFfn {
             shared_expert,
             shared_expert_gate: shared_gate_scalar,
             moe_norm: None,
+            router_dead: false,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
             expert_down_awq_ptrs: awq_ptrs,

@@ -832,6 +832,20 @@ pub(crate) fn config_json_from_gguf(
     serde_json::Value::Object(cfg)
 }
 
+/// llama.cpp convert writes `rope.freq_base=10000` when HF `rope_theta` is
+/// omitted. Official Qwen3.5 hosts use 1e7; keep any other GGUF value as-is.
+fn qwen35_host_rope_theta_from_gguf(freq: f64) -> f64 {
+    if (freq - 10_000.0).abs() < 0.5 {
+        eprintln!(
+            "[hipfire-quantize] GGUF qwen35moe rope.freq_base={freq} looks like \
+             llama.cpp convert default; stamping Qwen3.5 host theta 10000000"
+        );
+        10_000_000.0
+    } else {
+        freq
+    }
+}
+
 fn apply_qwen35moe_fields(
     gguf: &gguf_input::GgufFile,
     prefix: &str,
@@ -892,12 +906,11 @@ fn apply_qwen35moe_fields(
     if let Some(v) = read_u(&format!("{prefix}.ssm.time_step_rank")) {
         cfg.insert("linear_time_step_rank".to_string(), serde_json::Value::from(v));
     }
-    // mrope for Fuse VL text wrapper — hipfire's Qwen35Config uses these for
-    // the VL text path (is_vl_text + mrope_section). Fuse carries the same
-    // qwen35moe.rope.* fields as the VL models. Config::from_hfq derives
-    // is_vl_text from text_config+vision_config, not is_vl_text, so we must
-    // set those wrappers. Q 8192 = 2* n_heads*head_dim (16*256*2) is the VL
-    // doubled-Q for mrope, handled by the loader when is_vl_text is true.
+    // mrope_section for Qwen3.5 IMRoPE. Fuse GGUFs carry the same
+    // qwen35moe.rope.* fields as the VL text models. Config::from_hfq
+    // derives is_vl_text from text_config+vision_config, so we still wrap
+    // those nodes for section/interleave flags. Q 8192 is gated attention
+    // (n_heads * head_dim * 2), not a VL doubled-Q.
     if let Some(v) = gguf.metadata.get(&format!("{prefix}.rope.dimension_sections")) {
         if let crate::gguf_input::MetaValue::Array(arr) = v {
             let secs: Vec<u64> = arr
@@ -923,9 +936,13 @@ fn apply_qwen35moe_fields(
                 rope_params.insert("mrope_interleaved".to_string(), serde_json::Value::Bool(true));
                 if let Some(freq) = gguf.metadata.get(&format!("{prefix}.rope.freq_base")).and_then(|v| match v {
                     crate::gguf_input::MetaValue::F32(f) => Some(*f as f64),
+                    crate::gguf_input::MetaValue::F64(f) => Some(*f),
                     _ => None,
                 }) {
-                    rope_params.insert("rope_theta".to_string(), serde_json::Value::from(freq));
+                    rope_params.insert(
+                        "rope_theta".to_string(),
+                        serde_json::Value::from(qwen35_host_rope_theta_from_gguf(freq)),
+                    );
                 }
                 if let Some(cnt) = read_u(&format!("{prefix}.rope.dimension_count")) {
                     let head_dim = cfg.get("head_dim").and_then(|x| x.as_u64()).unwrap_or(256);
@@ -954,8 +971,16 @@ fn apply_qwen35moe_fields(
             }
         }
         if let Some(v) = gguf.metadata.get(&format!("{prefix}.rope.freq_base")) {
-            if let crate::gguf_input::MetaValue::F32(f) = v {
-                cfg.insert("rope_theta".to_string(), serde_json::Value::from(*f as f64));
+            let freq = match v {
+                crate::gguf_input::MetaValue::F32(f) => Some(*f as f64),
+                crate::gguf_input::MetaValue::F64(f) => Some(*f),
+                _ => None,
+            };
+            if let Some(freq) = freq {
+                cfg.insert(
+                    "rope_theta".to_string(),
+                    serde_json::Value::from(qwen35_host_rope_theta_from_gguf(freq)),
+                );
             }
         }
     }
@@ -1668,6 +1693,21 @@ mod gemma4_name_translation_tests {
         assert_eq!(
             gguf_to_safetensors_name("blk.2.layer_output_scale.weight", 13).unwrap(),
             "model.layers.2.layer_scalar"
+        );
+    }
+}
+
+#[cfg(test)]
+mod qwen35_gguf_rope_tests {
+    #[test]
+    fn llama_cpp_default_freq_base_becomes_host_theta() {
+        assert_eq!(
+            super::qwen35_host_rope_theta_from_gguf(10_000.0),
+            10_000_000.0
+        );
+        assert_eq!(
+            super::qwen35_host_rope_theta_from_gguf(10_000_000.0),
+            10_000_000.0
         );
     }
 }

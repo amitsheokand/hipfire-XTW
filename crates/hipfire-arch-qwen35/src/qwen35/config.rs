@@ -982,6 +982,43 @@ pub fn apply_reap_plan(config: &mut Qwen35Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Official Qwen3.5 host RoPE theta (`Qwen/Qwen3.5-4B` `rope_parameters.rope_theta`).
+const QWEN35_HOST_ROPE_THETA: f32 = 10_000_000.0;
+/// llama.cpp convert default when the exporter omits HF `rope_theta`.
+const LLAMA_CPP_DEFAULT_ROPE_THETA: f32 = 10_000.0;
+
+/// Rewrite GGUF-sourced Qwen3.5 RoPE theta when the file carries llama.cpp's
+/// 10000 default instead of the 4B-host 1e7. A 1000× undershoot scrambles
+/// full-attention even on a 6-token prompt (mid-frequency pairs already
+/// diverge by ~1 rad at pos=5).
+///
+/// `HIPFIRE_ROPE_THETA=<f32>` overrides any source (A/B / forensic).
+fn apply_qwen35_rope_theta_overrides(meta: &serde_json::Value, cfg: &mut Qwen35Config) {
+    if let Ok(raw) = hipfire_config::developer_var("HIPFIRE_ROPE_THETA") {
+        if let Ok(v) = raw.parse::<f32>() {
+            if v.is_finite() && v > 0.0 {
+                eprintln!(
+                    "[hipfire] HIPFIRE_ROPE_THETA={v} overriding rope_theta {} → {v}",
+                    cfg.rope_theta
+                );
+                cfg.rope_theta = v;
+                return;
+            }
+        }
+    }
+    let is_gguf = meta.get("source").and_then(|s| s.as_str()) == Some("gguf");
+    let looks_like_convert_default =
+        (cfg.rope_theta - LLAMA_CPP_DEFAULT_ROPE_THETA).abs() < 0.5;
+    let looks_like_qwen35_partial = (cfg.partial_rotary_factor - 0.25).abs() < 1e-5;
+    if is_gguf && looks_like_convert_default && looks_like_qwen35_partial {
+        eprintln!(
+            "[hipfire] GGUF qwen35 rope.freq_base=10000 looks like llama.cpp \
+             convert default; using Qwen3.5 host theta {QWEN35_HOST_ROPE_THETA}"
+        );
+        cfg.rope_theta = QWEN35_HOST_ROPE_THETA;
+    }
+}
+
 /// Inner parser, decoupled from `HfqFile` / `ModelSource` for unit testability.
 ///
 /// Parses the metadata JSON string, unwraps the `{config}` envelope both
@@ -991,7 +1028,9 @@ pub fn apply_reap_plan(config: &mut Qwen35Config) -> Result<(), String> {
 pub fn config_from_metadata_json(metadata_json: &str) -> Result<Qwen35Config, String> {
     let meta: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|e| format!("qwen35: metadata_json not valid JSON: {e}"))?;
-    from_config_value(meta.get("config").ok_or("qwen35: missing config")?)
+    let mut cfg = from_config_value(meta.get("config").ok_or("qwen35: missing config")?)?;
+    apply_qwen35_rope_theta_overrides(&meta, &mut cfg);
+    Ok(cfg)
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Result<Qwen35Config, String> {
@@ -1257,6 +1296,53 @@ mod tests {
         let cfg = from_config_value(&inner).expect("parse");
         // slot 0 ← 20, slot 1 non-u64 keeps default 11, slot 2 absent keeps 10.
         assert_eq!(cfg.mrope_section, [20, 11, 10]);
+    }
+
+    #[test]
+    fn gguf_llama_default_rope_theta_rewritten_to_qwen35_host() {
+        // Fuse-2 and similar qwen35moe GGUFs often ship llama.cpp's convert
+        // default (10000) instead of the Qwen3.5-4B host theta (1e7).
+        let env = serde_json::json!({
+            "source": "gguf",
+            "architecture": "qwen35moe",
+            "config": {
+                "hidden_size": 2560,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 16,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "rope_parameters": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 0.25
+                }
+            }
+        })
+        .to_string();
+        let cfg = config_from_metadata_json(&env).expect("gguf 10k rewrite");
+        assert_eq!(cfg.rope_theta, 10_000_000.0);
+    }
+
+    #[test]
+    fn safetensors_explicit_10k_theta_preserved() {
+        // Non-GGUF envelopes are trusted — do not rewrite an explicit 10k.
+        let env = serde_json::json!({
+            "source": "safetensors",
+            "architecture": "qwen35",
+            "config": {
+                "hidden_size": 2560,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 16,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "rope_parameters": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 0.25
+                }
+            }
+        })
+        .to_string();
+        let cfg = config_from_metadata_json(&env).expect("st 10k preserved");
+        assert_eq!(cfg.rope_theta, 10_000.0);
     }
 
     #[test]

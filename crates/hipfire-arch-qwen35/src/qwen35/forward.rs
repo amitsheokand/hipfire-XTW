@@ -99,6 +99,17 @@ fn fuse_shared_only() -> bool {
     })
 }
 
+/// Diagnostic: leave the attn residual unchanged (no shared/routed FFN).
+fn fuse_skip_ffn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FUSE_SKIP_FFN")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 struct MoeScratchRef<'a> {
     router_logits: &'a GpuTensor,
     scalar_buf: &'a GpuTensor,
@@ -838,7 +849,7 @@ fn moe_ffn_decode_fuse(
     )
     .map_err(HipError::from)?;
     gpu.add_f32(x_residual, &y_shared, &host_hidden)?;
-    if fuse_shared_only() {
+    if fuse_shared_only() || ffn.router_dead {
         gpu.add_f32(x_residual, &y_shared, x_residual)?;
         if let Some(t) = heap_y_shared {
             gpu.free_tensor(t)?;
@@ -3347,6 +3358,9 @@ fn moe_ffn_dispatch(
     // Fuse4 needs the unrotated post-FFN-norm activation as shared/routed
     // input. The prerotated residual path would feed x (not rmsnorm(x)).
     if ffn.moe_norm.is_some() {
+        if fuse_skip_ffn() {
+            return Ok(());
+        }
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
         let r = moe_ffn_decode_with_scratch(gpu, ffn, &s.tmp, x, config, s);
         r?;

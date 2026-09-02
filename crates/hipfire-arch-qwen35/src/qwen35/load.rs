@@ -151,6 +151,31 @@ fn qwen35_tensor_data_cow<'a>(
     None
 }
 
+/// Fuse-2 GGUF pads originally-dense host layers with a zero `ffn_gate_inp`.
+/// Q8 of those zeros is NOT an all-zero blob (repeated f16-scale + 0x81
+/// quants); every block is identical, so every expert row is the same and
+/// softmax is uniform. Treat that as a dead router.
+fn hfq_router_is_uniform_dead(hfq: &HfqFile, name: &str) -> bool {
+    let Some((info, data)) = qwen35_tensor_data_vec(hfq, name) else {
+        return false;
+    };
+    match info.quant_type {
+        3 => {
+            // Q8_0 / Q8F16: 2-byte scale + 32 i8
+            const GS: usize = 34;
+            data.len() >= GS && data.chunks_exact(GS).all(|c| c == &data[..GS])
+        }
+        1 => {
+            // F16
+            data.len() >= 2
+                && data.chunks_exact(2).all(|c| c == &data[..2])
+                && u16::from_le_bytes([data[0], data[1]]) == 0
+        }
+        2 => data.len() >= 4 && data.iter().all(|&b| b == 0),
+        _ => false,
+    }
+}
+
 fn load_norm_weight(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1459,6 +1484,7 @@ fn paro_load_moe_ffn(
         shared_expert,
         shared_expert_gate,
         moe_norm: None,
+        router_dead: false,
         expert_gate_up_ptrs,
         expert_down_ptrs,
         // ParoQuant routed experts use shared per-layer Givens sidecars, not
@@ -4939,6 +4965,14 @@ pub(crate) fn load_moe_ffn(
     } else {
         None
     };
+    let router_dead = moe_norm.is_some()
+        && hfq_router_is_uniform_dead(hfq, &format!("{p}.mlp.gate.weight"));
+    if router_dead {
+        eprintln!(
+            "[hipfire] Fuse layer {layer_idx}: zero router — skipping routed experts \
+             (GGUF dense-layer pad)"
+        );
+    }
     Ok(MoeFfnWeights {
         router,
         experts,
@@ -4946,6 +4980,7 @@ pub(crate) fn load_moe_ffn(
         shared_expert,
         shared_expert_gate,
         moe_norm,
+        router_dead,
         expert_gate_up_ptrs,
         expert_down_ptrs,
         expert_down_awq_ptrs,
