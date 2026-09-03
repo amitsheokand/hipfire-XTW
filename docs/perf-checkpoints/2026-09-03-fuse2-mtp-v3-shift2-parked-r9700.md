@@ -48,3 +48,22 @@ near-perfect head — a separate project, not a follow-up tweak.
 - Checkpoints: `mtp_fuse_v3/model_best.safetensors` (451 MB) +
   packed `fuse-2-moe-v3.mtp`
 - Commits: framer (`c9a633b0`), shift-2 trainer (`3a5e0b8c`)
+
+## Addendum: follow-up analysis (same day)
+
+- **A/B (same prompt/flags, noslots, max-tokens 128):** AR 116.4 tok/s
+  decode / 1433 prefill / ttft 27 ms vs MTP-v3 (tau 0.59) 63.7 / 771 /
+  51 ms. MTP is a 1.8× net loss at its best measured tau.
+- **Production flip: NO.** Fuse decodes 3.5× faster than qwen38 prod
+  (116 vs 33 tok/s) but chat quality blocks: same coding prompt →
+  qwen38 emits a full correct function (dflash tau 8.15), Fuse emits
+  one stub sentence then stops. Speed without following is not shippable.
+- **k>0 chain:** confirmed worthless today (steps 1–2 correct only when
+  step-0 was; chain feeds raw t_mtp_out never seen in training). Chained
+  fine-tuning (EAGLE active style) is the fix, but payoff is gated behind
+  verify economics (below) — parked, not next.
+- **Cheaper verify:** break-even needs tau ≈ 4.4 > K=3 max. Larger K
+  needs a near-perfect head first. Parked behind head quality.
+- **Shift-2 elsewhere:** deepseek4 (qwen38) loop uses the same EAGLE shape
+  (`mtp_last_hidden` + seed) and its head is consistent with it (tau 1.96
+  live) — no action. Lesson recorded for future head training.
