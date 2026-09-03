@@ -100,6 +100,27 @@ def check_keys(mtp):
 
 
 @torch.no_grad()
+def eval_chain_agreement(mtp, E, eval_files, device, chunk=128):
+    # Step-1-on-own-output agreement: the pilot metric for --chain-w.
+    # Feeds detached own mh as both hidden+embed (serve k>0 regime).
+    tot_agree = tot = 0
+    for base in eval_files:
+        hid = torch.from_numpy(np.load(base + ".hidden.npy")).to(device, torch.float32)
+        pe = torch.from_numpy(np.load(base + ".prevemb.npy")).to(device, torch.float32)
+        lab = torch.from_numpy(np.load(base + ".labels.npy")).to(device, torch.long)
+        pe_in, hid_in, lab_t = pe[1:], hid[:-1], lab[1:]
+        mh0 = mtp(pe_in.unsqueeze(0), hid_in.unsqueeze(0))[0].detach()
+        mh1 = mtp(mh0.unsqueeze(0), mh0.unsqueeze(0))[0]
+        for s in range(0, mh1.shape[0], chunk):
+            e = min(s + chunk, mh1.shape[0])
+            pred = (mh1[s:e] @ E.T).float().argmax(-1)
+            tot_agree += int((pred == lab_t[s:e]).sum())
+            tot += e - s
+        del hid, pe, lab, mh0, mh1
+    return tot_agree / max(1, tot)
+
+
+@torch.no_grad()
 def eval_agreement(mtp, E, eval_files, device, chunk=128):
     # EAGLE-shaped (shift-2) queries matching the serve draft loop: position t
     # feeds (E(ids[t+1]), H(ids[t])) and must predict labels[t+1]. The serve
@@ -170,6 +191,10 @@ def main():
     ap.add_argument("--init", default=None,
                     help="safetensors warm start (e.g. model_best from a prior run); "
                          "skips from-scratch init for fine-tune / on-policy rounds")
+    ap.add_argument("--chain-w", type=float, default=0.0,
+                    help="on-policy chain mix: loss = (1-w)*shift2 + w*step1-on-own-output. "
+                         "step-1 feeds detached own mh as both hidden+embed (what the "
+                         "serve k>0 chain does). 0 = pure teacher-forced (default).")
     ap.add_argument("--holdout", default="lru_cache_pep8_strict,humaneval_0_has_close_elements,agentic_user_multistep,trains-meet,tool_call_system")
     args = ap.parse_args()
     random.seed(args.seed)
@@ -263,6 +288,12 @@ def main():
         if not check_finite("fwd", step, base, mh=mh):
             break
         loss = chunked_ce_loss(mh, E, lab_t)
+        if args.chain_w > 0:
+            with torch.no_grad():
+                mh0 = mtp(pe_in.unsqueeze(0), hid_in.unsqueeze(0))[0].detach()
+            mh1 = mtp(mh0.unsqueeze(0), mh0.unsqueeze(0))[0]
+            loss = (1 - args.chain_w) * loss + args.chain_w * chunked_ce_loss(mh1, E, lab_t)
+            del mh1
         if not check_finite("loss", step, base, loss=loss):
             break
         opt.zero_grad()
@@ -294,10 +325,12 @@ def main():
         del mh
         if step % args.eval_every == 0 or step == args.steps - 1:
             ae = eval_agreement(mtp, E, eval_files, device)
+            ac = eval_chain_agreement(mtp, E, eval_files, device) if args.chain_w > 0 else 0.0
             hist.append((step + 1, ae))
             print(
                 f"{step:<5} lr={sched.get_last_lr()[0]:.2e} loss={losses[-1]:.4f} "
-                f"T={hid.shape[0]:<4} {dt:<7.1f}ms agree={100 * ae:.2f}% ({100 * (ae - a0):+.2f})",
+                f"T={hid.shape[0]:<4} {dt:<7.1f}ms agree={100 * ae:.2f}% ({100 * (ae - a0):+.2f})"
+                + (f" chain={100 * ac:.2f}%" if args.chain_w > 0 else ""),
                 flush=True,
             )
             # Periodic checkpoint: crash-safe, keep best by agreement.
