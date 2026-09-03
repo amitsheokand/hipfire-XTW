@@ -167,6 +167,9 @@ def main():
     ap.add_argument("--clip-norm", type=float, default=50.0)
     ap.add_argument("--constant-lr", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--init", default=None,
+                    help="safetensors warm start (e.g. model_best from a prior run); "
+                         "skips from-scratch init for fine-tune / on-policy rounds")
     ap.add_argument("--holdout", default="lru_cache_pep8_strict,humaneval_0_has_close_elements,agentic_user_multistep,trains-meet,tool_call_system")
     args = ap.parse_args()
     random.seed(args.seed)
@@ -201,18 +204,24 @@ def main():
     print("random init -> NaN factory; 450 MB head fits fine)...")
     cfg = build_head_config()
     mtp = Qwen35MtpBlock(cfg).to(device=device, dtype=torch.float32)
-    # EAGLE-standard init: fc to ZERO so early activations (and grads) stay
-    # small; the head grows out of uniform gradually instead of exploding.
-    # PLUS residual-scale init (GPT-2 style): attention-out + mlp-down at
-    # 0.1x so trunk outlier channels (hidden max ~60) cannot overflow the
-    # FP32 softmax through random weights in the first steps.
-    with torch.no_grad():
-        mtp.fc.weight.zero_()
-        for name, mod in mtp.named_modules():
-            if isinstance(mod, torch.nn.Linear) and any(
-                s in name for s in ("self_attn.o_proj", "mlp.down_proj")
-            ):
-                mod.weight.mul_(0.1)
+    if args.init:
+        from safetensors.torch import load_file as st_load
+        mtp.load_state_dict(st_load(args.init), strict=True)
+        print(f"  warm start from {args.init} (from-scratch init skipped)")
+    else:
+        # EAGLE-standard init: fc to ZERO so early activations (and grads) stay
+        # small; the head grows out of uniform gradually instead of exploding.
+        # PLUS residual-scale init (GPT-2 style): attention-out + mlp-down at
+        # 0.1x so trunk outlier channels (hidden max ~60) cannot overflow the
+        # FP32 softmax through random weights in the first steps.
+        # (Skipped entirely on --init warm start.)
+        with torch.no_grad():
+            mtp.fc.weight.zero_()
+            for name, mod in mtp.named_modules():
+                if isinstance(mod, torch.nn.Linear) and any(
+                    s in name for s in ("self_attn.o_proj", "mlp.down_proj")
+                ):
+                    mod.weight.mul_(0.1)
     n_train = sum(p.numel() for p in mtp.parameters())
     print(f"  trainable: {n_train:,} params")
     if not check_keys(mtp):
