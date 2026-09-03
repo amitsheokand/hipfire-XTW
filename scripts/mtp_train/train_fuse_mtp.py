@@ -231,7 +231,11 @@ def main():
     mtp = Qwen35MtpBlock(cfg).to(device=device, dtype=torch.float32)
     if args.init:
         from safetensors.torch import load_file as st_load
-        mtp.load_state_dict(st_load(args.init), strict=True)
+        raw = st_load(args.init)
+        # Checkpoints are saved with the mtp_extract `mtp.` prefix; the
+        # live module uses bare keys. Strip on load.
+        sd = {k[4:] if k.startswith("mtp.") else k: v for k, v in raw.items()}
+        mtp.load_state_dict(sd, strict=True)
         print(f"  warm start from {args.init} (from-scratch init skipped)")
     else:
         # EAGLE-standard init: fc to ZERO so early activations (and grads) stay
