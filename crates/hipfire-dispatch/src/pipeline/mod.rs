@@ -770,25 +770,33 @@ pub fn run_moe_decode(
                 },
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gemv.run(
-                ctx,
-                gpu,
-                &crate::families::gemv::GemvParams {
-                    w: &p.shared_expert_gate,
-                    x: xr,
-                    y: p.scalar_buf,
-                    variant: crate::types::GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            // skip_shared (Fuse routed call, EP rank>0): the shared-expert
+            // scalar gate is dead — the shared-down section below is skipped,
+            // so scalar_buf is never read. The router GEMV above still runs.
+            if !p.skip_shared {
+                gemv.run(
+                    ctx,
+                    gpu,
+                    &crate::families::gemv::GemvParams {
+                        w: &p.shared_expert_gate,
+                        x: xr,
+                        y: p.scalar_buf,
+                        variant: crate::types::GemvVariant::Prerotated,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
         } else {
             gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            // skip_shared: scalar_buf dead (shared-down skipped below).
+            if !p.skip_shared {
+                gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
         }
         // Shared-expert gate/up: on a graded file the all-MQ4 fused gate path
         // (fused_qkvza_hfq4g256 on the single rotated `xr`) doesn't apply because
@@ -809,7 +817,12 @@ pub fn run_moe_decode(
             // through to run_auto (the pre-2f38a16e gfx942 path that worked).
             && crate::types::KernelKey::dtype_arch_predicate(p.shared_gate_w.dtype).eval_arch(ctx)
             && crate::types::KernelKey::dtype_arch_predicate(p.shared_up_w.dtype).eval_arch(ctx);
-        if shared_prerot {
+        // skip_shared (Fuse routed call, EP rank>0): shared_gate/shared_up
+        // are dead — the shared-down section below is skipped and the Fuse
+        // path consumed the real shared projections before this call. Saves
+        // 2 full MQ GEMVs/layer (~24 MB traffic + ~47M MAC on Fuse dims).
+        if !p.skip_shared {
+            if shared_prerot {
             let xr = x_rot_local.expect("shared_prerot implies x_rot_local");
             gemv.run(
                 ctx,
@@ -844,6 +857,7 @@ pub fn run_moe_decode(
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
         }
     }
 
