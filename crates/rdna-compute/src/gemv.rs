@@ -7841,7 +7841,12 @@ impl Gpu {
             && *GFX1151_LM_HEAD_K2048.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_K2048").as_deref() == Ok("1")
             });
-        let use_wide = !gfx1151_lm_head_dot2
+        // NOTE: the `use_wide` MQ4V2 branch below references kernel symbol
+        // `gemv_mq4g256v2_wide`, which was never written (no such symbol in
+        // kernels/src) — R=1 died in hipModuleGetFunction/500. Disabled so
+        // R=1 takes the scalar single-row final-else (bit-exact reference).
+        let use_wide = false;
+        let _use_wide_was = !gfx1151_lm_head_dot2
             && !gfx1151_lm_head_r1_hybrid_buffer
             && !use_multirow
             && m >= 64
