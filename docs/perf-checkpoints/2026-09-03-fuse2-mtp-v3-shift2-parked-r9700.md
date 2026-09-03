@@ -67,3 +67,18 @@ near-perfect head — a separate project, not a follow-up tweak.
 - **Shift-2 elsewhere:** deepseek4 (qwen38) loop uses the same EAGLE shape
   (`mtp_last_hidden` + seed) and its head is consistent with it (tau 1.96
   live) — no action. Lesson recorded for future head training.
+
+## Addendum 2: chat-quality matrix kills the flip (same day)
+
+Three prompts, greedy + sampled (`--temp 0.7 --repeat-penalty 1.15`):
+
+| Prompt | Greedy | Sampled+penalty |
+|---|---|---|
+| Add-two-numbers | meta-chatter, stops at 28 tok | 53 tok, `def __add()` nonsense docstring |
+| Capital of France | attractor loop ("The capital of France is the capital…") | (not retested — structural) |
+| Photosynthesis | repetitive `**Answer:**` headings | (not retested — structural) |
+
+Root causes (model card, Akahsizrr/Fuse-2-MoE-BF16): base checkpoint
+(fine-tune lost), softmax routing approximates sqrtsoftplus+bias,
+no residual clamping / expert-output normalization. Not fixable with
+sampling flags. Flip stays NO; fuse lane remains opt-in only.
