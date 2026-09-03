@@ -110,3 +110,22 @@ sampling flags. Flip stays NO; fuse lane remains opt-in only.
 - Lesson: true on-policy needs GPU-capture harness (live triples with KV),
   not Python-only chain loss. Parked as a real project; `--chain-w`
   stays in the trainer (default 0, harmless).
+
+## Addendum 5: AR DECODE diverges on Fuse — spec paths are the correct ones
+
+- Single-token probe (raw sky prompt, temp 0): AR first_token `\n\n`
+  (271) vs MTP/ngram first emission `The` (760). Exporter ground truth:
+  labels[10]=271 (first), labels[11]=**760** (second).
+- Verdict: the trunk's VERIFY path (batched + per-token, MTP + ngram all
+  agree) reproduces the exporter exactly. The AR single-step DECODE path
+  emits 198 where the trunk predicts 760. Decode is divergent on Fuse-MoE,
+  not verify. All "AR quality" observations (loops, meta-chatter,
+  stub-then-stop) were measured through the broken decoder and are
+  UNSOUND as model-quality evidence — including the flip-killing chat
+  matrix in Addendum 2.
+- `mtp=off` is therefore not a quality baseline on Fuse: it is a
+  different, wrong trajectory. Spec modes (MTP/ngram) execute the
+  trunk faithfully (and slowly). Fixing decode is now the gating task
+  for both AR quality AND the flip decision; suspect area is the
+  single-step MoE/dispatch path (router-logits handling?) vs the
+  validated prefill/verify path.
