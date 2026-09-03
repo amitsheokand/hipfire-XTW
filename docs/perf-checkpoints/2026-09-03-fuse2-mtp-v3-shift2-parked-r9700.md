@@ -82,3 +82,16 @@ Root causes (model card, Akahsizrr/Fuse-2-MoE-BF16): base checkpoint
 (fine-tune lost), softmax routing approximates sqrtsoftplus+bias,
 no residual clamping / expert-output normalization. Not fixable with
 sampling flags. Flip stays NO; fuse lane remains opt-in only.
+
+## Addendum 3: actionable items (same day)
+
+- **Artifacts backed up** to `~/.hipfire/artifacts/mtp_fuse_v3/`
+  (model_best.safetensors 451 MB + config + metrics + packed v3 .mtp,
+  md5-verified identical to installed sidecar). No longer crash-vulnerable.
+- **Trainer `--init` warm start** committed (`ac0d3b6e`) — fine-tune and
+  on-policy rounds no longer need from-scratch runs.
+- **Assistant-prefix test** (raw framed + "```python" seed): channels the
+  model into code (no meta-chatter) but it EOSes after 12 tokens
+  (`def add_two_numbers(a, b)` then stop). Stops are only
+  `<|im_end|>`/`<|endoftext|>` — genuine model EOS. Useful lane trick,
+  not flip-grade.
