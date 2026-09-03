@@ -183,6 +183,14 @@ name = "profile_qwen35_mq4"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "fuse_tokenize_corpus"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "fuse_export_mtp_corpus"
+required-features = ["arch-qwen35"]
+
+[[example]]
 name = "profile_prefill_qwen35"
 required-features = ["arch-qwen35", "deltanet"]
 
