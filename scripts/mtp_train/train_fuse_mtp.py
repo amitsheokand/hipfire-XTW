@@ -6,7 +6,10 @@ Data: <corpus>/*.hidden.npy + *.prevemb.npy + *.labels.npy + *.ids.npy
 Head: Qwen35MtpBlock (scripts/mtp_train/mtp_module.py) with Fuse dims
   (H=2560, 16 heads / 4 kv / head_dim 256, mlp 8192, rope_theta 1e7 to match
   the hipfire trunk override, partial-rotary 0.25 -> n_rot 64).
-Loss: CE(mtp_logits[t], labels[t]) — self-distill vs the MQ4 trunk argmax.
+Loss: CE(mtp_logits[t], labels[t+1]) on EAGLE-shaped shift-2 queries
+  (E(ids[t+1]), H(ids[t])) — exactly what the serve draft loop feeds
+  step-0: (E(last@P), H(@P-1)). A shift-1 head echoes its embed input
+  live (tau~0) even at 74% shift-1 agreement; shift-2 is required.
 Output: <out_dir>/ with model.safetensors (mtp.* keys) + config.json,
   ready for `mtp_extract --hf-dir <out_dir> --output fuse-2-moe.mtp`.
 
@@ -98,16 +101,21 @@ def check_keys(mtp):
 
 @torch.no_grad()
 def eval_agreement(mtp, E, eval_files, device, chunk=128):
+    # EAGLE-shaped (shift-2) queries matching the serve draft loop: position t
+    # feeds (E(ids[t+1]), H(ids[t])) and must predict labels[t+1]. The serve
+    # step-0 passes (E(last@P), H(@P-1)); a shift-1 head echoes its embed
+    # input live (tau~0) even at 74% shift-1 agreement.
     tot_agree = tot = 0
     for base in eval_files:
         hid = torch.from_numpy(np.load(base + ".hidden.npy")).to(device, torch.float32)
         pe = torch.from_numpy(np.load(base + ".prevemb.npy")).to(device, torch.float32)
         lab = torch.from_numpy(np.load(base + ".labels.npy")).to(device, torch.long)
-        mh = mtp(pe.unsqueeze(0), hid.unsqueeze(0))[0]
-        for s in range(0, mh.shape[0] - 1, chunk):
-            e = min(s + chunk, mh.shape[0] - 1)
+        pe_in, hid_in, lab_t = pe[1:], hid[:-1], lab[1:]
+        mh = mtp(pe_in.unsqueeze(0), hid_in.unsqueeze(0))[0]
+        for s in range(0, mh.shape[0], chunk):
+            e = min(s + chunk, mh.shape[0])
             pred = (mh[s:e] @ E.T).float().argmax(-1)
-            tot_agree += int((pred == lab[s:e]).sum())
+            tot_agree += int((pred == lab_t[s:e]).sum())
             tot += e - s
         del hid, pe, lab, mh
     # NOTE: no torch.cuda.empty_cache() here (or in the train loop): on ROCm
@@ -239,11 +247,13 @@ def main():
         hid = torch.from_numpy(np.load(base + ".hidden.npy")).to(device, torch.float32)
         pe = torch.from_numpy(np.load(base + ".prevemb.npy")).to(device, torch.float32)
         lab = torch.from_numpy(np.load(base + ".labels.npy")).to(device, torch.long)
+        # Shift-2 inputs: (E(ids[t+1]), H(ids[t])) -> labels[t+1].
+        pe_in, hid_in, lab_t = pe[1:], hid[:-1], lab[1:]
         ts = time.time()
-        mh = mtp(pe.unsqueeze(0), hid.unsqueeze(0))[0]
+        mh = mtp(pe_in.unsqueeze(0), hid_in.unsqueeze(0))[0]
         if not check_finite("fwd", step, base, mh=mh):
             break
-        loss = chunked_ce_loss(mh, E, lab)
+        loss = chunked_ce_loss(mh, E, lab_t)
         if not check_finite("loss", step, base, loss=loss):
             break
         opt.zero_grad()
