@@ -29,11 +29,16 @@ fn main() {
     let mut input_dir: Option<String> = None;
     let mut out_dir: Option<String> = None;
     let mut min_tokens: usize = 50;
+    let mut decode_ids: Option<String> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
             "--gguf" => {
                 gguf = argv[i + 1].clone();
+                i += 2;
+            }
+            "--decode-ids" => {
+                decode_ids = Some(argv[i + 1].clone());
                 i += 2;
             }
             "--input-dir" => {
@@ -54,6 +59,17 @@ fn main() {
             }
         }
     }
+    let file = GgufFile::open(std::path::Path::new(&gguf)).expect("open gguf");
+    let tok = Tokenizer::from_gguf(&file).expect("gguf tokenizer");
+    eprintln!("vocab={} eos?", tok.vocab_size());
+    if let Some(ids_s) = decode_ids {
+        let ids: Vec<u32> = ids_s
+            .split(',')
+            .map(|s| s.trim().parse::<u32>().expect("id"))
+            .collect();
+        println!("{:?} -> {:?}", ids, tok.decode(&ids));
+        return;
+    }
     let (input_dir, out_dir) = match (input_dir, out_dir) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -61,9 +77,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let file = GgufFile::open(std::path::Path::new(&gguf)).expect("open gguf");
-    let tok = Tokenizer::from_gguf(&file).expect("gguf tokenizer");
-    eprintln!("vocab={} eos?", tok.vocab_size());
     std::fs::create_dir_all(&out_dir).expect("out dir");
     let mut n_ok = 0usize;
     let mut n_skip = 0usize;

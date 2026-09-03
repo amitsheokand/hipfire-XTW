@@ -140,6 +140,19 @@ fn main() {
         .collect();
     entries.sort();
     let hidden_dim = dim;
+    // KV + recurrent state allocated ONCE at max size and reused across
+    // prompts (prefill from 0 overwrites all live positions; no allocator
+    // churn, no cross-prompt contamination).
+    let kv_seq = (max_tokens + 32).max(512);
+    let mut kv_cache = KvCache::new_gpu_q8(
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq,
+    )
+    .expect("kv");
+    let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn");
     let mut done = 0usize;
     for path in entries {
         if done >= limit {
@@ -156,18 +169,10 @@ fn main() {
         }
         let t = ids.len();
         let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-        // Fresh KV + recurrent state per prompt (no cross-contamination).
-        let kv_seq = (t + 32).max(512);
-        let mut kv_cache = KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .expect("kv");
-        let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn");
-        // Per-token hiddens via prefill capture.
+        // Reset recurrent state per prompt (KV slots are positionally
+        // overwritten by prefill from 0; DN state accumulates and must zero).
+        dn_state.reset(&mut gpu).expect("dn reset");
+        // Per-token hiddens via prefill capture (KV/state reused, see above).
         let hidden_buf = gpu.alloc_tensor(&[t * hidden_dim], rdna_compute::DType::F32).expect("hidden");
         qwen35::forward_prefill_batch(
             &mut gpu,
