@@ -95,3 +95,18 @@ sampling flags. Flip stays NO; fuse lane remains opt-in only.
   (`def add_two_numbers(a, b)` then stop). Stops are only
   `<|im_end|>`/`<|endoftext|>` — genuine model EOS. Useful lane trick,
   not flip-grade.
+
+## Addendum 4: on-policy pilot NEGATIVE — reverted to v3 (same day)
+
+- `--chain-w 0.5` warm-start from v3 (500 steps, lr 1e-6): Python chain
+  10.3% → 55.0%, shift-2 held at 58.3%. Packed Q8 verified lossless
+  (Python Q8: shift2 58.5%, chain 54.8%).
+- **Live tau REGRESSED 0.59 → 0.17.** Step-0 must have dropped (~50% →
+  ~17% live accepts) while Python held — the chain mix overfit to
+  clean-prefill hiddens and lost robustness to live (rollback-state)
+  inputs. Python chain agreement does NOT transfer (no MTP-KV in Python).
+- Reverted installed sidecar to v3 (md5 `842cda4e…`). v4 weights kept at
+  `~/.hipfire/artifacts/mtp_fuse_v3/model_v4_chain.safetensors` for forensics.
+- Lesson: true on-policy needs GPU-capture harness (live triples with KV),
+  not Python-only chain loss. Parked as a real project; `--chain-w`
+  stays in the trainer (default 0, harmless).
