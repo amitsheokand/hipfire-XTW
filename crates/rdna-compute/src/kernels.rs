@@ -1990,6 +1990,13 @@ pub const MOE_TOPK_RENORM_K2_SRC: &str =
 pub const MOE_ROUTER_SQRTSOFTPLUS_SRC: &str =
     include_str!("../../../kernels/src/moe_router_sqrtsoftplus.hip");
 
+/// Fused k=2 router: Q8 GEMV + sqrtsoftplus gate + top-2 + renorm in one
+/// block (8 warps, warp-per-row). Bit-exact vs the three-launch chain
+/// (phase 1 transcribes gemv_q8_0 verbatim; phase 2 matches
+/// MOE_ROUTER_SQRTSOFTPLUS_SRC + MOE_TOPK_RENORM_K2_SRC op order).
+pub const MOE_ROUTER_Q8_SQRTSOFTPLUS_TOPK2_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_q8_sqrtsoftplus_topk2.hip");
+
 /// Batched companion of MOE_TOPK_RENORM_K8_SRC for the prefill path.
 /// Same per-block algorithm; one workgroup per token row.
 pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =

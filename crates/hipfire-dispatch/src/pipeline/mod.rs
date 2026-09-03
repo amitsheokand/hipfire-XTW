@@ -675,6 +675,46 @@ pub fn run_moe_decode(
         None
     };
 
+    // ── k==2 indexed admission (hoisted above gate-side) ──────────────────
+    // The gate-side section below must know whether the routed path runs
+    // indexed: the K1 fused router replaces the standalone router GEMV
+    // there AND the gate+topk kernels at the routing site below. Pure
+    // function of params + env; the fallback return below reuses it.
+    //
+    // k==2 indexed admission: uniform MQ4G256V2 routed experts (both
+    // projections), no per-expert tier tags, no AWQ sidecars, no deferred
+    // combine. The indexed GEMV/combine kernels take k_top as a runtime
+    // parameter, so the k==8 arms serve k==2 unchanged except gate_up (whose
+    // non-batched launcher bakes K_TOP=8 into its grid — k==2 takes the
+    // batched launcher with batch=1) and routing (GPU top-2, no D2H).
+    // HIPFIRE_MOE_K2_FORCE_FALLBACK=1 forces the CPU path for A/B parity
+    // validation of the indexed route.
+    let use_k2_indexed = p.k == 2
+        && res.routed_indexable_mq4v2
+        && p.expert_dtype_tags.is_none()
+        && p.expert_down_awq_ptrs.is_none()
+        && !p.defer_routed_combine
+        && hipfire_config::developer_var("HIPFIRE_MOE_K2_FORCE_FALLBACK")
+            .ok()
+            .as_deref()
+            != Some("1");
+    // K1 fused router: Q8 GEMV + sqrtsoftplus gate + top-2 + renorm in one
+    // block. Bit-exact vs the split chain; HIPFIRE_MOE_K1=0 opts out.
+    let k1_router_fused = use_k2_indexed
+        && matches!(
+            p.router_activation,
+            crate::families::moe::RouterActivation::SqrtSoftplus
+        )
+        && p.router.dtype == DType::Q8_0
+        && p.router.awq_scale.is_none()
+        && p.router.m == p.n_exp
+        && p.n_exp <= 8
+        && p.router.k == p.hidden
+        && hipfire_config::developer_var("HIPFIRE_MOE_K1")
+            .ok()
+            .as_deref()
+            != Some("0");
+
     // ── Gate-side GEMV ───────────────────────────────────────────────────────
     // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
     let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
@@ -756,6 +796,9 @@ pub fn run_moe_decode(
                 .eval_arch(ctx);
         if router_prerot {
             let xr = x_rot_local.expect("router_prerot implies x_rot_local");
+            // K1 fused router runs at the routing site below (reads p.x_norm
+            // directly); skip the standalone router GEMV here.
+            if !k1_router_fused {
             gemv.run(
                 ctx,
                 gpu,
@@ -770,6 +813,7 @@ pub fn run_moe_decode(
                 },
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
             // skip_shared (Fuse routed call, EP rank>0): the shared-expert
             // scalar gate is dead — the shared-down section below is skipped,
             // so scalar_buf is never read. The router GEMV above still runs.
@@ -790,8 +834,11 @@ pub fn run_moe_decode(
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
         } else {
-            gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            // K1 fused router runs at the routing site below; skip here.
+            if !k1_router_fused {
+                gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
             // skip_shared: scalar_buf dead (shared-down skipped below).
             if !p.skip_shared {
                 gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
@@ -876,23 +923,10 @@ pub fn run_moe_decode(
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
     // an indexable routed dtype + a supported k).
     //
-    // k==2 indexed admission: uniform MQ4G256V2 routed experts (both
-    // projections), no per-expert tier tags, no AWQ sidecars, no deferred
-    // combine. The indexed GEMV/combine kernels take k_top as a runtime
-    // parameter, so the k==8 arms serve k==2 unchanged except gate_up (whose
-    // non-batched launcher bakes K_TOP=8 into its grid — k==2 takes the
-    // batched launcher with batch=1) and routing (GPU top-2, no D2H).
+    // k==2 indexed admission: see the hoisted `use_k2_indexed` above
+    // gate-side (the K1 fused router needs it before the router GEMV).
     // HIPFIRE_MOE_K2_FORCE_FALLBACK=1 forces the CPU path for A/B parity
     // validation of the indexed route.
-    let use_k2_indexed = p.k == 2
-        && res.routed_indexable_mq4v2
-        && p.expert_dtype_tags.is_none()
-        && p.expert_down_awq_ptrs.is_none()
-        && !p.defer_routed_combine
-        && hipfire_config::developer_var("HIPFIRE_MOE_K2_FORCE_FALLBACK")
-            .ok()
-            .as_deref()
-            != Some("1");
     if !res.use_gpu_topk && !use_k2_indexed {
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
@@ -946,21 +980,38 @@ pub fn run_moe_decode(
         // k==2 indexed (Fuse): gate + top-2 stay on device; indices/weights
         // remain in device buffers for the indexed GEMVs below — no D2H.
         // Same gate/topk split as the CPU fallback's k==2 arm (Phase 3a).
-        if matches!(
-            p.router_activation,
-            crate::families::moe::RouterActivation::SqrtSoftplus
-        ) {
-            hip!(gpu.moe_router_sqrtsoftplus_f32(p.router_logits))?;
+        if k1_router_fused {
+            // K1: fused Q8 router GEMV + sqrtsoftplus + top-2 + renorm. The
+            // gate-side router GEMV was skipped above; this fills
+            // router_logits + topk buffers in one launch (no separate
+            // gate/topk kernels below).
+            hip!(gpu.moe_router_q8_sqrtsoftplus_topk2(
+                p.router.buf,
+                p.x_norm,
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.router.m,
+                p.router.k,
+                p.norm_topk_prob,
+            ))?;
         } else {
-            hip!(gpu.softmax_f32(p.router_logits))?;
+            if matches!(
+                p.router_activation,
+                crate::families::moe::RouterActivation::SqrtSoftplus
+            ) {
+                hip!(gpu.moe_router_sqrtsoftplus_f32(p.router_logits))?;
+            } else {
+                hip!(gpu.softmax_f32(p.router_logits))?;
+            }
+            hip!(gpu.moe_topk_renorm_k2(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob
+            ))?;
         }
-        hip!(gpu.moe_topk_renorm_k2(
-            p.router_logits,
-            p.topk_indices,
-            p.topk_weights,
-            p.n_exp,
-            p.norm_topk_prob
-        ))?;
     } else if router_shared_fuse {
         let shared_x_rot = unsafe {
             GpuTensor {

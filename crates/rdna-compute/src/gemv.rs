@@ -10228,7 +10228,80 @@ impl Gpu {
         }
         result
     }
-    /// mfp4-E8 grouped MoE gate_up (k8 indexed). Launches the batched kernel
+
+    /// Fused k=2 MoE router: Q8 GEMV over `x` + sqrtsoftplus gate + top-2 +
+    /// renorm in a single block. Writes `logits` (debug/dump parity with the
+    /// split chain), `topk_idx` (i32) and `topk_w`. Bit-exact vs
+    /// gemv_q8_0 + moe_router_sqrtsoftplus + moe_topk_renorm_k2.
+    /// Admission: router rows m == n_exp <= 8, sqrtsoftplus models only
+    /// (checked by dispatch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_router_q8_sqrtsoftplus_topk2(
+        &mut self,
+        router_q8: &GpuTensor, // Q8_0 router weights [m, k]
+        x: &GpuTensor,       // [k] f32
+        logits: &GpuTensor,  // [m] f32 out
+        topk_idx: &GpuTensor, // i32 [2] out
+        topk_w: &GpuTensor,  // f32 [2] out
+        m: usize,
+        k: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_router_q8_sqrtsoftplus_topk2",
+            kernels::MOE_ROUTER_Q8_SQRTSOFTPLUS_TOPK2_SRC,
+            "moe_router_q8_sqrtsoftplus_topk2",
+        )?;
+        let rp = router_q8.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &rp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = m * (k / 32) * 34 + k * 4 + m * 4 + 16;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "moe",
+            "moe_router_q8_sqrtsoftplus_topk2",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_router_q8_sqrtsoftplus_topk2",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(rp);
+                b.push_ptr(xp);
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// with N=1 (bid=0 collapses the K_TOP-stride terms), so the gate_batch/up_batch
     /// output matches the hfq4g256 k8-indexed contract.
     ///
