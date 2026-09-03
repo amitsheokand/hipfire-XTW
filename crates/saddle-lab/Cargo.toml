@@ -191,6 +191,10 @@ name = "fuse_export_mtp_corpus"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "fuse_frame_corpus"
+required-features = ["arch-qwen35"]
+
+[[example]]
 name = "profile_prefill_qwen35"
 required-features = ["arch-qwen35", "deltanet"]
 
