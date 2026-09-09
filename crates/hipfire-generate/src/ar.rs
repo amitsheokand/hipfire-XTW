@@ -1398,6 +1398,7 @@ pub fn generate(
                 request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
+                raw_requested,
             ) {
                 return;
             }
@@ -1570,6 +1571,7 @@ pub fn generate(
                 request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
+                raw_requested,
             ) {
                 return;
             }
@@ -1648,6 +1650,7 @@ pub fn generate(
                 request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
+                raw_requested,
             ) {
                 return;
             }
@@ -1726,6 +1729,7 @@ pub fn generate(
                 request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
+                raw_requested,
             ) {
                 return;
             }
@@ -1893,6 +1897,7 @@ pub fn generate(
                 request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
+                raw_requested,
             ) {
                 let _ = (
                     repeat_penalty,

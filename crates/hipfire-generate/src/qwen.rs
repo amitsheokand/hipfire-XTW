@@ -1892,6 +1892,11 @@ pub fn generate_dflash(
     request_seed: u64,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
+    // `--raw` (bare prompt tokens, no ChatML/Jinja framing). Mirrors the AR
+    // body in `ar::generate`: without this the spec route frames a raw
+    // request and its first token is computed at a different position than
+    // AR's, breaking the verify-gated "same tokens as AR" invariant.
+    raw_requested: bool,
     // Returns false in exactly one case: the request does not fit the loaded
     // speculator's reported ctx capacity (draft-side structures are capped at
     // load — see DEFAULT_DFLASH_CTX_CAP) — and NO output/events were emitted,
@@ -1961,12 +1966,29 @@ pub fn generate_dflash(
     // ChatML/Plain). No template ⇒ Plain. Template present + render Err ⇒
     // fail closed (see match below).
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
-    let mut started_in_think = matches!(
-        assistant_prefix,
-        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-    );
-    let prompt_tokens: Vec<u32> = if try_jinja {
+    // Bare-prompt contract, same as the AR body (`ar::generate` lines ~2257):
+    // `--raw` (or HIPFIRE_RAW_PROMPT=1) encodes the prompt verbatim with no
+    // ChatML/Jinja framing. The spec route previously ignored this and always
+    // framed, so a `--raw` spec request prefilled different tokens than the
+    // identical AR request (Fuse-2 sky probe: framed first token 760 `The`
+    // vs raw 271 `\n\n`) — a framing mismatch, not a decode divergence.
+    let raw_prompt = raw_requested
+        || hipfire_config::developer_var("HIPFIRE_RAW_PROMPT")
+            .ok()
+            .as_deref()
+            == Some("1");
+    let try_jinja = !raw_prompt && jinja_enabled && m.chat_template.is_some();
+    let mut started_in_think = if raw_prompt {
+        render_tail_opens_think(prompt)
+    } else {
+        matches!(
+            assistant_prefix,
+            hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+        )
+    };
+    let prompt_tokens: Vec<u32> = if raw_prompt {
+        tokenizer.encode(prompt)
+    } else if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
