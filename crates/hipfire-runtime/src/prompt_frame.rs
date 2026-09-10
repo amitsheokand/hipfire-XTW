@@ -1393,10 +1393,20 @@ impl<'a> JinjaChatFrame<'a> {
             Some(s) => Value::from_serialize(s),
             None => Value::UNDEFINED,
         };
+        // MiniCPM5's Qwen-shaped GGUF template treats `enable_thinking is
+        // defined` + false as "emit empty <think></think>", which llama_ar
+        // turns into the Python-file / tool-scaffold attractor. Leave the
+        // variable undefined so the opener is plain assistant ChatML.
+        let enable_thinking_val =
+            if self.tokenizer.undefine_false_enable_thinking() && !self.enable_thinking {
+                Value::UNDEFINED
+            } else {
+                Value::from_serialize(self.enable_thinking)
+            };
         let ctx = minijinja::context! {
             messages => messages_val,
             add_generation_prompt => true,
-            enable_thinking => self.enable_thinking,
+            enable_thinking => enable_thinking_val,
             bos_token => bos_token,
             reasoning_strength => reasoning_strength_val,
             reasoning_effort => reasoning_effort_val,

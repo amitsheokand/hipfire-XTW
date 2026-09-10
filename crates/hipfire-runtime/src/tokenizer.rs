@@ -65,6 +65,43 @@ impl Gpt2PreKind {
     fn ignore_merges(self) -> bool {
         matches!(self, Self::MiniCpm5)
     }
+
+    /// MiniCPM5's GGUF jinja is a Qwen-shaped template whose
+    /// `enable_thinking is defined` + `false` branch emits the empty
+    /// `<think>\n\n</think>\n\n` opener — a known llama_ar attractor.
+    /// Leave the jinja variable undefined so that branch does not fire.
+    fn undefine_false_enable_thinking(self) -> bool {
+        matches!(self, Self::MiniCpm5)
+    }
+}
+
+/// Angle-bracket control tokens used as greedy specials during `encode`.
+/// `<s>` / `</s>` are 3–4 chars so the historical `len() > 3` cut dropped
+/// MiniCPM5's BOS (`vocab[0] = "<s>"`), and jinja `{{ bos_token }}` then
+/// BPE-split instead of emitting id 0.
+fn collect_gguf_special_tokens(vocab: &[String], bos_id: u32, eos_id: u32) -> Vec<(String, u32)> {
+    let mut special_tokens: Vec<(String, u32)> = Vec::new();
+    for (i, tok) in vocab.iter().enumerate() {
+        if (tok.starts_with("<|") && tok.ends_with("|>"))
+            || (tok.starts_with('<') && tok.ends_with('>') && tok.len() > 3 && !tok.contains(' '))
+        {
+            special_tokens.push((tok.clone(), i as u32));
+        }
+    }
+    for id in [bos_id, eos_id] {
+        if let Some(s) = vocab.get(id as usize) {
+            if s.starts_with('<') && s.ends_with('>') && !s.contains(' ') {
+                if !special_tokens
+                    .iter()
+                    .any(|(t, existing)| t == s && *existing == id)
+                {
+                    special_tokens.push((s.clone(), id));
+                }
+            }
+        }
+    }
+    special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    special_tokens
 }
 
 /// MiniCPM5 Isolated first pass: isolate 1–3 digit groups so a longer run
@@ -491,20 +528,7 @@ impl Tokenizer {
             _ => true,
         };
 
-        // Build special tokens list: vocab entries matching <|...|> or </...> patterns
-        let mut special_tokens: Vec<(String, u32)> = Vec::new();
-        for (i, tok) in vocab.iter().enumerate() {
-            if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<")
-                    && tok.ends_with(">")
-                    && tok.len() > 3
-                    && !tok.contains(' '))
-            {
-                special_tokens.push((tok.clone(), i as u32));
-            }
-        }
-        // Sort longest-first for greedy matching
-        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let special_tokens = collect_gguf_special_tokens(&vocab, bos_id, eos_id);
 
         // Resolve merges to token ids; reject inconsistent vocab/merges (#203).
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
@@ -836,18 +860,7 @@ impl Tokenizer {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let mut special_tokens: Vec<(String, u32)> = Vec::new();
-        for (i, tok) in vocab.iter().enumerate() {
-            if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<")
-                    && tok.ends_with(">")
-                    && tok.len() > 3
-                    && !tok.contains(' '))
-            {
-                special_tokens.push((tok.clone(), i as u32));
-            }
-        }
-        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let special_tokens = collect_gguf_special_tokens(&vocab, bos_id, eos_id);
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -1329,6 +1342,11 @@ impl Tokenizer {
     /// constructors. Used for cross-tokenizer equivalence checks.
     pub fn special_tokens(&self) -> &[(String, u32)] {
         &self.special_tokens
+    }
+
+    /// MiniCPM5: do not define jinja `enable_thinking=false` (empty-think attractor).
+    pub fn undefine_false_enable_thinking(&self) -> bool {
+        self.gpt2_pre.undefine_false_enable_thinking()
     }
 
     /// Stable 64-bit signature derived from the full vocab + every special
@@ -2205,6 +2223,18 @@ mod consistency_tests {
         let tok_mc = Tokenizer::from_gguf_meta_json(&meta_mc).expect("minicpm5");
         assert_eq!(tok_mc.gpt2_pre, Gpt2PreKind::MiniCpm5);
         assert_eq!(tok_mc.encode("hi"), vec![256]);
+    }
+
+    #[test]
+    fn minicpm5_bos_s_is_single_special() {
+        // MiniCPM5 vocab[bos] is "<s>" (len 3). The historical len>3 special
+        // heuristic skipped it, so jinja `{{ bos_token }}` BPE-split.
+        let mut meta = gpt2_meta_full_bytes(None, &["<s>", "hi"], &[]);
+        meta["tokenizer.ggml.pre"] = serde_json::json!("minicpm5");
+        meta["tokenizer.ggml.bos_token_id"] = serde_json::json!(256);
+        let tok = Tokenizer::from_gguf_meta_json(&meta).expect("minicpm5 bos");
+        assert_eq!(tok.encode("<s>"), vec![256]);
+        assert_eq!(tok.encode("<s>hi"), vec![256, 257]);
     }
 
     #[test]

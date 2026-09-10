@@ -16,7 +16,12 @@ Fix: `Gpt2PreKind::MiniCpm5` in `crates/hipfire-runtime/src/tokenizer.rs`, read 
 `tokenizer.ggml.pre` in `from_gguf` / `from_gguf_meta_json`. MQ4 already copies the field
 via `gguf_meta`. Local encode of `"hi"` on `MiniCPM5-2B-Q8_0.mq4` is `[7466]`.
 
-Serve after the port: the Python-file attractor is gone. Remaining (not tokenizer):
-Jinja `{{- bos_token }}` + tools XML in the GGUF chat template; `llama_ar` fake
-`reasoning_content` / “the user’s request…” scaffold; `:8080` tools on llama_ar.
-Not a first-class hipfire arch. Do not advertise 128k; catalog is 32k.
+Serve after the port: `"hi"` encodes `[7466]`. Follow-up (same day): register
+`<s>` (bos id 0, len 3) as a greedy special — the `len() > 3` heuristic skipped
+it so jinja `{{ bos_token }}` BPE-split to two ids. MiniCPM5 jinja is Qwen-shaped:
+`enable_thinking is defined` + false emits empty `<think></think>` (Python-file
+attractor). Leave that jinja variable undefined when thinking is off.
+
+Remaining: some prompts still emit think-body “user’s request…” into
+`reasoning_content` (llama_ar think router / model opening `<think>`). Not a
+first-class hipfire arch. Catalog window is 32k.
