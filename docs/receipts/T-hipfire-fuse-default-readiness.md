@@ -94,7 +94,13 @@ validation) but model-incapable on this artifact — thinking-off degenerate tex
 becomes a thinking-on hard error. Fuse cannot take thinking traffic. Qwen stays
 for all reasoning workload; Fuse default, if any, is thinking-off code/factual only.
 
-## 7. State on exit
+## 7. SHIPPED: Fuse presence_penalty 0.0 → 1.0
+
+One-line `~/.hipfire/models.toml` change (fuse generation block only; Qwen
+untouched, live serve not restarted — applies on next Fuse serve). Evidence §3:
+runaway 2→0, decode 113.0→114.3, greedy retained. Sampling rejected.
+
+## 8. State on exit
 
 - `~/.hipfire/models.toml` untouched (scratch edit reverted, verified).
 - Qwen `qwen3.8:27b-mq4-pro` serve restored on `:11435`, pre-warmed.
