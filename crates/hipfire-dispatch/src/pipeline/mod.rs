@@ -659,15 +659,28 @@ pub fn run_moe_decode(
                     paro.krot,
                 ))?;
             } else if res.gate_side_mq4 {
+                // All gate-side weights are MQ4 (incl. router) → router awq
+                // scale equals the shared gate/up scale (same input basis).
                 if let Some(awq) = p.router.awq_scale {
                     hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
                 } else {
                     hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
                 }
             } else {
-                // !gate_side_mq4 but routed MQ4/MQ6: no AWQ on MoE expert weights
-                // in Phase 1 targets (A3B). Byte-identical for models without AWQ.
-                hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
+                // !gate_side_mq4 (router is Q8) but routed experts are MQ4/MQ6.
+                // The batched-prefill Fuse path (prefill.rs) rotates host_hidden
+                // using ffn.experts[0].gate_up's AWQ scale — NOT the router's
+                // (which is None when router is Q8). Mirror that here: use the
+                // first routed expert's gate_up AWQ scale for the rotation that
+                // feeds the routed GEMVs. Models without expert AWQ sidecars get
+                // rotate_x_mq (None → no AWQ), preserving prior byte-identical
+                // behavior for A3B / non-AWQ artifacts.
+                let expert_awq = p.routed_experts.first().and_then(|(gu, _)| gu.awq_scale);
+                if let Some(awq) = expert_awq {
+                    hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
+                } else {
+                    hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
+                }
             }
         }
         Some(p.x_rot_local)
