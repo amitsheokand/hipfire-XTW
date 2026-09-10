@@ -191,7 +191,7 @@ pub fn generate_ep(
             }
         }
     };
-    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
+    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
         .ok()
         .as_deref()
         == Some("1")
@@ -1291,7 +1291,7 @@ pub fn ep_serve_ds4(
     }
     // Mirror prior gate: require generated > 0 so empty turns never store.
     if action.store && generated > 0 {
-        if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+        if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
             .ok()
             .as_deref()
             == Some("1")
@@ -1305,7 +1305,7 @@ pub fn ep_serve_ds4(
         }
         let _ = ds4_apply_cache_action(
             |fp, seq| {
-                if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+                if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                     .ok()
                     .as_deref()
                     == Some("1")
@@ -1388,7 +1388,7 @@ pub fn ep_serve_minimax(
             lcp += 1;
         }
         let cache_hit = lcp > 0 && lcp < prompt_n;
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[minimax-ep-cache] prior_len={} rendered_len={} lcp={} hit={} partial={}",
                 prior_len,
@@ -1637,7 +1637,7 @@ pub fn ep_serve_minimax(
 /// byte-consistent — a mismatch would break the LCP forward-extension.
 pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_frame::ToolCallRender {
     hipfire_runtime::prompt_frame::qwen35_history_render(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
         model_path,
     )
 }
@@ -1723,7 +1723,7 @@ pub fn plan_from_rendered(
         while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
             lcp += 1;
         }
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[qwen-cache lcp {trace_tag}] prior_len={} rendered_len={} lcp={}",
                 prior_len,
@@ -1965,7 +1965,7 @@ pub fn generate_dflash(
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). No template ⇒ Plain. Template present + render Err ⇒
     // fail closed (see match below).
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // Bare-prompt contract, same as the AR body (`ar::generate` lines ~2257):
     // `--raw` (or HIPFIRE_RAW_PROMPT=1) encodes the prompt verbatim with no
     // ChatML/Jinja framing. The spec route previously ignored this and always
@@ -2125,7 +2125,7 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -2133,7 +2133,7 @@ pub fn generate_dflash(
     // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
     // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
     // (zero overhead) + legacy cold-reset-on-divergence.
-    let dflash_resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref()
+    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref()
         != Some("0")
         && m.eviction.is_none();
     let dflash_ckpt_positions: Vec<usize> = m
@@ -2175,7 +2175,7 @@ pub fn generate_dflash(
             };
             let cache_ref = &mut m.asst_turn_cache;
             let trace_cache =
-                std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+                hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
             let rendered = match hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,
                 hist,
@@ -2284,7 +2284,7 @@ pub fn generate_dflash(
     // text with finish_reason=stop (Pi never executed the tool). Always pass
     // request tools for routing; grammar is the separate `tool_grammar` flag.
     let tool_grammar = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
         &m.model_path,
     );
     let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
@@ -2308,7 +2308,7 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1")
+                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1")
                 && temp <= 1e-6
                 && max_think_tokens == 1,
         });
@@ -2571,7 +2571,7 @@ pub fn generate_dflash(
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
                 if action.store {
-                    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!(
                             "[qwen-cache store dflash] fp_text.len={} tool_calls={} preview={:?}",
                             action.fingerprint_text.len(),
@@ -2582,7 +2582,7 @@ pub fn generate_dflash(
                     let reasoning_text = qwen_dflash_reasoning_from_finish(&run.finish);
                     let _ = qwen_dflash_apply_cache_action(
                         |fp, turn| {
-                            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
+                            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
                                 == Some("1")
                             {
                                 eprintln!(
@@ -2742,7 +2742,7 @@ pub fn generate_dflash(
             let emit_text =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                 eprintln!(
                     "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
                     fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
@@ -2944,7 +2944,7 @@ pub fn generate_spec(
         // bookkeeping remains.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-    } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    } else if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
             prefill_start,
@@ -4285,7 +4285,7 @@ pub fn generate_multi(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -4572,7 +4572,7 @@ pub fn generate_multi(
     // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
     // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
         &m.model_path,
     );
     let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
@@ -4727,7 +4727,7 @@ pub fn generate_multi(
     // and runs to max_tokens. Mark the latch position and hard-EOS once
     // generation runs this many tokens past it — generous for a real final
     // answer, bounded against runaway.
-    let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+    let post_latch_answer_budget: usize = hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(768);
