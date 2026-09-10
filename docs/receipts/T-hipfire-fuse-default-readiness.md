@@ -100,7 +100,18 @@ One-line `~/.hipfire/models.toml` change (fuse generation block only; Qwen
 untouched, live serve not restarted — applies on next Fuse serve). Evidence §3:
 runaway 2→0, decode 113.0→114.3, greedy retained. Sampling rejected.
 
-## 8. State on exit
+## 8. E0 vocab audit: PASS — teacher text retokenizes losslessly
+
+- Qwen3.8 (`Qwen/Qwen3.8-27B` tokenizer.json) vs Fuse GGUF (`Fuse-2-MoE-Q4_K_M`,
+  first 64 MB range-fetched, GGUFv3 metadata parsed): base 248044 strings
+  identical (0 diffs); all 33 added tokens + full added_tokens_decoder match;
+  `<think>`=248068 / `</think>`=248069 / im_start/end, endoftext identical.
+- Fuse tail `[PAD248319]`-style pads align. `tokenizers_compatible` holds.
+- Consequence: Qwen3.8 teacher **text** distills into Fuse with zero tokenizer
+  friction. Opt-A/B unblocked on vocab grounds. No downloads retained except
+  Qwen3.8 tokenizer JSON (HF cache) and `/tmp/fuse_tokens.json` (scratch).
+
+## 9. State on exit
 
 - `~/.hipfire/models.toml` untouched (scratch edit reverted, verified).
 - Qwen `qwen3.8:27b-mq4-pro` serve restored on `:11435`, pre-warmed.
