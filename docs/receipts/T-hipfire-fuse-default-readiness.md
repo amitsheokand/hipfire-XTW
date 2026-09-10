@@ -68,7 +68,33 @@ template supports effort and embedded does not, the embed predates it → re-exp
 or pin template source before any thinking claim. BF16 repo stays the clean
 re-quant source; no re-quant until the diff lands.
 
-## 5. State on exit
+## 5. Template diff: embedded == upstream, effort unsupported by design
+
+- GGUF repo (`Akahsizrr/Fuse-2-MoE-GGUF` @ `4b686d2d`) carries no JSON sidecars;
+  template sourced from API `gguf.chat_template`: **7756 chars, byte-identical**
+  to `/tmp/fuse_embedded_tpl.j2` (`cmp` clean). No re-export needed.
+- Upstream template has `enable_thinking` but **no `reasoning_effort` variable**
+  → effort-rung warning is correct upstream behavior, not staleness.
+  Thinking control = `enable_thinking` boolean + think-token budget only.
+- Template end-logic: `enable_thinking=false` → closed empty think block
+  (current thinking-off framing); otherwise open `<think>`.
+
+## 6. Thinking + presence combined probe: FAILS CLOSED (hard error)
+
+Scratch config (reverted after): reasoning mode on / budget low / effort xhigh
+(warns+drops, but enables) / max_tokens 512 + presence 1.0. Result:
+`daemon error: open think span at end of generation (validation)`, rolled back,
+no answer at all. Model enters `<think>`, never emits `</think>` in budget;
+daemon refuses to force-close (qwen.rs:559). Presence does not save it.
+Side finding: `effort=none` forces thinking disabled even with mode on
+(request reports `mode:disabled`); effort xhigh enables despite the drop warning.
+
+**Verdict:** thinking is mechanically fully wired (contract, framing, budget,
+validation) but model-incapable on this artifact — thinking-off degenerate text
+becomes a thinking-on hard error. Fuse cannot take thinking traffic. Qwen stays
+for all reasoning workload; Fuse default, if any, is thinking-off code/factual only.
+
+## 7. State on exit
 
 - `~/.hipfire/models.toml` untouched (scratch edit reverted, verified).
 - Qwen `qwen3.8:27b-mq4-pro` serve restored on `:11435`, pre-warmed.
