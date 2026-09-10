@@ -35,6 +35,107 @@ fn gpt2_pretok_re() -> &'static Regex {
     })
 }
 
+/// GPT-2 BPE pre-tokenizer family. Hipfire historically used one cl100k-ish
+/// regex for every `tokenizer.ggml.model=gpt2` vocab. llama.cpp keys the
+/// split + merge policy off `tokenizer.ggml.pre`; MiniCPM5 is the first
+/// GGUF-imported family that diverges enough to garbage the decode path
+/// if we ignore that field.
+///
+/// MiniCPM5 (openbmb/MiniCPM5, llama.cpp `LLAMA_VOCAB_PRE_TYPE_MINICPM5`):
+/// two Isolated regex passes (`\p{N}{1,3}`, then the main GPT-2-style
+/// pattern with `\p{N}+`) plus `ignore_merges` — if the GPT-2-byte-encoded
+/// pretok chunk is itself a vocab entry, emit that id and skip BPE. Without
+/// this, `"hi"` byte-splits then merges instead of emitting the single
+/// trained id (7466 on MiniCPM5-2B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Gpt2PreKind {
+    #[default]
+    Default,
+    MiniCpm5,
+}
+
+impl Gpt2PreKind {
+    fn from_gguf_pre(pre: Option<&str>) -> Self {
+        match pre {
+            Some("minicpm5") => Self::MiniCpm5,
+            _ => Self::Default,
+        }
+    }
+
+    fn ignore_merges(self) -> bool {
+        matches!(self, Self::MiniCpm5)
+    }
+}
+
+/// MiniCPM5 Isolated first pass: isolate 1–3 digit groups so a longer run
+/// is never one `\p{N}+` chunk (`12345` → `123` + `45`).
+const MINICPM5_DIGIT_PATTERN: &str = r"\p{N}{1,3}";
+
+/// MiniCPM5 Isolated second pass. llama.cpp's original has lookaround
+/// `\s+(?!\S)`; the `regex` crate cannot do lookaround, so that branch is
+/// dropped the same way as `GPT2_PRETOK_PATTERN` — trailing `\s+` covers
+/// the same spans.
+const MINICPM5_MAIN_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+fn minicpm5_digit_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(MINICPM5_DIGIT_PATTERN)
+            .expect("MINICPM5_DIGIT_PATTERN must compile — pattern is a const")
+    })
+}
+
+fn minicpm5_main_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(MINICPM5_MAIN_PATTERN)
+            .expect("MINICPM5_MAIN_PATTERN must compile — pattern is a const")
+    })
+}
+
+/// Isolated split: keep both regex matches *and* the unmatched leftovers,
+/// covering `text` end-to-end. Matches llama.cpp `unicode_regex_split_stl`
+/// / HF `Split(behavior=Isolated)`. `find_iter` alone would drop leftovers,
+/// which is wrong for MiniCPM5's first pass (`\p{N}{1,3}` does not cover
+/// letters).
+fn regex_isolated_pieces<'a>(text: &'a str, re: &Regex) -> Vec<&'a str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut last = 0;
+    for m in re.find_iter(text) {
+        if m.start() > last {
+            out.push(&text[last..m.start()]);
+        }
+        if !m.as_str().is_empty() {
+            out.push(m.as_str());
+        }
+        last = m.end();
+    }
+    if last < text.len() {
+        out.push(&text[last..]);
+    }
+    out
+}
+
+/// MiniCPM5 two-pass Isolated pretok (digits, then main) on UTF-8 text.
+/// GPT-2 byte encoding happens later, per chunk, in `encode_gpt2_chunk`.
+fn pretok_minicpm5(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut pieces = vec![text];
+    for re in [minicpm5_digit_re(), minicpm5_main_re()] {
+        let mut next = Vec::new();
+        for piece in pieces {
+            next.extend(regex_isolated_pieces(piece, re));
+        }
+        pieces = next;
+    }
+    pieces
+}
+
 /// Which side of a merge rule failed validation. Used by `MissingMergeOperand`.
 #[derive(Debug, Clone, Copy)]
 pub enum Side {
@@ -157,6 +258,8 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
+    /// GPT-2 pretok family from `tokenizer.ggml.pre`. Unused on SP.
+    gpt2_pre: Gpt2PreKind,
     /// SentencePiece `add_dummy_prefix`: when true, `encode_sentencepiece`
     /// prepends a `▁` to each raw text segment (the LLaMA convention —
     /// `normalizer: [Prepend("▁"), Replace(" "→"▁")]`). CONFIG-DRIVEN, not
@@ -317,7 +420,6 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
         || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
 
-
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -381,6 +483,7 @@ impl Tokenizer {
         // Detect tokenizer type
         let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
         let is_gpt2_bpe = model_type == "gpt2";
+        let gpt2_pre = Gpt2PreKind::from_gguf_pre(gguf.meta_str("tokenizer.ggml.pre"));
         // SP dummy prefix: GGUF carries it as `tokenizer.ggml.add_space_prefix`
         // (llama.cpp SPM convention, default true when absent).
         let sp_dummy_prefix = match gguf.meta("tokenizer.ggml.add_space_prefix") {
@@ -424,6 +527,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            gpt2_pre,
             sp_dummy_prefix,
         })
     }
@@ -548,6 +652,11 @@ impl Tokenizer {
         let n_sp = token_to_id.keys().filter(|t| t.starts_with('▁')).count();
         let is_gpt2_bpe =
             token_to_id.contains_key("Ġthe") || (token_to_id.contains_key("Ġ") && n_gpt2 > n_sp);
+        // MiniCPM5 (and other GGUF `tokenizer.ggml.pre` families) arrive via
+        // `from_gguf` / `from_gguf_meta_json`. HF tokenizer.json MiniCPM
+        // Sequence pretok is not detected here — Default matches prior
+        // Qwen/cl100k behaviour.
+        let gpt2_pre = Gpt2PreKind::Default;
         // SP dummy prefix is a property of the model's normalizer /
         // pre_tokenizer config, NOT of SentencePiece itself — read it from
         // the tokenizer.json instead of assuming the LLaMA convention.
@@ -572,6 +681,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            gpt2_pre,
             sp_dummy_prefix,
         })
     }
@@ -717,6 +827,8 @@ impl Tokenizer {
             .and_then(|v| v.as_str())
             .unwrap_or("llama");
         let is_gpt2_bpe = model_type == "gpt2";
+        let gpt2_pre =
+            Gpt2PreKind::from_gguf_pre(meta.get("tokenizer.ggml.pre").and_then(|v| v.as_str()));
         // Mirrors `from_gguf`: llama.cpp SPM convention defaults the dummy
         // prefix ON when `tokenizer.ggml.add_space_prefix` is absent.
         let sp_dummy_prefix = meta
@@ -756,6 +868,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            gpt2_pre,
             sp_dummy_prefix,
         })
     }
@@ -1033,8 +1146,17 @@ impl Tokenizer {
         // → tokens, so `len/4` is a sane lower bound that avoids early
         // reallocs without wasting memory on short inputs.
         let mut result: Vec<u32> = Vec::with_capacity(text.len() / 4 + 1);
-        for m in gpt2_pretok_re().find_iter(text) {
-            self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+        match self.gpt2_pre {
+            Gpt2PreKind::Default => {
+                for m in gpt2_pretok_re().find_iter(text) {
+                    self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+                }
+            }
+            Gpt2PreKind::MiniCpm5 => {
+                for chunk in pretok_minicpm5(text) {
+                    self.encode_gpt2_chunk(chunk.as_bytes(), &mut result);
+                }
+            }
         }
         result
     }
@@ -1055,6 +1177,18 @@ impl Tokenizer {
             .byte_to_id
             .as_ref()
             .expect("encode_gpt2_chunk called on non-GPT2 tokenizer");
+
+        // llama.cpp `ignore_merges`: if the whole GPT-2-byte-encoded chunk
+        // is a vocab entry, emit that id and skip BPE. MiniCPM5 relies on
+        // this for whole-word tokens such as "hi" (id 7466 on MiniCPM5-2B).
+        if self.gpt2_pre.ignore_merges() {
+            let encoded: String = chunk_bytes.iter().copied().map(byte_to_gpt2_char).collect();
+            if let Some(&id) = self.token_to_id.get(&encoded) {
+                out.push(id);
+                return;
+            }
+        }
+
         let mut syms: Vec<u32> = chunk_bytes
             .iter()
             .map(|&b| byte_to_id[b as usize])
@@ -1778,6 +1912,7 @@ mod bpe_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
+            gpt2_pre: Gpt2PreKind::Default,
             sp_dummy_prefix: true,
         }
     }
@@ -1874,6 +2009,25 @@ mod bpe_tests {
         // pointing at vocab id 2 ("aaaa").
         assert_eq!(out.len(), 256);
         assert!(out.iter().all(|&id| id == 2));
+    }
+
+    #[test]
+    fn minicpm5_ignore_merges_emits_whole_word() {
+        // Vocab has "hi" plus the byte seeds, but no ("h","i") merge.
+        // Default GPT-2 BPE must byte-split; MiniCPM5 ignore_merges must
+        // emit the whole-word id. This is the MiniCPM5-2B "hi" → 7466
+        // failure class (llama.cpp tokenizer_pre=minicpm5).
+        let mut tok = synth(&["h", "i", "hi"], &[]);
+        assert_eq!(tok.encode_gpt2_bpe("hi"), vec![0, 1]);
+        tok.gpt2_pre = Gpt2PreKind::MiniCpm5;
+        assert_eq!(tok.encode_gpt2_bpe("hi"), vec![2]);
+    }
+
+    #[test]
+    fn minicpm5_pretok_isolates_digit_runs() {
+        assert_eq!(pretok_minicpm5("12345"), vec!["123", "45"]);
+        assert_eq!(pretok_minicpm5("a12345b"), vec!["a", "123", "45", "b"]);
+        assert_eq!(pretok_minicpm5("hi"), vec!["hi"]);
     }
 }
 
@@ -2038,6 +2192,22 @@ mod consistency_tests {
     }
 
     #[test]
+    fn minicpm5_pre_sets_ignore_merges_and_whole_word_id() {
+        // Full GPT-2 byte coverage plus extra "hi". Without tokenizer.ggml.pre,
+        // encode byte-splits (no h+i merge). With pre=minicpm5, emit extra id 256.
+        let meta_default = gpt2_meta_full_bytes(None, &["hi"], &[]);
+        let tok_default = Tokenizer::from_gguf_meta_json(&meta_default).expect("gpt2");
+        assert_eq!(tok_default.gpt2_pre, Gpt2PreKind::Default);
+        assert_eq!(tok_default.encode("hi"), vec![b'h' as u32, b'i' as u32]);
+
+        let mut meta_mc = gpt2_meta_full_bytes(None, &["hi"], &[]);
+        meta_mc["tokenizer.ggml.pre"] = serde_json::json!("minicpm5");
+        let tok_mc = Tokenizer::from_gguf_meta_json(&meta_mc).expect("minicpm5");
+        assert_eq!(tok_mc.gpt2_pre, Gpt2PreKind::MiniCpm5);
+        assert_eq!(tok_mc.encode("hi"), vec![256]);
+    }
+
+    #[test]
     fn rejects_metadata_missing_tokens() {
         let meta = json!({});
         let err = match Tokenizer::from_gguf_meta_json(&meta) {
@@ -2087,6 +2257,7 @@ mod sp_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            gpt2_pre: Gpt2PreKind::Default,
             // The pre-existing SP unit tests below were written against the
             // unconditional-prefix behavior; keep them on the LLaMA
             // convention. Config-driven coverage lives in
@@ -2454,7 +2625,6 @@ mod prompt_norm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sp_dummy_prefix_tests {
     //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
@@ -2528,8 +2698,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_no_dummy_prefix_first_word_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(t.bos_id, 2, "generation_config bos override");
         let mut ids = vec![t.bos_id];
         ids.extend(t.encode("The capital of France is"));
@@ -2538,8 +2707,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_chat_tail_thought_channel_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
