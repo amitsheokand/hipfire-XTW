@@ -216,6 +216,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_DETERMINISTIC` | Determinism toggles in dispatch |
 | `HIPFIRE_DS4_DENSE_ACT_DIR` | DeepSeek4 calibration-only dump of P1 projection inputs in `collect_e8_hessian` format; direct evaluator flag `--dump-dense-acts` is preferred. |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | Compatibility alias for `diagnostic.compiler.hipcc_extra_flags` |
+| `HIPFIRE_ROCM_DEVICE_LIB_PATH` | Explicit `--rocm-device-lib-path` for JIT when the selected ROCm root has no `amdgcn/bitcode` (Nix/split installs). Directory must exist. Extra-flags already carrying the flag win. |
 | `HIPFIRE_KERNEL_CACHE` | Kernel cache dir (`var_os`) |
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
@@ -992,6 +993,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_ROCBLAS_MIN_BATCH` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_ROCBLAS_OFF` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_ROCM_DEVICE_LIB_PATH` | crates/rdna-compute/src/compiler.rs |
 | `HIPFIRE_ROCPROF_CSV` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs, scripts/coverage-audit.py |
 | `HIPFIRE_ROPE_HALFSPLIT` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/norm.rs |

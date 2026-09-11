@@ -805,13 +805,12 @@ impl KernelCompiler {
         let legacy_obj = self.cache_dir.join(format!("{name}.hsaco"));
         let legacy_hash = self.cache_dir.join(format!("{name}.hash"));
         if pair_valid(&legacy_obj, &legacy_hash, &src_hash) {
-            let hit_path = if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true)
-                .is_ok()
-            {
-                obj_path
-            } else {
-                legacy_obj
-            };
+            let hit_path =
+                if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true).is_ok() {
+                    obj_path
+                } else {
+                    legacy_obj
+                };
             if let Some(dir) = self.writeback_dir() {
                 writeback_cold(name, &hit_path, &src_hash, dir, false);
             }
@@ -970,6 +969,25 @@ impl KernelCompiler {
         p.to_string()
     }
 
+    /// Resolve the ROCm device-library (bitcode) directory for the JIT
+    /// command, if one is discoverable. See the call site in
+    /// `hipcc_passthrough` for the policy.
+    fn device_lib_path(root: Option<&Path>) -> Option<String> {
+        if let Ok(dir) = hipfire_config::developer_var("HIPFIRE_ROCM_DEVICE_LIB_PATH") {
+            let p = Path::new(&dir);
+            if p.is_dir() {
+                return Some(Self::win_short_path_if_needed(&dir));
+            }
+        }
+        if let Some(root) = root {
+            let candidate = root.join("amdgcn").join("bitcode");
+            if candidate.is_dir() {
+                return Some(Self::win_short_path_if_needed(&candidate.to_string_lossy()));
+            }
+        }
+        None
+    }
+
     /// Root-scoped flags passed through hipcc to the device compiler.
     ///
     /// `hipcc.bat` re-tokenises its arguments on Windows, so both flags must
@@ -1048,8 +1066,9 @@ impl KernelCompiler {
                 passthrough.extend(Self::rocm_root_flags(root));
             }
         }
-        if let Some(candidate) =
-            selected_root.map(|root| root.join("include").to_string_lossy().into_owned())
+        if let Some(candidate) = selected_root
+            .as_ref()
+            .map(|root| root.join("include").to_string_lossy().into_owned())
         {
             if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
                 // Windows hipcc (hipcc.bat) re-tokenises its argv on the inner
@@ -1065,6 +1084,23 @@ impl KernelCompiler {
         }
         for flag in extra_flags.split_whitespace() {
             passthrough.push(flag.to_string());
+        }
+        // Device-library path for split installs (notably Nix, where the
+        // `clr` package carries no `amdgcn/bitcode` and clang fails every
+        // libm-using kernel with "cannot find ROCm device library").
+        // Explicit `HIPFIRE_HIPCC_EXTRA_FLAGS` wins if it already carries
+        // `--rocm-device-lib-path`; then `HIPFIRE_ROCM_DEVICE_LIB_PATH`;
+        // otherwise `<root>/amdgcn/bitcode` when it exists (standard layout —
+        // the same bitcode clang would resolve via `--rocm-path` anyway, so
+        // complete installs see no behavior change). Absent everywhere ⇒
+        // no flag (today's behavior, including today's failure mode).
+        if !passthrough
+            .iter()
+            .any(|flag| flag.starts_with("--rocm-device-lib-path="))
+        {
+            if let Some(dir) = Self::device_lib_path(selected_root.as_deref()) {
+                passthrough.push(format!("--rocm-device-lib-path={dir}"));
+            }
         }
         for flag in module_flags {
             passthrough.push(flag.clone());
