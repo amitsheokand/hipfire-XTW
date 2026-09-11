@@ -211,6 +211,7 @@ fn dflash_moe_draft_ffn_graph_eligible(
 /// gfx1100, but two graph-on V2 campaigns lost the endpoint. Default-off graph
 /// quarantines (direct batched HIP/WMMA remains on):
 /// - exact gfx1100 + MQ*V2
+/// - exact gfx1201 + MQ*V2 (product Qwen 3.8 mq4-pro / mq4-xt SKUs)
 /// - exact gfx1100 + legacy MQ4G256 (measured direct HIP faster)
 /// - exact gfx1201 + legacy MQ4G256 (measured graph replay slower than direct)
 ///
@@ -232,7 +233,7 @@ fn dflash_verify_graph_env_eligible(
             | rdna_compute::DType::MQ3G256V2
             | rdna_compute::DType::MQ2G256V2
     );
-    if arch == "gfx1100" && is_mq_v2 {
+    if matches!(arch, "gfx1100" | "gfx1201") && is_mq_v2 {
         return env_value == Some("1");
     }
     if arch == "gfx1100" && output_dtype == rdna_compute::DType::MQ4G256 {
@@ -7979,25 +7980,19 @@ mod tests {
     fn dflash_verify_graph_env_quarantines_gfx1100_mq_v2() {
         use rdna_compute::DType;
 
-        // gfx1100 + every V2 width: default-off; =0 force-off; =1 diagnostic opt-in.
-        for dtype in [
-            DType::MQ2G256V2,
-            DType::MQ3G256V2,
-            DType::MQ4G256V2,
-            DType::MQ5G256V2,
-            DType::MQ6G256V2,
-        ] {
-            assert!(!dflash_verify_graph_env_eligible("gfx1100", dtype, None));
-            assert!(!dflash_verify_graph_env_eligible(
-                "gfx1100",
-                dtype,
-                Some("0")
-            ));
-            assert!(dflash_verify_graph_env_eligible(
-                "gfx1100",
-                dtype,
-                Some("1")
-            ));
+        // gfx1100 / gfx1201 + every V2 width: default-off; =0 force-off; =1 diagnostic opt-in.
+        for arch in ["gfx1100", "gfx1201"] {
+            for dtype in [
+                DType::MQ2G256V2,
+                DType::MQ3G256V2,
+                DType::MQ4G256V2,
+                DType::MQ5G256V2,
+                DType::MQ6G256V2,
+            ] {
+                assert!(!dflash_verify_graph_env_eligible(arch, dtype, None));
+                assert!(!dflash_verify_graph_env_eligible(arch, dtype, Some("0")));
+                assert!(dflash_verify_graph_env_eligible(arch, dtype, Some("1")));
+            }
         }
 
         // gfx1100 + non-MQ4 legacy quant remains default-on.
@@ -8007,7 +8002,7 @@ mod tests {
             None
         ));
 
-        // Other arches keep default-on for V2; =0 still force-off.
+        // Sibling arches keep default-on for V2; =0 still force-off.
         assert!(dflash_verify_graph_env_eligible(
             "gfx1151",
             DType::MQ3G256V2,
@@ -8024,8 +8019,8 @@ mod tests {
             Some("1")
         ));
         assert!(dflash_verify_graph_env_eligible(
-            "gfx1201",
-            DType::MQ3G256V2,
+            "gfx1200",
+            DType::MQ4G256V2,
             None
         ));
     }
